@@ -1,0 +1,693 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "doccraft-agent",
+    "description": "",
+    "license": {
+      "name": ""
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/runs": {
+      "get": {
+        "tags": [],
+        "operationId": "runs_list",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RunView"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/cancel": {
+      "post": {
+        "tags": [],
+        "operationId": "cancel_run",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/resume": {
+      "post": {
+        "tags": [],
+        "operationId": "resume_run",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunId"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/settings": {
+      "get": {
+        "tags": [],
+        "operationId": "settings_get",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Settings"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [],
+        "operationId": "settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Settings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Settings"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tasks": {
+      "get": {
+        "tags": [],
+        "operationId": "tasks_list",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TaskConfig"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "tasks_save",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskConfig"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{id}": {
+      "delete": {
+        "tags": [],
+        "operationId": "task_delete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{id}/run": {
+      "post": {
+        "tags": [],
+        "operationId": "start_run",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunId"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "DbConfig": {
+        "type": "object",
+        "properties": {
+          "database": {
+            "type": "string",
+            "default": "doccraft_agent"
+          },
+          "host": {
+            "type": "string",
+            "default": "127.0.0.1"
+          },
+          "max_connections": {
+            "type": "integer",
+            "format": "int32",
+            "default": 8,
+            "minimum": 0
+          },
+          "password": {
+            "type": "string",
+            "default": ""
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "default": 3306,
+            "minimum": 0
+          },
+          "tls": {
+            "type": "boolean",
+            "default": false
+          },
+          "user": {
+            "type": "string",
+            "default": "root"
+          }
+        }
+      },
+      "EventView": {
+        "type": "object",
+        "required": [
+          "id",
+          "run_id",
+          "kind",
+          "data"
+        ],
+        "properties": {
+          "data": {},
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          }
+        }
+      },
+      "Issue": {
+        "type": "object",
+        "required": [
+          "severity",
+          "section",
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string"
+          },
+          "section": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "severity": {
+            "type": "string"
+          }
+        }
+      },
+      "LlmConfig": {
+        "type": "object",
+        "properties": {
+          "api_key": {
+            "type": "string",
+            "default": ""
+          },
+          "base_url": {
+            "type": "string",
+            "default": "http://127.0.0.1:8000/v1"
+          },
+          "ca_path": {
+            "type": "string",
+            "default": ""
+          },
+          "concurrency": {
+            "type": "integer",
+            "default": 2,
+            "minimum": 0
+          },
+          "context_limit": {
+            "type": "integer",
+            "format": "int32",
+            "default": 200000,
+            "minimum": 0
+          },
+          "effort": {
+            "type": "string",
+            "default": "medium"
+          },
+          "input_price": {
+            "type": "number",
+            "format": "double",
+            "default": 0.0
+          },
+          "max_output_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "default": 8192,
+            "minimum": 0
+          },
+          "model": {
+            "type": "string",
+            "default": ""
+          },
+          "model_context_limit": {
+            "type": "integer",
+            "format": "int32",
+            "default": 200000,
+            "minimum": 0
+          },
+          "model_max_output": {
+            "type": "integer",
+            "format": "int32",
+            "default": 32768,
+            "minimum": 0
+          },
+          "output_parameter": {
+            "type": "string",
+            "default": "max_completion_tokens"
+          },
+          "output_price": {
+            "type": "number",
+            "format": "double",
+            "default": 0.0
+          },
+          "proxy_mode": {
+            "type": "string",
+            "default": "none"
+          },
+          "proxy_password": {
+            "type": "string",
+            "default": ""
+          },
+          "proxy_url": {
+            "type": "string",
+            "default": ""
+          },
+          "proxy_user": {
+            "type": "string",
+            "default": ""
+          },
+          "reasoning": {
+            "type": "string",
+            "default": "default"
+          },
+          "reasoning_parameter": {
+            "type": "string",
+            "default": "reasoning_effort"
+          },
+          "retries": {
+            "type": "integer",
+            "format": "int32",
+            "default": 3,
+            "minimum": 0
+          },
+          "rpm": {
+            "type": "integer",
+            "format": "int32",
+            "default": 30,
+            "minimum": 0
+          },
+          "safety_percent": {
+            "type": "integer",
+            "format": "int32",
+            "default": 20,
+            "minimum": 0
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "default": 180,
+            "minimum": 0
+          },
+          "token_count_url": {
+            "type": "string",
+            "default": ""
+          },
+          "token_mode": {
+            "type": "string",
+            "default": "estimate"
+          },
+          "tpm": {
+            "type": "integer",
+            "format": "int32",
+            "default": 300000,
+            "minimum": 0
+          }
+        }
+      },
+      "Outline": {
+        "type": "object",
+        "required": [
+          "sections"
+        ],
+        "properties": {
+          "sections": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SectionPlan"
+            }
+          }
+        }
+      },
+      "RunId": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        }
+      },
+      "RunView": {
+        "type": "object",
+        "required": [
+          "id",
+          "task_id",
+          "status",
+          "progress",
+          "tokens",
+          "cost",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "cost": {
+            "type": "number",
+            "format": "double"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "progress": {},
+          "status": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "SectionPlan": {
+        "type": "object",
+        "required": [
+          "title",
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "Settings": {
+        "type": "object",
+        "properties": {
+          "cache_max_mb": {
+            "type": "integer",
+            "format": "int64",
+            "default": 1024,
+            "minimum": 0
+          },
+          "db": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DbConfig"
+              }
+            ],
+            "default": {
+              "database": "doccraft_agent",
+              "host": "127.0.0.1",
+              "max_connections": 8,
+              "password": "",
+              "port": 3306,
+              "tls": false,
+              "user": "root"
+            }
+          },
+          "llm": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LlmConfig"
+              }
+            ],
+            "default": {
+              "api_key": "",
+              "base_url": "http://127.0.0.1:8000/v1",
+              "ca_path": "",
+              "concurrency": 2,
+              "context_limit": 200000,
+              "effort": "medium",
+              "input_price": 0.0,
+              "max_output_tokens": 8192,
+              "model": "",
+              "model_context_limit": 200000,
+              "model_max_output": 32768,
+              "output_parameter": "max_completion_tokens",
+              "output_price": 0.0,
+              "proxy_mode": "none",
+              "proxy_password": "",
+              "proxy_url": "",
+              "proxy_user": "",
+              "reasoning": "default",
+              "reasoning_parameter": "reasoning_effort",
+              "retries": 3,
+              "rpm": 30,
+              "safety_percent": 20,
+              "timeout_seconds": 180,
+              "token_count_url": "",
+              "token_mode": "estimate",
+              "tpm": 300000
+            }
+          },
+          "max_file_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "default": 20971520,
+            "minimum": 0
+          },
+          "max_files": {
+            "type": "integer",
+            "default": 100000,
+            "minimum": 0
+          },
+          "max_jobs": {
+            "type": "integer",
+            "default": 2,
+            "minimum": 0
+          },
+          "output_roots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "retention_days": {
+            "type": "integer",
+            "format": "int32",
+            "default": 30,
+            "minimum": 0
+          },
+          "source_roots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          }
+        }
+      },
+      "TaskConfig": {
+        "type": "object",
+        "properties": {
+          "direction": {
+            "type": "string",
+            "default": ""
+          },
+          "exclude": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "id": {
+            "type": "string",
+            "default": ""
+          },
+          "include": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "language": {
+            "type": "string",
+            "default": "한국어"
+          },
+          "max_cost": {
+            "type": "number",
+            "format": "double",
+            "default": 0.0
+          },
+          "max_iterations": {
+            "type": "integer",
+            "format": "int32",
+            "default": 3,
+            "minimum": 0
+          },
+          "max_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "default": 7200,
+            "minimum": 0
+          },
+          "max_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "default": 2000000,
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "default": ""
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "target": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      }
+    }
+  }
+}

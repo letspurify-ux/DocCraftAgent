@@ -1,0 +1,18 @@
+{
+  "note": "Local structural analysis with a deterministic mock LLM; excludes real model inference latency.",
+  "platform": "Darwin",
+  "benchmarks": [
+    {
+      "lines": 100000,
+      "cold_seconds": 4.684,
+      "warm_seconds": 2.33,
+      "warm_llm_tokens": 0
+    },
+    {
+      "lines": 1000000,
+      "cold_seconds": 29.846,
+      "warm_seconds": 6.791,
+      "warm_llm_tokens": 0
+    }
+  ]
+}

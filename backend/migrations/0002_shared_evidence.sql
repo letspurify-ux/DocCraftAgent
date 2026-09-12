@@ -1,0 +1,11 @@
+CREATE TABLE chunk_blobs (
+ hash CHAR(64) PRIMARY KEY,
+ symbols TEXT NOT NULL,
+ content MEDIUMTEXT NOT NULL
+);
+ALTER TABLE chunks ADD COLUMN blob_hash CHAR(64) NULL, ADD INDEX chunks_blob (blob_hash);
+CREATE TABLE retrieval_cache (
+ hash CHAR(64) PRIMARY KEY,
+ data MEDIUMTEXT NOT NULL,
+ created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

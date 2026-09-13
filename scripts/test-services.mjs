@@ -66,7 +66,24 @@ async function stop(service) {
   const child = spawn(
     process.execPath,
     [path.join(root, "scripts", "stop-service.mjs"), service],
-    { cwd: os.tmpdir(), env, stdio: "inherit" },
+    {
+      cwd: os.tmpdir(),
+      env: { ...env, LANG: "ko_KR.UTF-8", LC_ALL: "ko_KR.UTF-8" },
+      stdio: "inherit",
+    },
+  );
+  assert.equal((await once(child, "exit"))[0], 0);
+}
+
+async function stopAll() {
+  const child = spawn(
+    process.execPath,
+    [path.join(root, "scripts", "stop-all.mjs")],
+    {
+      cwd: os.tmpdir(),
+      env: { ...env, LANG: "ko_KR.UTF-8", LC_ALL: "ko_KR.UTF-8" },
+      stdio: "inherit",
+    },
   );
   assert.equal((await once(child, "exit"))[0], 0);
 }
@@ -136,13 +153,22 @@ try {
     "stop_backend must leave the frontend running",
   );
 
-  await stop("frontend");
+  backend = start("backend");
+  await ready(backend, "Backend:");
+  await fs.writeFile(
+    path.join(managerData, "backend-process.json"),
+    JSON.stringify({ ...readServiceState("backend"), identity: "stale" }),
+  );
+  await fs.rm(path.join(managerData, "frontend-process.json"));
+  await stopAll();
+  assert.equal((await backend.finished)[0], 0);
   assert.equal((await frontend.finished)[0], 0);
+  await assertClosed(backendPort, "/health");
   await assertClosed(frontendPort, "/");
   assert.equal(readServiceState("backend"), null);
   assert.equal(readServiceState("frontend"), null);
   console.log(
-    "PASS individual start, proxy, duplicate protection, independent stop, state cleanup and ports released",
+    "PASS individual start, proxy, duplicate protection, independent stop, stop_all, state cleanup and ports released",
   );
 } finally {
   await cleanup("frontend", frontend);

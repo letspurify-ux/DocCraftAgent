@@ -9,6 +9,7 @@ export const statePath = path.join(
   process.env.DOCCRAFT_PROCESS_STATE_DIR ?? path.join(root, ".local"),
   "all-processes.json",
 );
+const stableLocale = { ...process.env, LANG: "C", LC_ALL: "C" };
 export function identity(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 1) return null;
   try {
@@ -30,10 +31,45 @@ export function identity(pid) {
     return (
       execFileSync("ps", ["-p", String(pid), "-o", "lstart=", "-o", "args="], {
         encoding: "utf8",
+        env: stableLocale,
       }).trim() || null
     );
   } catch {
     return null;
+  }
+}
+
+export function discoverManagers() {
+  if (windows) return [];
+  const scripts = [
+    { label: "start_all", suffix: path.join(root, "scripts", "start-all.mjs") },
+    ...["frontend", "backend"].map((service) => ({
+      label: `start_${service}`,
+      suffix: `${path.join(root, "scripts", "start-service.mjs")} ${service}`,
+    })),
+  ];
+  try {
+    const processes = execFileSync("ps", ["-axo", "pid=", "-o", "args="], {
+      encoding: "utf8",
+      env: stableLocale,
+    });
+    const found = [];
+    for (const line of processes.split("\n")) {
+      const match = line.match(/^\s*(\d+)\s+(.+)$/);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      const command = match[2].trim();
+      const script = scripts.find(
+        ({ suffix }) => command === suffix || command.endsWith(` ${suffix}`),
+      );
+      if (!script) continue;
+      const processIdentity = identity(pid);
+      if (processIdentity)
+        found.push({ ...script, pid, identity: processIdentity });
+    }
+    return found;
+  } catch {
+    return [];
   }
 }
 export function readState() {

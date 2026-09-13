@@ -4,13 +4,15 @@
 
 ## 실행
 
-필요한 도구는 Rust 1.93 이상, Node.js 22 이상, 로컬 MariaDB입니다. MariaDB를 새로 설치하거나 Docker로 실행하지 않습니다.
+필요한 도구는 Rust 1.93 이상, Node.js 22 이상, Homebrew로 설치한 로컬 MariaDB입니다. MariaDB를 새로 설치하거나 Docker로 실행하지 않습니다.
 
 macOS/Linux에서 백엔드와 프론트엔드를 함께 실행합니다.
 
 ```sh
 ./start_all.sh
 ```
+
+`start_all.sh`는 3306번 포트의 MariaDB 상태를 확인하고, 꺼져 있으면 `brew services start mariadb`로 먼저 시작합니다. MariaDB가 설치되어 있지 않거나 20초 안에 준비되지 않으면 애플리케이션을 시작하지 않습니다. 개별 `start_backend.sh`와 `start_frontend.sh`는 MariaDB를 시작하지 않습니다.
 
 Windows에서는 프로젝트 폴더에서 다음 스크립트를 사용합니다(Node.js·npm, Rust·Cargo가 PATH에 있어야 합니다).
 
@@ -26,7 +28,7 @@ start_all.bat
 ./stop_all.sh
 ```
 
-`start_all`이 실행한 프로세스만 중지합니다. 이미 다른 서버가 포트를 사용 중이면 시작을 거절합니다. 실행 기록은 `.local/all-processes.json`에 저장합니다. 시작 시 Rust를 빌드하고, 프론트엔드 의존성이 없으면 `npm ci`를 실행합니다. 한 서버가 종료되면 나머지도 종료합니다. 종료는 최대 8초 기다린 뒤 남은 자식 프로세스 그룹을 강제 종료합니다.
+`stop_all`은 통합 실행 및 개별 실행으로 시작한 백엔드와 프론트엔드를 모두 중지합니다. MariaDB 서비스는 중지하지 않습니다. 이미 다른 서버가 포트를 사용 중이면 시작을 거절합니다. 실행 기록은 `.local/all-processes.json`에 저장합니다. 시작 시 Rust를 빌드하고, 프론트엔드 의존성이 없으면 `npm ci`를 실행합니다. 한 서버가 종료되면 나머지도 종료합니다. 종료는 최대 8초 기다린 뒤 남은 자식 프로세스 그룹을 강제 종료합니다.
 
 포트가 다른 앱에 점유된 경우 그 앱을 임의로 종료하지 않습니다. 예를 들어 대체 포트로 실행하려면 `DOCCRAFT_PORT=8766 DOCCRAFT_FRONTEND_PORT=6002 ./start_all.sh`를 사용할 수 있습니다.
 

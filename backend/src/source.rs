@@ -63,7 +63,7 @@ pub fn validate_task(
     }
     if task.max_diagrams.is_some_and(|n| n > 32)
         || task.max_iterations == 0
-        || task.max_iterations > 10
+        || task.max_iterations > 20
         || task.max_seconds < 30
         || task.max_seconds > 86400
         || task.max_tokens < 1024
@@ -115,7 +115,6 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(32);
     let scan = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut seen = std::collections::HashSet::new();
-        let mut count = 0;
         for root in roots {
             for item in ignore::WalkBuilder::new(root)
                 .hidden(false)
@@ -133,10 +132,6 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
                 if !seen.insert(p.clone()) {
                     continue;
                 }
-                count += 1;
-                if count > max_files {
-                    bail!("Source file count exceeds configured limit");
-                }
                 if tx.blocking_send(p).is_err() {
                     return Ok(());
                 }
@@ -149,7 +144,9 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
     let mut fingerprint = Sha256::new();
     fingerprint.update(parser::VERSION);
     let mut indexed = 0usize;
+    let mut excluded = 0usize;
     let mut skipped = 0usize;
+    let mut considered = 0usize;
     let mut cache_hits = 0usize;
     while let Some(path) = tokio::select! { _ = ctx.cancel.cancelled() => { bail!("CANCELLED"); }, value = rx.recv() => value }
     {
@@ -195,15 +192,19 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
                 && !includes.is_match(&relative)
                 && !includes.is_match(&normalized))
         {
-            record_skip(ctx, &path, "excluded").await?;
-            skipped += 1;
+            record_file_status(ctx, &path, "excluded", "excluded").await?;
+            excluded += 1;
             continue;
+        }
+        considered += 1;
+        if considered > max_files {
+            bail!("Source file count exceeds configured limit after filtering");
         }
         let result = snapshot_file(ctx, &path, &dir).await;
         let (bytes, snapshot_path) = match result {
             Ok(v) => v,
             Err(e) => {
-                record_skip(ctx, &path, &e.to_string()).await?;
+                record_file_status(ctx, &path, "skipped", &e.to_string()).await?;
                 skipped += 1;
                 continue;
             }
@@ -230,7 +231,7 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
                     p
                 }
                 Err(e) => {
-                    record_skip(ctx, &path, &e.to_string()).await?;
+                    record_file_status(ctx, &path, "skipped", &e.to_string()).await?;
                     skipped += 1;
                     continue;
                 }
@@ -243,7 +244,7 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
         persist_chunks(ctx, file_id, &normalized, &parsed.chunks).await?;
         indexed += 1;
         if indexed.is_multiple_of(10) || indexed == 1 {
-            ctx.event("index", json!({"stage":"indexing","indexed":indexed,"skipped":skipped,"parse_cache_hits":cache_hits,"current_file":normalized})).await?;
+            ctx.event("index", json!({"stage":"indexing","indexed":indexed,"excluded":excluded,"skipped":skipped,"parse_cache_hits":cache_hits,"current_file":normalized})).await?;
         }
     }
     scan.await??;
@@ -261,10 +262,10 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
         &ctx.pool,
         &ctx.id,
         "indexed",
-        &json!({"indexed":indexed,"skipped":skipped,"cache_hits":cache_hits}),
+        &json!({"indexed":indexed,"excluded":excluded,"skipped":skipped,"cache_hits":cache_hits}),
     )
     .await?;
-    ctx.event("index",json!({"stage":"indexed","indexed":indexed,"skipped":skipped,"parse_cache_hits":cache_hits})).await?;
+    ctx.event("index",json!({"stage":"indexed","indexed":indexed,"excluded":excluded,"skipped":skipped,"parse_cache_hits":cache_hits})).await?;
     Ok(())
 }
 
@@ -393,9 +394,19 @@ async fn snapshot_file(ctx: &RunContext, path: &Path, dir: &Path) -> Result<(Vec
     }
     bail!("File changed during snapshot after three attempts")
 }
-async fn record_skip(ctx: &RunContext, path: &Path, detail: &str) -> Result<()> {
-    sqlx::query("INSERT INTO files(run_id,path,snapshot_path,hash,language,status,detail) VALUES(?,?, '', '', '', 'skipped', ?)")
-        .bind(&ctx.id).bind(path.to_string_lossy().as_ref()).bind(detail.chars().take(500).collect::<String>()).execute(&ctx.pool).await?;
+async fn record_file_status(
+    ctx: &RunContext,
+    path: &Path,
+    status: &str,
+    detail: &str,
+) -> Result<()> {
+    sqlx::query("INSERT INTO files(run_id,path,snapshot_path,hash,language,status,detail) VALUES(?,?, '', '', '', ?, ?)")
+        .bind(&ctx.id)
+        .bind(path.to_string_lossy().as_ref())
+        .bind(status)
+        .bind(detail.chars().take(500).collect::<String>())
+        .execute(&ctx.pool)
+        .await?;
     Ok(())
 }
 async fn worker(ctx: &RunContext, path: &Path, lang: &str) -> Result<parser::Parsed> {

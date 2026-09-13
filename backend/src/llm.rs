@@ -40,6 +40,30 @@ fn payload(c: &LlmConfig, messages: Value) -> Value {
     }
     p
 }
+fn prepared_request(c: &LlmConfig, system: &str, mut input: Value) -> Result<(Value, String)> {
+    crate::editorial::compact_evidence_ids(&mut input);
+    let request = payload(
+        c,
+        json!([{"role":"system","content":system},{"role":"user","content":input.to_string()}]),
+    );
+    let cache_key = hash(
+        serde_json::to_string(&json!({"version":2,"endpoint":c.base_url,"request":request}))?
+            .as_bytes(),
+    );
+    Ok((request, cache_key))
+}
+
+/// Remove an output that failed the caller's schema or document validation.
+/// The next attempt or checkpoint resume must ask the provider again instead of
+/// deterministically replaying a poisoned cache entry.
+pub async fn forget(ctx: &RunContext, system: &str, input: Value) -> Result<()> {
+    let (_, cache_key) = prepared_request(&ctx.snapshot.settings.llm, system, input)?;
+    sqlx::query("DELETE FROM llm_cache WHERE hash=?")
+        .bind(cache_key)
+        .execute(&ctx.pool)
+        .await?;
+    Ok(())
+}
 async fn read_response(response: reqwest::Response) -> Result<Value> {
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
@@ -58,15 +82,7 @@ fn retryable_status(status: reqwest::StatusCode) -> bool {
 pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<String> {
     ctx.check()?;
     let c = &ctx.snapshot.settings.llm;
-    crate::editorial::compact_evidence_ids(&mut input);
-    let request = payload(
-        c,
-        json!([{"role":"system","content":system},{"role":"user","content":input.to_string()}]),
-    );
-    let cache_key = hash(
-        serde_json::to_string(&json!({"version":1,"endpoint":c.base_url,"request":request}))?
-            .as_bytes(),
-    );
+    let (request, cache_key) = prepared_request(c, system, std::mem::take(&mut input))?;
     if let Some(row) = sqlx::query("SELECT data FROM llm_cache WHERE hash=?")
         .bind(&cache_key)
         .fetch_optional(&ctx.pool)
@@ -408,7 +424,46 @@ pub fn decode<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
         .or_else(|| trimmed.strip_prefix("```"))
         .unwrap_or(trimmed);
     let trimmed = trimmed.trim().strip_suffix("```").unwrap_or(trimmed).trim();
-    serde_json::from_str(trimmed).context("LLM output does not match required JSON schema")
+    serde_json::from_str(trimmed)
+        .or_else(|_| {
+            extract_json_object(trimmed)
+                .ok_or_else(|| serde_json::Error::io(std::io::Error::other("no JSON object")))
+                .and_then(serde_json::from_str)
+        })
+        .context("LLM output does not match required JSON schema")
+}
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text
+        .char_indices()
+        .find_map(|(index, ch)| (ch == '{').then_some(index))?;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (relative, ch) in text[start..].char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&text[start..start + relative + ch.len_utf8()]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -438,5 +493,15 @@ mod quota_tests {
         assert!(retryable_status(reqwest::StatusCode::SERVICE_UNAVAILABLE));
         assert!(!retryable_status(reqwest::StatusCode::BAD_REQUEST));
         assert!(!retryable_status(reqwest::StatusCode::UNAUTHORIZED));
+    }
+    #[test]
+    fn decoder_accepts_one_balanced_json_object_with_surrounding_text() -> Result<()> {
+        let value: Value = decode(
+            "검토 결과입니다.\n{\"message\":\"중괄호 } 와 \\\"인용\\\"\",\"ok\":true}\n완료",
+        )?;
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["message"], "중괄호 } 와 \"인용\"");
+        assert!(decode::<Value>("JSON이 없습니다").is_err());
+        Ok(())
     }
 }

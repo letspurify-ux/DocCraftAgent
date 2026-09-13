@@ -545,8 +545,10 @@ struct ResumeOptions {
     current_llm: bool,
     #[serde(default)]
     current_token_limit: bool,
+    #[serde(default)]
+    current_review_limit: bool,
 }
-#[utoipa::path(post,path="/api/v1/runs/{id}/resume",params(("id"=String,Path),("current_llm"=Option<bool>,Query,description="Apply current LLM settings while preserving completed sections and task budget"),("current_token_limit"=Option<bool>,Query,description="Apply the saved task token limit explicitly; other run limits stay fixed")),responses((status=200,body=RunId)))]
+#[utoipa::path(post,path="/api/v1/runs/{id}/resume",params(("id"=String,Path),("current_llm"=Option<bool>,Query,description="Apply current LLM settings while preserving completed sections and task budget"),("current_token_limit"=Option<bool>,Query,description="Apply the saved task token limit explicitly; other run limits stay fixed"),("current_review_limit"=Option<bool>,Query,description="Apply the saved task review limit so a warning-completed run can continue from its review checkpoints")),responses((status=200,body=RunId)))]
 async fn resume_run(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -562,16 +564,20 @@ async fn resume_run(
         .fetch_one(&pool)
         .await?;
     let status: String = row.try_get("status")?;
-    let partial = status == "completed_with_warnings"
+    let completed_with_warnings = status == "completed_with_warnings";
+    let partial = completed_with_warnings
         && row
             .try_get::<String, _>("progress")?
             .contains("this document is incomplete");
-    if !partial && !["failed", "cancelled", "interrupted"].contains(&status.as_str()) {
-        bail_api("Only stopped or failed runs can resume")?;
+    if !completed_with_warnings
+        && !["failed", "cancelled", "interrupted"].contains(&status.as_str())
+    {
+        bail_api("Only stopped, failed, or warning-completed runs can resume")?;
     }
     let mut snapshot: RunSnapshot =
         serde_json::from_str(&s.vault.decrypt(&row.try_get::<String, _>("snapshot")?)?)?;
-    if partial
+    let previous_review_limit = snapshot.task.max_iterations;
+    if completed_with_warnings
         && let Some(artifact) = sqlx::query(
             "SELECT hash FROM artifacts WHERE run_id=? ORDER BY created_at DESC LIMIT 1",
         )
@@ -643,12 +649,32 @@ async fn resume_run(
         snapshot.settings.llm.api_key = settings.llm.api_key;
         snapshot.settings.llm.proxy_password = settings.llm.proxy_password;
     }
-    if options.current_token_limit {
+    let current_task = if options.current_token_limit || options.current_review_limit {
         let config: String = sqlx::query_scalar("SELECT config FROM tasks WHERE id=?")
             .bind(&snapshot.task.id)
             .fetch_one(&pool)
             .await?;
-        snapshot.task.max_tokens = serde_json::from_str::<TaskConfig>(&config)?.max_tokens;
+        Some(serde_json::from_str::<TaskConfig>(&config)?)
+    } else {
+        None
+    };
+    if options.current_token_limit {
+        snapshot.task.max_tokens = current_task
+            .as_ref()
+            .context("Missing current task")?
+            .max_tokens;
+    }
+    if options.current_review_limit {
+        snapshot.task.max_iterations = current_task
+            .as_ref()
+            .context("Missing current task")?
+            .max_iterations;
+    }
+    if completed_with_warnings
+        && !partial
+        && (!options.current_review_limit || snapshot.task.max_iterations <= previous_review_limit)
+    {
+        bail_api("Increase the task review limit and apply it to continue this reviewed run")?;
     }
     source::validate_task(&snapshot.task, &snapshot.settings)?;
     Ok(Json(RunId {
@@ -678,11 +704,9 @@ async fn events(
         let mut idle_polls = 0u8;
         loop{
             let mut full_page = false;
-            let mut terminal = false;
             match db::events(&pool,&id,after).await{
                 Ok(events)=>{
                     full_page = events.len() == 200;
-                    terminal = events.iter().any(|event| event.kind == "terminal");
                     for e in events{after=e.id;if let Ok(event)=Event::default().id(e.id.to_string()).event("progress").json_data(e){yield Ok(event);}}
                     if full_page {
                         idle_polls = 0;
@@ -692,14 +716,10 @@ async fn events(
                 },
                 Err(_)=>{yield Ok(Event::default().event("connection").data("database temporarily unavailable"));}
             }
-            if terminal {
-                yield Ok(Event::default().event("stream-end").data("terminal"));
-                break;
-            }
             if idle_polls == 1 || idle_polls >= 20 {
                 idle_polls = 0;
                 match sqlx::query_scalar::<_,String>("SELECT status FROM runs WHERE id=?").bind(&id).fetch_optional(&pool).await {
-                    Ok(Some(status)) if !["queued","running","cancelling","interrupted"].contains(&status.as_str()) => {
+                    Ok(Some(status)) if stream_terminal(&status) => {
                         yield Ok(Event::default().event("stream-end").data("terminal"));
                         break;
                     },
@@ -717,6 +737,9 @@ async fn events(
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))))
+}
+fn stream_terminal(status: &str) -> bool {
+    !["queued", "running", "cancelling", "interrupted"].contains(&status)
 }
 async fn files(
     State(s): State<Arc<AppState>>,
@@ -879,6 +902,21 @@ mod origin_tests {
 
         let response = ApiError(anyhow::anyhow!("Invalid task configuration")).into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn event_stream_uses_current_run_status_not_historical_terminal_events() {
+        for active in ["queued", "running", "cancelling", "interrupted"] {
+            assert!(!stream_terminal(active));
+        }
+        for terminal in [
+            "completed",
+            "completed_with_warnings",
+            "failed",
+            "cancelled",
+        ] {
+            assert!(stream_terminal(terminal));
+        }
     }
 
     #[tokio::test]

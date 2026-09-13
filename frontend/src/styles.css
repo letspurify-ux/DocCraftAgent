@@ -521,12 +521,14 @@ h3 {
   background: #eaf5ef;
   color: #5a9276;
 }
-.badge.failed {
+.badge.failed,
+.badge.skipped {
   background: #fff0ee;
   color: #c57068;
 }
 .badge.completed_with_warnings,
-.badge.cancelling {
+.badge.cancelling,
+.badge.excluded {
   background: #fff5e5;
   color: #ab8745;
 }

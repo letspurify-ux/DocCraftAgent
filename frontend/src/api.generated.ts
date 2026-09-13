@@ -440,6 +440,8 @@ export interface operations {
         current_llm?: boolean;
         /** @description Apply the saved task token limit explicitly; other run limits stay fixed */
         current_token_limit?: boolean;
+        /** @description Apply the saved task review limit so a warning-completed run can continue from its review checkpoints */
+        current_review_limit?: boolean;
       };
       header?: never;
       path: {

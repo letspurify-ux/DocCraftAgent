@@ -81,6 +81,15 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "current_review_limit",
+            "in": "query",
+            "description": "Apply the saved task review limit so a warning-completed run can continue from its review checkpoints",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

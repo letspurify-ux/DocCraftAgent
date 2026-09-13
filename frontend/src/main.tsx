@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { createRoot } from "react-dom/client";
+import { createRoot, type Root } from "react-dom/client";
 import {
   BookOpen,
   Layers,
@@ -51,8 +51,27 @@ const labels: Record<string, string> = {
   completed: "완료",
   completed_with_warnings: "검토 사항 있음",
   interrupted: "복구 대기",
+  indexed: "분석 완료",
+  excluded: "분석 제외",
+  skipped: "분석 실패",
 };
 const fmt = (n: number) => new Intl.NumberFormat("ko-KR").format(n);
+const localTime = (value: string) => {
+  const normalized = /(?:Z|[+-]\d{2}:\d{2})$/i.test(value.trim())
+    ? value.trim()
+    : `${value.trim().replace(" ", "T")}Z`;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("ko-KR", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).format(date);
+};
 function Badge({ status }: { status: string }) {
   return (
     <span className={"badge " + status}>
@@ -512,7 +531,7 @@ function App() {
                               </strong>
                               <Badge status={r.status} />
                             </div>
-                            <small>{r.created_at}</small>
+                            <small>{localTime(r.created_at)}</small>
                             <span>
                               {fmt(r.tokens)} tokens <ChevronRight size={14} />
                             </span>
@@ -535,10 +554,15 @@ function App() {
                           );
                         })
                       }
-                      onResume={(id, currentLlm, currentTokenLimit) =>
+                      onResume={(
+                        id,
+                        currentLlm,
+                        currentTokenLimit,
+                        currentReviewLimit,
+                      ) =>
                         action(async () => {
                           await api(
-                            `/runs/${id}/resume?current_llm=${currentLlm}&current_token_limit=${currentTokenLimit}`,
+                            `/runs/${id}/resume?current_llm=${currentLlm}&current_token_limit=${currentTokenLimit}&current_review_limit=${currentReviewLimit}`,
                             send("POST"),
                           );
                         })
@@ -734,11 +758,14 @@ function TaskEditor({
                 onChange={(e) => change("language", e.target.value)}
               />
             </Field>
-            <Field label="최대 반복 횟수">
+            <Field
+              label="최대 검토 회차"
+              help="1회는 검토만 수행합니다. 2회 이상이면 앞 회차 지적을 수정한 뒤 다음 회차에서 다시 검토합니다."
+            >
               <input
                 type="number"
                 min="1"
-                max="10"
+                max="20"
                 value={v.max_iterations}
                 onChange={(e) => change("max_iterations", +e.target.value)}
               />
@@ -828,10 +855,12 @@ function RunDetail({
     id: string,
     currentLlm: boolean,
     currentTokenLimit: boolean,
+    currentReviewLimit: boolean,
   ) => void;
 }) {
   const [currentLlm, setCurrentLlm] = useState(false);
   const [currentTokenLimit, setCurrentTokenLimit] = useState(false);
+  const [currentReviewLimit, setCurrentReviewLimit] = useState(false);
   const [events, setEvents] = useState<RunEvent[]>([]),
     [eventError, setEventError] = useState(""),
     [files, setFiles] = useState<RunFile[]>([]),
@@ -846,7 +875,7 @@ function RunDetail({
   useEffect(() => {
     setEvents([]);
     setEventError("");
-    if (!run) return;
+    if (!run || !streamActive) return;
     const es = new EventSource(`/api/v1/runs/${run.id}/events`);
     let active = true;
     let ended = false;
@@ -991,10 +1020,7 @@ function RunDetail({
           </button>
         ) : (
           (["failed", "cancelled", "interrupted"].includes(run.status) ||
-            (run.status === "completed_with_warnings" &&
-              JSON.stringify(run.progress).includes(
-                "this document is incomplete",
-              ))) && (
+            run.status === "completed_with_warnings") && (
             <div>
               <label className="checkbox">
                 <input
@@ -1012,17 +1038,32 @@ function RunDetail({
                 />
                 현재 작업의 토큰 한도 적용
               </label>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={currentReviewLimit}
+                  onChange={(e) => setCurrentReviewLimit(e.target.checked)}
+                />
+                현재 작업의 검토 회차 적용
+              </label>
               <button
                 className="secondary"
-                onClick={() => onResume(run.id, currentLlm, currentTokenLimit)}
+                onClick={() =>
+                  onResume(
+                    run.id,
+                    currentLlm,
+                    currentTokenLimit,
+                    currentReviewLimit,
+                  )
+                }
               >
                 <RefreshCw size={14} />
                 체크포인트 재개
               </button>
               <small>
-                기존 소스와 완료 섹션을 유지합니다. 토큰 한도 적용을 선택하면
-                작업에 저장된 최신 한도로 재개합니다. 시간·비용 한도는
-                유지합니다.
+                기존 소스와 완료 섹션을 유지합니다. 검토 완료 경고를 이어서
+                수정하려면 작업의 검토 회차를 늘린 뒤 현재 검토 회차 적용을
+                선택하세요. 시간·비용 한도는 유지합니다.
               </small>
             </div>
           )
@@ -1598,7 +1639,7 @@ function Documents({
           <option value="">문서를 선택하세요</option>
           {artifacts.map((a) => (
             <option key={a.id} value={a.id}>
-              {a.path.split(/[\\/]/).pop()} · {a.created_at} ·{" "}
+              {a.path.split(/[\\/]/).pop()} · {localTime(a.created_at)} ·{" "}
               {a.warnings.some((w) => w.includes("this document is incomplete"))
                 ? "부분 생성"
                 : a.warnings.length
@@ -1621,7 +1662,7 @@ function Documents({
             )
             .map((a) => (
               <option key={a.id} value={a.id}>
-                {a.created_at}
+                {localTime(a.created_at)}
               </option>
             ))}
         </select>
@@ -1676,7 +1717,17 @@ function Documents({
   );
 }
 
-createRoot(document.getElementById("root")!).render(
+declare global {
+  interface Window {
+    __doccraftRoot?: Root;
+  }
+}
+
+const rootContainer = document.getElementById("root")!;
+// Vite can re-evaluate this entry module during HMR; reuse the mounted root.
+const root = window.__doccraftRoot ?? createRoot(rootContainer);
+window.__doccraftRoot = root;
+root.render(
   <React.StrictMode>
     <App />
   </React.StrictMode>,

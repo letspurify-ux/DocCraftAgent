@@ -123,13 +123,39 @@ pub fn excerpt(text: &str, limit: usize) -> String {
     format!("{}{}{}", &text[..head], GAP, &text[tail..])
 }
 
+fn markdown_headings(markdown: &str) -> Vec<&str> {
+    let (literals, _) = block_code_ranges(markdown);
+    let mut offset = 0;
+    let mut headings = Vec::new();
+    for raw_line in markdown.split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        if !literals.iter().any(|range| range.contains(&offset)) && indent <= 3 {
+            let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+            if (1..=6).contains(&level)
+                && trimmed
+                    .get(level..)
+                    .is_some_and(|rest| rest.starts_with(' '))
+            {
+                headings.push(trimmed);
+            }
+        }
+        offset += raw_line.len();
+    }
+    headings
+}
+
 pub fn digest(sections: &[Section], byte_budget: usize) -> Vec<Value> {
     let per = byte_budget / sections.len().max(1);
     sections.iter().enumerate().map(|(index, section)| {
         let mut text = section.markdown.clone();
         for e in &section.evidence { text = replace_citation(&text, &e.id, "[source]"); }
-        let headings = text.lines().filter(|line| line.starts_with('#')).take(16).collect::<Vec<_>>().join("\n");
-        json!({"section":index,"title":section.title,"headings":excerpt(&headings,per/3),"text":excerpt(&text,per*2/3),"excerpted":text.len()>per*2/3,"mermaid_count":section.markdown.lines().filter(|line| line.trim_start().starts_with("```mermaid")).count(),"heading_count":section.markdown.lines().filter(|line| line.trim_start().starts_with('#')).count()})
+        let headings = markdown_headings(&text);
+        let heading_count = headings.len();
+        let headings = headings.into_iter().take(16).collect::<Vec<_>>().join("\n");
+        json!({"section":index,"title":section.title,"headings":excerpt(&headings,per/3),"text":excerpt(&text,per*2/3),"excerpted":text.len()>per*2/3,"mermaid_count":section.markdown.lines().filter(|line| line.trim_start().starts_with("```mermaid")).count(),"heading_count":heading_count})
     }).collect()
 }
 
@@ -216,6 +242,19 @@ mod tests {
             "```markdown\n```mermaid\nflowchart LR\nA-->B\n```\n```"
         ));
         assert!(has_unclosed_fence("~~~rust\nlet value = 1;"));
+    }
+    #[test]
+    fn digest_counts_only_rendered_headings() {
+        let section = Section {
+            title: "Examples".into(),
+            markdown:
+                "### 실제 제목\n\n```text\n# 명령 예시\n## 출력 예시\n```\n\n    # 들여쓴 코드\n"
+                    .into(),
+            evidence: vec![],
+        };
+        let digest = digest(&[section], 4000);
+        assert_eq!(digest[0]["heading_count"], 1);
+        assert_eq!(digest[0]["headings"], "### 실제 제목");
     }
 }
 

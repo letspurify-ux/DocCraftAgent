@@ -82,7 +82,9 @@ pub async fn connect(c: &DbConfig, migrate: bool) -> Result<MySqlPool> {
         .acquire_timeout(Duration::from_secs(5))
         .after_connect(|conn, _| {
             Box::pin(async move {
-                sqlx::query("SET SESSION max_statement_time=10, innodb_lock_wait_timeout=5")
+                sqlx::query(
+                    "SET SESSION time_zone='+00:00', max_statement_time=10, innodb_lock_wait_timeout=5",
+                )
                     .execute(conn)
                     .await?;
                 Ok(())

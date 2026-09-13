@@ -113,7 +113,7 @@ test("terminal event closes the browser event stream", async ({ page }) => {
   });
   await mockWorkspace(
     page,
-    [run("run-a", "종료된 실행")],
+    [{ ...run("run-a", "실행 중인 작업"), status: "running" }],
     async (route) => route.fulfill({ json: { files: [], has_more: false } }),
     "retry: 50\n\nevent: stream-end\ndata: terminal\n\n",
   );
@@ -122,6 +122,75 @@ test("terminal event closes the browser event stream", async ({ page }) => {
   await expect(page.locator(".run-detail")).toBeVisible();
   await page.waitForTimeout(300);
   expect(connections).toBe(1);
+});
+
+test("terminal runs do not open an event stream", async ({ page }) => {
+  let connections = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.endsWith("/events")) connections++;
+  });
+  await mockWorkspace(page, [run("run-a", "종료된 실행")], async (route) =>
+    route.fulfill({ json: { files: [], has_more: false } }),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "실행 모니터", exact: true }).click();
+  await expect(page.locator(".run-detail")).toBeVisible();
+  await page.waitForTimeout(100);
+  expect(connections).toBe(0);
+});
+
+test("warning-completed runs can continue with a higher UI review limit", async ({
+  page,
+}) => {
+  await mockWorkspace(
+    page,
+    [
+      {
+        ...run("run-a", "추가 검토"),
+        status: "completed_with_warnings",
+        progress: { title: "추가 검토", warnings: ["minor issue"] },
+      },
+    ],
+    async (route) => route.fulfill({ json: { files: [], has_more: false } }),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "실행 모니터", exact: true }).click();
+  await page
+    .getByRole("checkbox", { name: "현재 작업의 검토 회차 적용" })
+    .check();
+  const resumed = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      new URL(request.url()).pathname.endsWith("/runs/run-a/resume"),
+  );
+  await page.getByRole("button", { name: "체크포인트 재개" }).click();
+  const url = new URL((await resumed).url());
+  expect(url.searchParams.get("current_review_limit")).toBe("true");
+});
+
+test("UTC database timestamps are displayed in the browser timezone", async ({
+  page,
+}) => {
+  await mockWorkspace(page, [run("run-a", "시간 표시")], async (route) =>
+    route.fulfill({ json: { files: [], has_more: false } }),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "실행 모니터", exact: true }).click();
+  const expected = await page.evaluate(() =>
+    new Intl.DateTimeFormat("ko-KR", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).format(new Date("2026-09-13T12:00:00Z")),
+  );
+  await expect(page.locator(".run-row small")).toHaveText(expected);
+  await expect(page.locator(".run-row small")).not.toHaveText(
+    "2026-09-13 12:00:00",
+  );
 });
 
 test("file history pagination ends on the last page", async ({ page }) => {
@@ -186,7 +255,7 @@ test("malformed progress event is skipped without breaking later events", async 
   page.on("pageerror", (error) => errors.push(error.message));
   await mockWorkspace(
     page,
-    [run("run-a", "실행 A")],
+    [{ ...run("run-a", "실행 A"), status: "running" }],
     async (route) => route.fulfill({ json: { files: [], has_more: false } }),
     [
       "retry: 60000",

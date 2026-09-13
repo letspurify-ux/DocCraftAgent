@@ -52,6 +52,9 @@ async fn read_response(response: reqwest::Response) -> Result<Value> {
     }
     serde_json::from_slice(&bytes).context("API returned invalid JSON")
 }
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
 pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<String> {
     ctx.check()?;
     let c = &ctx.snapshot.settings.llm;
@@ -103,13 +106,13 @@ pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<St
     }
     for attempt in 0..=c.retries {
         ctx.check()?;
-        let _permit = tokio::select! { _ = ctx.cancel.cancelled() => { bail!("CANCELLED"); }, p=ctx.state.llm_slots.acquire() => p? };
         rate_limit(ctx, reservation).await?;
         ctx.reserve(
             reservation,
             (b.input as f64 * c.input_price + b.output as f64 * c.output_price) / 1_000_000.0,
         )?;
         ctx.event("llm_request",json!({"stage":"llm","attempt":attempt+1,"budget":b,"reserved_total":ctx.reserved_tokens.load(std::sync::atomic::Ordering::Relaxed)})).await?;
+        let permit = tokio::select! { _ = ctx.cancel.cancelled() => { bail!("CANCELLED"); }, p=ctx.state.llm_slots.acquire() => p? };
         let start = Instant::now();
         let response = tokio::select! {
             _ = ctx.cancel.cancelled() => { bail!("CANCELLED"); },
@@ -129,6 +132,7 @@ pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<St
                 {
                     Ok(body) => body,
                     Err(e) if e.downcast_ref::<reqwest::Error>().is_some() => {
+                        drop(permit);
                         ctx.event("retry", json!({"stage":"retry","attempt":attempt+1,"reason":"response_body_connection_or_timeout","exhausted":attempt==c.retries})).await?;
                         if attempt == c.retries {
                             bail!("API_RETRIES_EXHAUSTED: response body connection or timeout");
@@ -136,8 +140,35 @@ pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<St
                         cancellable_delay(ctx, Duration::from_secs(1u64 << attempt)).await?;
                         continue;
                     }
-                    Err(e) => return Err(e),
+                    Err(_) if retryable_status(status) => {
+                        drop(permit);
+                        ctx.event("retry", json!({"stage":"retry","attempt":attempt+1,"http_status":status.as_u16(),"reason":"invalid_error_response","exhausted":attempt==c.retries})).await?;
+                        if attempt == c.retries {
+                            bail!(
+                                "API_RETRIES_EXHAUSTED: HTTP {} returned invalid JSON",
+                                status.as_u16()
+                            );
+                        }
+                        cancellable_delay(
+                            ctx,
+                            Duration::from_secs(retry_after.max(1u64 << attempt)),
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(_) if !status.is_success() => {
+                        drop(permit);
+                        bail!(
+                            "API rejected request (HTTP {}); verify authentication, model and reasoning parameter support",
+                            status.as_u16()
+                        );
+                    }
+                    Err(e) => {
+                        drop(permit);
+                        return Err(e);
+                    }
                 };
+                drop(permit);
                 if status.is_success() && body.get("error").is_some() {
                     let message = body
                         .pointer("/error/message")
@@ -243,7 +274,7 @@ pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<St
                         .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
                     bail!("CONTEXT_BUDGET: server requires smaller input");
                 }
-                if status.as_u16() != 429 && !status.is_server_error() {
+                if !retryable_status(status) {
                     bail!(
                         "API rejected request (HTTP {}); verify authentication, model and reasoning parameter support",
                         status.as_u16()
@@ -261,6 +292,7 @@ pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<St
                     .await?;
             }
             Err(_) => {
+                drop(permit);
                 if attempt == c.retries {
                     bail!("API_RETRIES_EXHAUSTED: connection or timeout");
                 }
@@ -340,13 +372,13 @@ pub async fn test(c: &LlmConfig) -> Result<Value> {
         .await
         .context("LLM connection failed")?;
     let status = response.status();
-    let body = read_response(response).await?;
     if !status.is_success() {
         bail!(
             "LLM probe rejected (HTTP {}); check model, key and reasoning mapping",
             status.as_u16()
         );
     }
+    let body = read_response(response).await?;
     if body.pointer("/choices/0/message").is_none() {
         let code = body
             .pointer("/error/code")
@@ -397,5 +429,14 @@ mod quota_tests {
             "429",
             "rate limit exceeded: requests per minute"
         ));
+    }
+
+    #[test]
+    fn retries_rate_limits_and_server_failures_regardless_of_body_format() {
+        assert!(retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(retryable_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(retryable_status(reqwest::StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!retryable_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!retryable_status(reqwest::StatusCode::UNAUTHORIZED));
     }
 }

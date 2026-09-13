@@ -31,14 +31,76 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let text = self.0.to_string();
-        let text = if text.contains("http://") || text.contains("https://") {
-            "Network operation failed; check connection settings".into()
-        } else {
-            text
-        };
-        (StatusCode::BAD_REQUEST, Json(json!({"error":text}))).into_response()
+        let (status, text) = public_api_error(&self.0);
+        (status, Json(json!({"error":text}))).into_response()
     }
+}
+fn public_api_error(error: &anyhow::Error) -> (StatusCode, String) {
+    if let Some(error) = error.downcast_ref::<sqlx::Error>() {
+        return match error {
+            sqlx::Error::RowNotFound => (StatusCode::NOT_FOUND, "Resource not found".into()),
+            sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database temporarily unavailable".into(),
+            ),
+            sqlx::Error::Database(database)
+                if database.code().as_deref().is_some_and(|code| {
+                    [
+                        "1040", "1042", "1152", "1153", "1158", "1159", "1160", "1161", "1205",
+                        "1213", "2002", "2003", "2006", "2013",
+                    ]
+                    .contains(&code)
+                }) =>
+            {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database temporarily unavailable".into(),
+                )
+            }
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".into(),
+            ),
+        };
+    }
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        return if error.is_timeout() {
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "Upstream request timed out".into(),
+            )
+        } else {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream service request failed".into(),
+            )
+        };
+    }
+    if error
+        .downcast_ref::<tokio::time::error::Elapsed>()
+        .is_some()
+    {
+        return (StatusCode::GATEWAY_TIMEOUT, "Operation timed out".into());
+    }
+    if error.downcast_ref::<serde_json::Error>().is_some()
+        || error.downcast_ref::<std::io::Error>().is_some()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error".into(),
+        );
+    }
+    let text = error.to_string();
+    let text = if text.contains("http://") || text.contains("https://") {
+        "Network operation failed; check connection settings".into()
+    } else {
+        text
+    };
+    (StatusCode::BAD_REQUEST, text)
 }
 type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -248,13 +310,9 @@ async fn settings_put(
     let pool = tokio::time::timeout(Duration::from_secs(20), db::connect(&new.db, true))
         .await
         .context("Database connection timed out")??;
+    // The encrypted vault is the authoritative settings store. Keeping a second,
+    // unread database copy made a partial save possible when its write failed.
     s.vault.save(&new)?;
-    sqlx::query(
-        "INSERT INTO app_settings(id,data) VALUES(1,?) ON DUPLICATE KEY UPDATE data=VALUES(data)",
-    )
-    .bind(s.vault.encrypt(&serde_json::to_string(&new)?)?)
-    .execute(&pool)
-    .await?;
     adjust_slots(&s.jobs, old.max_jobs, new.max_jobs);
     adjust_slots(&s.llm_slots, old.llm.concurrency, new.llm.concurrency);
     *s.pool.write().await = Some(pool);
@@ -314,8 +372,21 @@ async fn diagnostics(State(s): State<Arc<AppState>>) -> ApiResult<Value> {
         false
     };
     let settings = s.settings.read().await.clone();
+    let node = s
+        .node_version
+        .get_or_init(|| async {
+            tokio::process::Command::new("node")
+                .arg("--version")
+                .output()
+                .await
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
+        .await
+        .clone();
     Ok(Json(
-        json!({"database":db_ok,"active_runs":s.controls.lock().await.len(),"llm_configured":!settings.llm.model.is_empty(),"token_mode":settings.llm.token_mode,"source_roots":settings.source_roots,"output_roots":settings.output_roots,"data_dir":s.vault.dir,"node":tokio::process::Command::new("node").arg("--version").output().await.ok().map(|o|String::from_utf8_lossy(&o.stdout).trim().to_string())}),
+        json!({"database":db_ok,"active_runs":s.controls.lock().await.len(),"llm_configured":!settings.llm.model.is_empty(),"token_mode":settings.llm.token_mode,"source_roots":settings.source_roots,"output_roots":settings.output_roots,"data_dir":s.vault.dir,"node":node}),
     ))
 }
 #[utoipa::path(get,path="/api/v1/tasks",responses((status=200,body=[TaskConfig])))]
@@ -441,20 +512,7 @@ async fn runs_list(State(s): State<Arc<AppState>>) -> ApiResult<Vec<RunView>> {
 }
 #[utoipa::path(post,path="/api/v1/runs/{id}/cancel",params(("id"=String,Path)),responses((status=200)))]
 async fn cancel_run(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult<Value> {
-    let cancelled = {
-        let controls = s.controls.lock().await;
-        if let Some(c) = controls.get(&id) {
-            let _gate = c.gate.lock.lock().unwrap_or_else(|p| p.into_inner());
-            if c.gate.published.load(std::sync::atomic::Ordering::Acquire) {
-                false
-            } else {
-                c.token.cancel();
-                true
-            }
-        } else {
-            false
-        }
-    };
+    let cancelled = request_cancel(&s, &id).await;
     if cancelled {
         config::atomic_private(
             &s.vault.dir.join("terminal").join(format!("{id}.json")),
@@ -471,6 +529,33 @@ async fn cancel_run(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> A
         });
     }
     Ok(Json(json!({"accepted":cancelled,"id":id})))
+}
+async fn request_cancel(s: &AppState, id: &str) -> bool {
+    let control = {
+        let controls = s.controls.lock().await;
+        controls
+            .get(id)
+            .map(|control| (control.token.clone(), control.gate.clone()))
+    };
+    if let Some((token, gate)) = control {
+        // Do not hold the global registry while waiting for the short publication
+        // boundary. Revalidate under a single gate -> registry lock order so a
+        // finishing worker cannot be cancelled after removing its control entry.
+        let _gate_guard = gate.lock.lock().await;
+        let controls = s.controls.lock().await;
+        if controls
+            .get(id)
+            .is_some_and(|control| Arc::ptr_eq(&control.gate, &gate))
+            && !gate.published.load(std::sync::atomic::Ordering::Acquire)
+        {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
 }
 #[derive(Default, Deserialize)]
 struct ResumeOptions {
@@ -608,13 +693,45 @@ async fn events(
         })
         .unwrap_or(0);
     let stream = async_stream::stream! {
+        let mut idle_polls = 0u8;
         loop{
+            let mut full_page = false;
+            let mut terminal = false;
             match db::events(&pool,&id,after).await{
-                Ok(events)=>{for e in events{after=e.id;if let Ok(event)=Event::default().id(e.id.to_string()).event("progress").json_data(e){yield Ok(event);}}},
+                Ok(events)=>{
+                    full_page = events.len() == 200;
+                    terminal = events.iter().any(|event| event.kind == "terminal");
+                    for e in events{after=e.id;if let Ok(event)=Event::default().id(e.id.to_string()).event("progress").json_data(e){yield Ok(event);}}
+                    if full_page {
+                        idle_polls = 0;
+                    } else {
+                        idle_polls = idle_polls.saturating_add(1);
+                    }
+                },
                 Err(_)=>{yield Ok(Event::default().event("connection").data("database temporarily unavailable"));}
             }
+            if terminal {
+                yield Ok(Event::default().event("stream-end").data("terminal"));
+                break;
+            }
+            if idle_polls == 1 || idle_polls >= 20 {
+                idle_polls = 0;
+                match sqlx::query_scalar::<_,String>("SELECT status FROM runs WHERE id=?").bind(&id).fetch_optional(&pool).await {
+                    Ok(Some(status)) if !["queued","running","cancelling","interrupted"].contains(&status.as_str()) => {
+                        yield Ok(Event::default().event("stream-end").data("terminal"));
+                        break;
+                    },
+                    Ok(None) => {
+                        yield Ok(Event::default().event("stream-end").data("not-found"));
+                        break;
+                    },
+                    _ => {}
+                }
+            }
             if s.shutdown.is_cancelled(){break;}
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            if !full_page {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))))
@@ -624,12 +741,14 @@ async fn files(
     Path(id): Path<String>,
     Query(q): Query<Cursor>,
 ) -> ApiResult<Value> {
-    let rows=sqlx::query("SELECT id,path,language,status,detail FROM files WHERE run_id=? AND id>? ORDER BY id LIMIT 200").bind(id).bind(q.after.unwrap_or(0)).fetch_all(&s.db().await?).await?;
+    let mut rows=sqlx::query("SELECT id,path,language,status,detail FROM files WHERE run_id=? AND id>? ORDER BY id LIMIT 201").bind(id).bind(q.after.unwrap_or(0)).fetch_all(&s.db().await?).await?;
+    let has_more = rows.len() > 200;
+    rows.truncate(200);
     let mut values = vec![];
     for r in rows {
         values.push(json!({"id":r.try_get::<u64,_>("id")?,"path":r.try_get::<String,_>("path")?,"language":r.try_get::<String,_>("language")?,"status":r.try_get::<String,_>("status")?,"detail":r.try_get::<String,_>("detail")?}));
     }
-    Ok(Json(json!({"files":values})))
+    Ok(Json(json!({"files":values,"has_more":has_more})))
 }
 async fn artifacts(State(s): State<Arc<AppState>>) -> ApiResult<Value> {
     let rows=sqlx::query("SELECT id,run_id,task_id,path,warnings,CAST(created_at AS CHAR) created_at FROM artifacts ORDER BY created_at DESC LIMIT 200").fetch_all(&s.db().await?).await?;
@@ -668,5 +787,106 @@ mod origin_tests {
         ] {
             assert!(!allowed_origin(origin, 8765, 6001), "{origin}");
         }
+    }
+
+    #[test]
+    fn api_errors_have_safe_and_meaningful_status_codes() {
+        let response = ApiError(sqlx::Error::RowNotFound.into()).into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = ApiError(sqlx::Error::PoolClosed.into()).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let response =
+            ApiError(sqlx::Error::ColumnNotFound("missing".into()).into()).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let response = ApiError(anyhow::anyhow!("Invalid task configuration")).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cancellation_wait_does_not_lock_the_control_registry() -> anyhow::Result<()> {
+        let data = tempfile::tempdir()?;
+        let state = Arc::new(AppState::new(
+            config::Vault::open(data.path().to_path_buf())?,
+            Settings::default(),
+            None,
+        ));
+        let token = tokio_util::sync::CancellationToken::new();
+        let gate = Arc::new(runner::CommitGate {
+            lock: tokio::sync::Mutex::new(()),
+            published: std::sync::atomic::AtomicBool::new(false),
+        });
+        state.controls.lock().await.insert(
+            "run".into(),
+            runner::Control {
+                token: token.clone(),
+                target: "target.md".into(),
+                gate: gate.clone(),
+            },
+        );
+
+        let held = gate.lock.lock().await;
+        let request = tokio::spawn({
+            let state = state.clone();
+            async move { request_cancel(&state, "run").await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        let registry = tokio::time::timeout(Duration::from_millis(100), state.controls.lock())
+            .await
+            .context("cancellation held the control registry while waiting for publication")?;
+        drop(registry);
+        drop(held);
+        assert!(request.await?);
+        assert!(token.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_cancellation_cannot_override_a_finished_run() -> anyhow::Result<()> {
+        let data = tempfile::tempdir()?;
+        let state = Arc::new(AppState::new(
+            config::Vault::open(data.path().to_path_buf())?,
+            Settings::default(),
+            None,
+        ));
+        let token = tokio_util::sync::CancellationToken::new();
+        let gate = Arc::new(runner::CommitGate {
+            lock: tokio::sync::Mutex::new(()),
+            published: std::sync::atomic::AtomicBool::new(false),
+        });
+        state.controls.lock().await.insert(
+            "run".into(),
+            runner::Control {
+                token: token.clone(),
+                target: "target.md".into(),
+                gate: gate.clone(),
+            },
+        );
+
+        let held = gate.lock.lock().await;
+        let request = tokio::spawn({
+            let state = state.clone();
+            async move { request_cancel(&state, "run").await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        state.controls.lock().await.remove("run");
+        drop(held);
+
+        assert!(!request.await?);
+        assert!(!token.is_cancelled());
+        Ok(())
     }
 }

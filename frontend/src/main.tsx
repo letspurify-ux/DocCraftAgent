@@ -30,6 +30,17 @@ import { api, send, newTask, type Task, type Run, type Artifact } from "./api";
 import "./styles.css";
 
 type Page = "tasks" | "runs" | "documents" | "settings";
+type RunEvent = { id: number; kind: string; data: unknown };
+type RunFile = {
+  id: number;
+  path: string;
+  language: string;
+  status: string;
+  detail: string;
+};
+type RunFilesResponse = { files: RunFile[]; has_more?: boolean };
+const FILE_PAGE_SIZE = 200;
+const EVENT_LIMIT = 500;
 const busy = (s: string) => ["queued", "running", "cancelling"].includes(s);
 const labels: Record<string, string> = {
   queued: "대기 중",
@@ -64,13 +75,15 @@ function App() {
     [selected, setSelected] = useState<string | null>(null),
     [ready, setReady] = useState(false),
     [search, setSearch] = useState("");
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (signal?: AbortSignal) => {
+    const options = signal ? { signal } : undefined;
     const results = await Promise.allSettled([
-      api<Task[]>("/tasks"),
-      api<Run[]>("/runs"),
-      api<{ artifacts: Artifact[] }>("/artifacts"),
-      api("/diagnostics"),
+      api<Task[]>("/tasks", options),
+      api<Run[]>("/runs", options),
+      api<{ artifacts: Artifact[] }>("/artifacts", options),
+      api("/diagnostics", options),
     ]);
+    if (signal?.aborted) return;
     if (results[0].status === "fulfilled") setTasks(results[0].value);
     if (results[1].status === "fulfilled") setRuns(results[1].value);
     if (results[2].status === "fulfilled")
@@ -83,19 +96,35 @@ function App() {
     );
   }, []);
   useEffect(() => {
-    api("/session")
-      .then(() => api("/settings"))
-      .then((s) => {
+    const controller = new AbortController();
+    api("/session", { signal: controller.signal })
+      .then(() => api("/settings", { signal: controller.signal }))
+      .then(async (s) => {
         setSettings(s);
+        await refresh(controller.signal);
         setReady(true);
-        return refresh();
       })
-      .catch((e) => setError(e.message));
+      .catch((e) => {
+        if (e.name !== "AbortError") setError(e.message);
+      });
+    return () => controller.abort();
   }, [refresh]);
   useEffect(() => {
     if (!ready) return;
-    const timer = setInterval(refresh, 2500);
-    return () => clearInterval(timer);
+    let stopped = false;
+    let timer: number | undefined;
+    let controller: AbortController | undefined;
+    const poll = async () => {
+      controller = new AbortController();
+      await refresh(controller.signal);
+      if (!stopped) timer = window.setTimeout(poll, 2500);
+    };
+    timer = window.setTimeout(poll, 2500);
+    return () => {
+      stopped = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      controller?.abort();
+    };
   }, [ready, refresh]);
   const action = async (fn: () => Promise<void>) => {
     setError("");
@@ -175,16 +204,19 @@ function App() {
       </aside>
       <main>
         <header className="topbar">
-          <span>
-            워크스페이스 <ChevronRight size={14} />{" "}
-            {
+          <span className="breadcrumb">
+            <span className="breadcrumb-root">워크스페이스</span>
+            <ChevronRight className="breadcrumb-separator" size={14} />
+            <strong className="breadcrumb-page">
               {
-                tasks: "문서화 작업",
-                runs: "실행 모니터",
-                documents: "문서 라이브러리",
-                settings: "설정",
-              }[page]
-            }
+                {
+                  tasks: "문서화 작업",
+                  runs: "실행 모니터",
+                  documents: "문서 라이브러리",
+                  settings: "설정",
+                }[page]
+              }
+            </strong>
           </span>
           <div
             className={
@@ -452,7 +484,7 @@ function App() {
                       <h1>실행 모니터</h1>
                       <p>분석 근거, 반복 검토와 토큰 사용량을 확인합니다.</p>
                     </div>
-                    <button className="secondary" onClick={refresh}>
+                    <button className="secondary" onClick={() => refresh()}>
                       <RefreshCw size={16} />
                       새로고침
                     </button>
@@ -800,30 +832,139 @@ function RunDetail({
 }) {
   const [currentLlm, setCurrentLlm] = useState(false);
   const [currentTokenLimit, setCurrentTokenLimit] = useState(false);
-  const [events, setEvents] = useState<any[]>([]),
-    [files, setFiles] = useState<any[]>([]),
+  const [events, setEvents] = useState<RunEvent[]>([]),
+    [eventError, setEventError] = useState(""),
+    [files, setFiles] = useState<RunFile[]>([]),
+    [filesLoading, setFilesLoading] = useState(false),
+    [filesHasMore, setFilesHasMore] = useState(false),
+    [filesError, setFilesError] = useState(""),
+    [filesReload, setFilesReload] = useState(0),
     [tab, setTab] = useState("events");
+  const fileRequest = useRef(0);
+  const fileAbort = useRef<AbortController | null>(null);
+  const streamActive = run ? busy(run.status) : false;
   useEffect(() => {
     setEvents([]);
-    setFiles([]);
+    setEventError("");
     if (!run) return;
     const es = new EventSource(`/api/v1/runs/${run.id}/events`);
-    es.addEventListener("progress", (e) => {
-      const value = JSON.parse((e as MessageEvent).data);
-      setEvents((prev) =>
-        prev.some((v) => v.id === value.id)
-          ? prev
-          : [...prev, value].slice(-500),
-      );
+    let active = true;
+    let ended = false;
+    es.onopen = () => {
+      if (active) setEventError("");
+    };
+    es.onerror = () => {
+      if (active && !ended)
+        setEventError(
+          "이벤트 스트림 연결이 끊겼습니다. 자동으로 다시 연결합니다.",
+        );
+    };
+    es.addEventListener("connection", () => {
+      if (active)
+        setEventError(
+          "이벤트 저장소에 일시적으로 연결할 수 없습니다. 자동으로 다시 시도합니다.",
+        );
     });
-    return () => es.close();
-  }, [run?.id]);
+    es.addEventListener("progress", (e) => {
+      if (!active) return;
+      try {
+        const value = JSON.parse((e as MessageEvent).data) as RunEvent;
+        if (
+          !Number.isSafeInteger(value?.id) ||
+          typeof value?.kind !== "string" ||
+          !("data" in value)
+        )
+          throw new Error("Invalid progress event");
+        setEvents((prev) =>
+          prev.some((v) => v.id === value.id)
+            ? prev
+            : [...prev, value].slice(-EVENT_LIMIT),
+        );
+      } catch {
+        setEventError(
+          "형식이 잘못된 진행 이벤트를 건너뛰었습니다. 나머지 이벤트는 계속 표시합니다.",
+        );
+      }
+    });
+    es.addEventListener("stream-end", () => {
+      ended = true;
+      es.close();
+      if (active) setEventError("");
+    });
+    return () => {
+      active = false;
+      es.close();
+    };
+  }, [run?.id, streamActive]);
   useEffect(() => {
-    if (run && tab === "files")
-      api(`/runs/${run.id}/files`)
-        .then((r) => setFiles(r.files))
-        .catch(() => setFiles([]));
-  }, [run?.id, tab]);
+    const request = ++fileRequest.current;
+    fileAbort.current?.abort();
+    setFiles([]);
+    setFilesHasMore(false);
+    setFilesError("");
+    setFilesLoading(false);
+    if (!run || tab !== "files") return;
+    const controller = new AbortController();
+    fileAbort.current = controller;
+    setFilesLoading(true);
+    api<RunFilesResponse>(`/runs/${run.id}/files`, {
+      signal: controller.signal,
+    })
+      .then((response) => {
+        if (fileRequest.current !== request) return;
+        setFiles(response.files);
+        setFilesHasMore(
+          response.has_more ?? response.files.length === FILE_PAGE_SIZE,
+        );
+      })
+      .catch((error: Error) => {
+        if (fileRequest.current !== request || error.name === "AbortError")
+          return;
+        setFilesError(`파일 분석 내역을 불러오지 못했습니다. ${error.message}`);
+      })
+      .finally(() => {
+        if (fileRequest.current === request) setFilesLoading(false);
+      });
+    return () => controller.abort();
+  }, [run?.id, tab, filesReload]);
+
+  async function loadMoreFiles() {
+    const after = files.at(-1)?.id;
+    if (!run || !after || filesLoading || !filesHasMore) return;
+    const request = ++fileRequest.current;
+    fileAbort.current?.abort();
+    const controller = new AbortController();
+    fileAbort.current = controller;
+    setFilesLoading(true);
+    setFilesError("");
+    try {
+      const response = await api<RunFilesResponse>(
+        `/runs/${run.id}/files?after=${after}`,
+        { signal: controller.signal },
+      );
+      if (fileRequest.current !== request) return;
+      setFiles((current) => {
+        const existing = new Set(current.map((file) => file.id));
+        return [
+          ...current,
+          ...response.files.filter((file) => !existing.has(file.id)),
+        ];
+      });
+      setFilesHasMore(
+        response.has_more ?? response.files.length === FILE_PAGE_SIZE,
+      );
+    } catch (error) {
+      if (
+        fileRequest.current === request &&
+        (error as Error).name !== "AbortError"
+      )
+        setFilesError(
+          `파일 분석 내역을 더 불러오지 못했습니다. ${(error as Error).message}`,
+        );
+    } finally {
+      if (fileRequest.current === request) setFilesLoading(false);
+    }
+  }
   if (!run)
     return (
       <div className="panel empty">
@@ -918,8 +1059,18 @@ function RunDetail({
       </div>
       {tab === "events" ? (
         <div className="event-list">
+          {eventError && (
+            <div role="alert" className="inline-error">
+              {eventError}
+            </div>
+          )}
           {!events.length && (
             <p className="muted">진행 이벤트를 기다리는 중…</p>
+          )}
+          {events.length === EVENT_LIMIT && (
+            <p className="list-note">
+              최근 {EVENT_LIMIT}개 이벤트를 표시합니다.
+            </p>
           )}
           {[...events].reverse().map((e) => (
             <div className="event" key={e.id}>
@@ -936,24 +1087,43 @@ function RunDetail({
         </div>
       ) : (
         <div className="file-list">
+          {filesError && (
+            <div role="alert" className="inline-error">
+              <span>{filesError}</span>
+              <button
+                className="secondary"
+                onClick={() => setFilesReload((value) => value + 1)}
+              >
+                다시 시도
+              </button>
+            </div>
+          )}
+          {!files.length && filesLoading && (
+            <p className="muted">파일 분석 내역을 불러오는 중…</p>
+          )}
+          {!files.length && !filesLoading && !filesError && (
+            <p className="muted">기록된 파일 분석 내역이 없습니다.</p>
+          )}
           {files.map((f) => (
-            <div key={f.id}>
+            <div className="file-row" key={f.id}>
               <Badge status={f.status} />
               <code>{f.path}</code>
               <small>{f.detail}</small>
             </div>
           ))}
           {files.length > 0 && (
-            <button
-              className="secondary"
-              onClick={() =>
-                api(`/runs/${run.id}/files?after=${files.at(-1).id}`).then(
-                  (r) => setFiles([...files, ...r.files]),
-                )
-              }
-            >
-              더 보기
-            </button>
+            <div className="list-footer">
+              <small>{fmt(files.length)}개 파일</small>
+              {filesHasMore && (
+                <button
+                  className="secondary"
+                  disabled={filesLoading}
+                  onClick={loadMoreFiles}
+                >
+                  {filesLoading ? "불러오는 중…" : "더 보기"}
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}
@@ -1364,26 +1534,28 @@ function Documents({
       w.includes("Missing planned sections:"),
   );
   useEffect(() => {
-    let active = true;
+    const controller = new AbortController();
     setDoc(null);
     if (selected)
-      api(`/artifacts/${selected}`)
+      api(`/artifacts/${selected}`, { signal: controller.signal })
         .then((value) => {
-          if (active) setDoc(value);
+          setDoc(value);
         })
         .catch((e) => {
-          if (active) onError(e.message);
+          if (e.name !== "AbortError") onError(e.message);
         });
-    return () => {
-      active = false;
-    };
+    return () => controller.abort();
   }, [selected]);
   useEffect(() => {
+    const controller = new AbortController();
     if (compare)
-      api(`/artifacts/${compare}`)
+      api(`/artifacts/${compare}`, { signal: controller.signal })
         .then((d) => setOld(d.markdown))
-        .catch((e) => onError(e.message));
+        .catch((e) => {
+          if (e.name !== "AbortError") onError(e.message);
+        });
     else setOld("");
+    return () => controller.abort();
   }, [compare]);
   return (
     <>

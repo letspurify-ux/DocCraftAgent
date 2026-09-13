@@ -47,3 +47,4 @@ tower = { version = "0.5", features = ["util"] }
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+await_holding_lock = "deny"

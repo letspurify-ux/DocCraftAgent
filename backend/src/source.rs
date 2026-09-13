@@ -14,6 +14,11 @@ use tokio::io::AsyncReadExt;
 pub fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
+fn ordered_by_hash<T>(blobs: &[(String, T)]) -> Vec<&(String, T)> {
+    let mut ordered: Vec<_> = blobs.iter().collect();
+    ordered.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    ordered
+}
 pub fn matches_root(path: &Path, roots: &[String]) -> bool {
     roots
         .iter()
@@ -236,30 +241,38 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
             .bind(json!({"parse_errors":parsed.has_errors,"limited":lang=="text","relations":parsed.relations}).to_string()).execute(&ctx.pool).await?;
         let file_id = result.last_insert_id();
         let mut tx = ctx.pool.begin().await?;
-        for batch in parsed.chunks.chunks(64) {
+        let blobs: Vec<_> = parsed
+            .chunks
+            .iter()
+            .map(|chunk| {
+                (
+                    hash(format!("{}:{}", chunk.symbols.join(" "), chunk.content).as_bytes()),
+                    chunk,
+                )
+            })
+            .collect();
+        // Concurrent runs can share the same blobs. Lock every shared hash in a
+        // stable global order before inserting run-specific chunks, including
+        // files whose evidence spans more than one SQL batch.
+        let shared_blobs = ordered_by_hash(&blobs);
+        for batch in shared_blobs.chunks(64) {
             ctx.check()?;
-            let blobs: Vec<_> = batch
-                .iter()
-                .map(|c| {
-                    (
-                        hash(format!("{}:{}", c.symbols.join(" "), c.content).as_bytes()),
-                        c,
-                    )
-                })
-                .collect();
             let mut shared = sqlx::QueryBuilder::<sqlx::MySql>::new(
                 "INSERT IGNORE INTO chunk_blobs(hash,symbols,content) ",
             );
-            shared.push_values(&blobs, |mut b, (hash, chunk)| {
-                b.push_bind(hash)
-                    .push_bind(chunk.symbols.join(" "))
-                    .push_bind(&chunk.content);
+            shared.push_values(batch, |mut b, blob| {
+                b.push_bind(blob.0.as_str())
+                    .push_bind(blob.1.symbols.join(" "))
+                    .push_bind(&blob.1.content);
             });
             shared.build().execute(&mut *tx).await?;
+        }
+        for batch in blobs.chunks(64) {
+            ctx.check()?;
             let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
                 "INSERT INTO chunks(run_id,file_id,path,start_line,end_line,symbols,content,blob_hash) ",
             );
-            query.push_values(&blobs, |mut b, (hash, chunk)| {
+            query.push_values(batch, |mut b, (hash, chunk)| {
                 b.push_bind(&ctx.id)
                     .push_bind(file_id)
                     .push_bind(&normalized)
@@ -347,15 +360,19 @@ async fn worker(ctx: &RunContext, path: &Path, lang: &str) -> Result<parser::Par
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .context("Missing worker stdout")?
-        .take(150 * 1024 * 1024);
+    let stdout = child.stdout.take().context("Missing worker stdout")?;
     let mut bytes = Vec::new();
+    const WORKER_OUTPUT_LIMIT: u64 = 150 * 1024 * 1024;
     tokio::select! {
         _ = ctx.cancel.cancelled() => { let _ = child.kill().await; bail!("CANCELLED"); },
-        result = tokio::time::timeout(Duration::from_secs(30), async { stdout.read_to_end(&mut bytes).await?; child.wait().await }) => {
+        result = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut limited = stdout.take(WORKER_OUTPUT_LIMIT + 1);
+            limited.read_to_end(&mut bytes).await?;
+            if bytes.len() as u64 > WORKER_OUTPUT_LIMIT {
+                return Err(std::io::Error::other("Parser worker output exceeded 150 MiB"));
+            }
+            child.wait().await
+        }) => {
             let status = result.context("Parser worker timeout")??;
             if !status.success() { bail!("Parser worker failed; file isolated"); }
         }
@@ -763,6 +780,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["first", "loop", "unrelated"]
         );
+    }
+
+    #[test]
+    fn shared_blob_locks_have_one_global_order_across_sql_batches() {
+        let blobs: Vec<(String, ())> = (0..130)
+            .rev()
+            .map(|index| (format!("{index:03}"), ()))
+            .collect();
+        let ordered = ordered_by_hash(&blobs)
+            .into_iter()
+            .map(|blob| blob.0.as_str())
+            .collect::<Vec<_>>();
+        assert!(ordered.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(ordered.first().copied(), Some("000"));
+        assert_eq!(ordered.last().copied(), Some("129"));
     }
     #[test]
     fn truncated_evidence_keeps_the_matching_logic_and_source_range() {

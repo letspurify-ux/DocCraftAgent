@@ -68,7 +68,7 @@ pub async fn save(ctx: &RunContext, markdown: &str, warnings: &[String]) -> Resu
     atomic_private(&journal, serde_json::to_string(&p)?.as_bytes())?;
     ctx.check()?;
     {
-        let _gate = ctx.gate.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _gate = ctx.gate.lock.lock().await;
         // No await between final cancellation check and atomic replacement; cancellation API
         // waits for this short synchronous commit boundary before acknowledging completion.
         if path == target {
@@ -150,12 +150,19 @@ pub async fn validate_mermaid(ctx: &RunContext, markdown: &str) -> Result<()> {
         .take()
         .context("Missing Mermaid worker stderr")?;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const DIAGNOSTIC_LIMIT: u64 = 2048;
     tokio::select! {
         _=ctx.cancel.cancelled()=>{let _=child.kill().await;bail!("CANCELLED");},
         result=tokio::time::timeout(Duration::from_secs(15),async{
             stdin.write_all(markdown.as_bytes()).await?;drop(stdin);
             let mut diagnostic = Vec::new();
-            stderr.take(2048).read_to_end(&mut diagnostic).await?;
+            let mut limited = stderr.take(DIAGNOSTIC_LIMIT + 1);
+            limited.read_to_end(&mut diagnostic).await?;
+            if diagnostic.len() as u64 > DIAGNOSTIC_LIMIT {
+                return Err(std::io::Error::other(
+                    "Mermaid validator diagnostic exceeded 2 KiB",
+                ));
+            }
             let status = child.wait().await?;
             Ok::<_, std::io::Error>((status, diagnostic))
         })=>{

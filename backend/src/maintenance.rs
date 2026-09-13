@@ -14,15 +14,27 @@ pub fn start(state: Arc<AppState>) {
                     let _ = cleanup(&state, &pool).await;
                 }
             } else {
-                let config = state.settings.read().await.db.clone();
-                if let Ok(pool) = db::connect(&config, true).await {
-                    *state.pool.write().await = Some(pool);
-                    let _ = crate::runner::recover(state.clone()).await;
-                }
+                let _ = reconnect_database(&state).await;
             }
             cycle = cycle.wrapping_add(1);
         }
     });
+}
+async fn reconnect_database(state: &Arc<AppState>) -> Result<()> {
+    // Settings changes, manual starts and recovery all mutate the pool/run
+    // lifecycle. Serializing the complete reconnect prevents an old snapshot
+    // from being enqueued while a new database configuration is being saved.
+    let _guard = match state.lifecycle.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => return Ok(()),
+    };
+    if state.pool.read().await.is_some() {
+        return Ok(());
+    }
+    let config = state.settings.read().await.db.clone();
+    let pool = db::connect(&config, true).await?;
+    *state.pool.write().await = Some(pool);
+    crate::runner::recover(state.clone()).await
 }
 async fn reconnect_runs(state: &Arc<AppState>, pool: &sqlx::MySqlPool) -> Result<()> {
     let _guard = match state.lifecycle.try_acquire() {
@@ -32,6 +44,7 @@ async fn reconnect_runs(state: &Arc<AppState>, pool: &sqlx::MySqlPool) -> Result
     sqlx::query("SELECT 1").execute(pool).await?;
     crate::runner::replay_terminal(state, pool).await?;
     if state.controls.lock().await.is_empty() {
+        crate::runner::replay_journal(state, pool).await?;
         crate::publish::recover(state, pool).await?;
     }
     let rows=sqlx::query("SELECT id,snapshot FROM runs WHERE status='failed' AND error LIKE 'DB_UNAVAILABLE:%' AND cancel_requested=FALSE LIMIT 10").fetch_all(pool).await?;
@@ -107,4 +120,27 @@ pub async fn cleanup(state: &Arc<AppState>, pool: &sqlx::MySqlPool) -> Result<()
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Vault, model::Settings};
+
+    #[tokio::test]
+    async fn database_reconnect_respects_the_lifecycle_gate() -> Result<()> {
+        let data = tempfile::tempdir()?;
+        let mut settings = Settings::default();
+        settings.db.port = 1;
+        let state = Arc::new(AppState::new(
+            Vault::open(data.path().to_path_buf())?,
+            settings,
+            None,
+        ));
+        let _held = state.lifecycle.acquire().await?;
+
+        tokio::time::timeout(Duration::from_millis(100), reconnect_database(&state)).await??;
+        assert!(state.pool.read().await.is_none());
+        Ok(())
+    }
 }

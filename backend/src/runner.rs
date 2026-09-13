@@ -11,11 +11,11 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 pub struct CommitGate {
-    pub lock: std::sync::Mutex<()>,
+    pub lock: Mutex<()>,
     pub published: std::sync::atomic::AtomicBool,
 }
 pub struct Control {
@@ -34,6 +34,7 @@ pub struct AppState {
     pub rate: Mutex<VecDeque<(Instant, u64)>>,
     pub shutdown: CancellationToken,
     pub session: String,
+    pub node_version: OnceCell<Option<String>>,
 }
 impl AppState {
     pub fn new(vault: Vault, settings: Settings, pool: Option<MySqlPool>) -> Self {
@@ -50,6 +51,7 @@ impl AppState {
             rate: Mutex::new(VecDeque::new()),
             shutdown: CancellationToken::new(),
             session: uuid::Uuid::new_v4().to_string(),
+            node_version: OnceCell::new(),
         }
     }
     pub async fn db(&self) -> Result<MySqlPool> {
@@ -122,7 +124,7 @@ impl RunContext {
     }
     pub async fn event(&self, kind: &str, data: Value) -> Result<()> {
         self.check()?;
-        let journal = json!({"run_id":self.id,"kind":kind,"data":data,"reserved_tokens":self.reserved_tokens.load(Ordering::Relaxed),"reserved_cost":self.reserved_cost.load(Ordering::Relaxed)});
+        let journal = json!({"run_id":self.id,"kind":kind,"data":data,"reserved_tokens":self.reserved_tokens.load(Ordering::Relaxed),"reserved_cost":self.reserved_cost.load(Ordering::Relaxed),"elapsed":self.elapsed_before+self.started.elapsed().as_secs()});
         let path = self
             .state
             .vault
@@ -176,7 +178,7 @@ pub async fn enqueue(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let token = CancellationToken::new();
     let gate = Arc::new(CommitGate {
-        lock: std::sync::Mutex::new(()),
+        lock: Mutex::new(()),
         published: std::sync::atomic::AtomicBool::new(false),
     });
     {
@@ -287,6 +289,7 @@ pub async fn recover(state: Arc<AppState>) -> Result<()> {
         return Ok(());
     };
     replay_terminal(&state, &pool).await?;
+    replay_journal(&state, &pool).await?;
     sqlx::query("UPDATE runs SET status='cancelled' WHERE cancel_requested=TRUE AND status IN ('running','queued','cancelling','interrupted')").execute(&pool).await?;
     publish::recover(&state, &pool).await?;
     let rows=sqlx::query("SELECT id,snapshot FROM runs WHERE status IN ('running','queued','interrupted') ORDER BY created_at").fetch_all(&pool).await?;
@@ -310,6 +313,68 @@ pub async fn recover(state: Arc<AppState>) -> Result<()> {
                 .execute(&pool)
                 .await?;
         }
+    }
+    Ok(())
+}
+pub async fn replay_journal(state: &Arc<AppState>, pool: &MySqlPool) -> Result<()> {
+    let journal_dir = state.vault.dir.join("journal");
+    if !journal_dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&journal_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|p| p.to_str()) != Some("json") {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let run_id = value
+            .get("run_id")
+            .and_then(Value::as_str)
+            .context("Checkpoint journal is missing run_id")?;
+        if path.file_stem().and_then(|p| p.to_str()) != Some(run_id) {
+            bail!("Checkpoint journal run_id does not match its filename");
+        }
+        let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM runs WHERE id=?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?;
+        if exists.is_none() {
+            std::fs::remove_file(path)?;
+            continue;
+        }
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .context("Checkpoint journal is missing kind")?;
+        let data = value
+            .get("data")
+            .context("Checkpoint journal is missing data")?;
+        let encoded = data.to_string();
+        let mut tx = pool.begin().await?;
+        let current =
+            sqlx::query("SELECT data FROM checkpoints WHERE run_id=? AND step='budget' FOR UPDATE")
+                .bind(run_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.try_get::<String, _>("data"))
+                .transpose()?
+                .map(|text| serde_json::from_str::<Value>(&text))
+                .transpose()?
+                .unwrap_or_else(|| json!({}));
+        let budget = json!({
+            "tokens": current.get("tokens").and_then(Value::as_u64).unwrap_or(0).max(value.get("reserved_tokens").and_then(Value::as_u64).unwrap_or(0)),
+            "cost": current.get("cost").and_then(Value::as_u64).unwrap_or(0).max(value.get("reserved_cost").and_then(Value::as_u64).unwrap_or(0)),
+            "elapsed": current.get("elapsed").and_then(Value::as_u64).unwrap_or(0).max(value.get("elapsed").and_then(Value::as_u64).unwrap_or(0)),
+        });
+        sqlx::query("INSERT INTO events(run_id,kind,data) SELECT ?,?,? FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM events WHERE run_id=? AND kind=? AND data=? LIMIT 1)")
+            .bind(run_id).bind(kind).bind(&encoded).bind(run_id).bind(kind).bind(&encoded)
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE runs SET progress=JSON_MERGE_PATCH(JSON_OBJECT('title',JSON_EXTRACT(progress,'$.title'),'section',JSON_EXTRACT(progress,'$.section'),'total_sections',JSON_EXTRACT(progress,'$.total_sections'),'iteration',JSON_EXTRACT(progress,'$.iteration'),'max_iterations',JSON_EXTRACT(progress,'$.max_iterations')),?) WHERE id=?")
+            .bind(&encoded).bind(run_id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,'budget',?) ON DUPLICATE KEY UPDATE data=VALUES(data)")
+            .bind(run_id).bind(budget.to_string()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        std::fs::remove_file(path)?;
     }
     Ok(())
 }

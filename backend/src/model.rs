@@ -167,6 +167,12 @@ pub struct SectionPlan {
     pub handoff: String,
     #[serde(default)]
     pub diagrams: Option<Vec<String>>,
+    /// Reading prerequisites, expressed as earlier zero-based section indices.
+    #[serde(default)]
+    pub depends_on: Vec<usize>,
+    /// Source passages read before planning, retained for the section writer.
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
 }
 #[derive(Clone, Serialize, Deserialize, ToSchema)]
 pub struct Outline {

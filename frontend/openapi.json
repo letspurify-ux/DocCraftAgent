@@ -524,11 +524,26 @@
         "type": "object",
         "required": ["title", "query"],
         "properties": {
+          "depends_on": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Reading prerequisites, expressed as earlier zero-based section indices."
+          },
           "diagrams": {
             "type": ["array", "null"],
             "items": {
               "type": "string"
             }
+          },
+          "evidence_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Source passages read before planning, retained for the section writer."
           },
           "handoff": {
             "type": "string"

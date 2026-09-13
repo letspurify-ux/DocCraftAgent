@@ -8,6 +8,7 @@ mod llm;
 mod maintenance;
 mod model;
 mod parser;
+mod planning;
 mod publish;
 mod runner;
 mod source;

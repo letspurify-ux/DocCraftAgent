@@ -2,8 +2,7 @@
 use crate::model::Section;
 use serde_json::{Value, json};
 
-/// Byte ranges of code literals, so citation examples are not treated as references.
-pub fn code_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
+fn block_code_ranges(markdown: &str) -> (Vec<std::ops::Range<usize>>, bool) {
     let mut ranges = Vec::new();
     let mut fence: Option<(u8, usize, usize)> = None;
     let mut offset = 0;
@@ -29,9 +28,16 @@ pub fn code_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
         }
         offset += line.len();
     }
+    let unclosed = fence.is_some();
     if let Some((_, _, start)) = fence {
         ranges.push(start..markdown.len());
     }
+    (ranges, unclosed)
+}
+
+/// Byte ranges of code literals, so citation examples are not treated as references.
+pub fn code_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
+    let (mut ranges, _) = block_code_ranges(markdown);
     let blocks = ranges.clone();
     let bytes = markdown.as_bytes();
     let mut i = 0;
@@ -71,6 +77,13 @@ pub fn code_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
         }
     }
     ranges
+}
+
+/// CommonMark-style fence balance check. Counting literal ``` markers is not
+/// sufficient because fences may use tildes, more than three markers, or contain
+/// another apparent opening fence as literal text.
+pub fn has_unclosed_fence(markdown: &str) -> bool {
+    block_code_ranges(markdown).1
 }
 
 pub fn replace_citation(markdown: &str, id: &str, replacement: &str) -> String {
@@ -193,6 +206,16 @@ mod tests {
         assert!(!body.contains(&e.id));
         assert!(refs.contains(&e.id) && refs.contains("L2–L9"));
         assert!(!refs.contains("unused"));
+    }
+    #[test]
+    fn fence_balance_follows_commonmark_closing_rules() {
+        assert!(!has_unclosed_fence(
+            "~~~~rust\nlet value = 1;\n~~~~\n\n```text\nplain\n```"
+        ));
+        assert!(has_unclosed_fence(
+            "```markdown\n```mermaid\nflowchart LR\nA-->B\n```\n```"
+        ));
+        assert!(has_unclosed_fence("~~~rust\nlet value = 1;"));
     }
 }
 

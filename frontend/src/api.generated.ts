@@ -265,7 +265,11 @@ export interface components {
       updated_at: string;
     };
     SectionPlan: {
+      /** @description Reading prerequisites, expressed as earlier zero-based section indices. */
+      depends_on?: number[];
       diagrams?: string[] | null;
+      /** @description Source passages read before planning, retained for the section writer. */
+      evidence_ids?: string[];
       handoff?: string;
       query: string;
       reader_question?: string;

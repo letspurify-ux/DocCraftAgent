@@ -42,8 +42,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if model=='quota-partial' and 'Write only Markdown' in instruction:
                 writes=sum(1 for r in requests if r['model']==model and 'Write only Markdown' in r['messages'][-1]['content'])
                 if writes>1: return self.reply({'error':{'code':429,'message':'Rate limit exceeded: free-models-per-day'}},429)
-            if 'sections:[{title' in instruction:
+            if 'Read source evidence before planning' in instruction:
+                evidence=data['evidence']
+                assert evidence and all(e['content'] and e['start']>=1 for e in evidence)
+                final_pass=data['final_pass']
+                result=json.dumps({'findings':[{'topic':'입력과 결과','observation':'구현에서 입력 이름을 검사하고 결과를 반환한다.','kind':'runtime','evidence_ids':[evidence[0]['id']]}], 'uncertainties':[] if final_pass else ['오류 처리와 반환 결과의 연결을 추가 확인한다.'], 'followup_queries':['service.py name_required handle_request'] if model in ['planning-followup','restart-discovery'] and not final_pass else []},ensure_ascii=False)
+                if model=='planning-citation-once' and not getattr(self.server,'planning_citation_sent',False):
+                    self.server.planning_citation_sent=True
+                    invalid=json.loads(result);invalid['findings'][0]['evidence_ids']=['ffffffff'];result=json.dumps(invalid)
+                if model=='planning-invalid':
+                    invalid=json.loads(result);invalid['findings'][0]['evidence_ids']=['ffffffff'];result=json.dumps(invalid)
+                if model=='restart-discovery' and final_pass and not getattr(self.server,'discovery_delayed',False):
+                    self.server.discovery_delayed=True;time.sleep(4)
+            elif 'sections:[{title' in instruction:
                 result=json.dumps({'reader_goal':'입력을 보내고 결과와 오류를 이해한다','storyline':'입력 준비에서 실행, 결과 확인과 오류 대응으로 이어진다','terminology':['처리 결과: 검증을 마친 반환값'],'sections':[{'title':'기능 개요','query':'handle_request handleRequest validation','reader_question':'무엇을 할 수 있는가?','handoff':'검증 조건을 확인한다','diagrams':['입력과 검증 흐름']},{'title':'오류와 제약','query':'name_required errors','reader_question':'어떤 입력이 유효한가?','handoff':'검증을 통과한 입력을 처리한다','diagrams':['오류 분기']},{'title':'처리 흐름','query':'return handle_request','reader_question':'결과를 어떻게 확인하는가?','handoff':'','diagrams':['결과 반환 흐름']}]},ensure_ascii=False)
+                outline=json.loads(result)
+                for index,section in enumerate(outline['sections']):
+                    section['depends_on']=[index-1] if index else []
+                    section['evidence_ids']=[data['source_brief']['findings'][0]['evidence_ids'][0]]
+                if model=='planning-dependency-once' and not data.get('previous_error'):
+                    outline['sections'][0]['depends_on']=[2]
+                result=json.dumps(outline,ensure_ascii=False)
                 if model=='outline-overflow-once' and data.get('previous_error'):
                     outline=json.loads(result);outline['sections'][-1]['diagrams']=[];result=json.dumps(outline,ensure_ascii=False)
             elif 'Review the whole document' in instruction:
@@ -55,7 +74,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     result=json.dumps({'issues':[{'severity':'major','section':1,'message':'앞 절의 입력 준비가 다음 절의 실행으로 이어지도록 결과와 연결을 설명하세요.','query':''}]})
                 else:result=json.dumps({'issues':[]})
             elif 'Review this section' in instruction:
-                if model=='restart-review' and not getattr(self.server,'reviewed_'+str(data['section_index']),False):
+                if model=='section-review-format-once' and not getattr(self.server,'section_review_format_sent',False):
+                    self.server.section_review_format_sent=True
+                    result=json.dumps({'issues':[{'section':data['section_index'],'problem':'wrong review schema'}]})
+                elif model=='restart-review' and not getattr(self.server,'reviewed_'+str(data['section_index']),False):
                     setattr(self.server,'reviewed_'+str(data['section_index']),True)
                     result=json.dumps({'issues':[{'severity':'major','section':data['section_index'],'message':'Add the missing validation condition','query':'name_required'}]})
                 elif model=='review-once' and not getattr(self.server,'review_sent',False):
@@ -70,7 +92,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if model=='diagram-overflow-once' and not getattr(self.server,'diagram_overflow_sent',False):
                     self.server.diagram_overflow_sent=True;result+='\n\n```mermaid\nflowchart LR\n X-->Y\n```'
                 if model=='headings':result='## '+data['title']+'\n\n## Details\n'+result
-                if data.get('correction'):result+=f'\n\n빈 이름의 오류 조건을 추가로 정리했습니다. [E:{eid}]'
+                if model=='wrapped-markdown':result='```markdown\n### 2장: '+data['title']+'\n\n'+result+'\n```'
+                if model=='duplicate-once':
+                    if data.get('correction'):
+                        result=f'{data["title"]}에서만 필요한 새로운 차이점을 설명합니다. [E:{eid}]'
+                        if data.get('section_plan',{}).get('diagrams')!=[]:result+='\n\n```mermaid\nflowchart LR\n A["입력"] --> B["결과"]\n```'
+                    else:
+                        result=f'문서 생성기는 소스 근거를 검색하고 선택된 근거만 사용하여 독자가 이해할 수 있는 설명을 작성합니다. 동일한 설명을 여러 장에 복사하면 각 장의 역할이 흐려지므로 뒤쪽 장에서는 새로운 차이점만 설명해야 합니다. 이 문단은 통합 테스트가 안정적으로 중복을 판별할 수 있을 만큼 충분히 긴 문장으로 구성되어 있습니다. [E:{eid}]'
+                        if data.get('section_plan',{}).get('diagrams')!=[]:result+='\n\n```mermaid\nflowchart LR\n A["입력"] --> B["결과"]\n```'
+                if data.get('correction') and model!='duplicate-once':result+=f'\n\n빈 이름의 오류 조건을 추가로 정리했습니다. [E:{eid}]'
                 if model=='mermaid-once' and not getattr(self.server,'mermaid_sent',False):
                     self.server.mermaid_sent=True;result=f'Keep this fact [E:{eid}]\n\n```mermaid\nflowchart LR\n A[broken\n```'
                 if model=='invalid-once' and not getattr(self.server,'invalid_sent',False):
@@ -169,11 +199,28 @@ def main():
             probe['llm']['proxy_mode']='custom';probe['llm']['proxy_url']=f'http://127.0.0.1:{MOCK}';probe['llm']['base_url']='http://upstream.invalid/v1'
             assert api('/settings/test-llm','POST',probe)['ok']
             print('PASS reasoning mappings and explicit HTTP proxy',flush=True)
-            for model in ['normal','context-once','retry-once','invalid-once','review-once','truncate-once','headings','mermaid-once','body-disconnect-once','provider-error-once','coherence-once','diagram-overflow-once','coherence-format-once']:
+            for model in ['normal','context-once','retry-once','invalid-once','review-once','truncate-once','headings','wrapped-markdown','duplicate-once','section-review-format-once','mermaid-once','body-disconnect-once','provider-error-once','coherence-once','diagram-overflow-once','coherence-format-once','planning-followup','planning-citation-once','planning-dependency-once']:
                 configure(model);t=task(model);rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
                 assert r['status']=='completed',r
                 if model=='review-once':assert r['tokens']>=1800,r
                 text=(out/(model+'.md')).read_text();assert 'Source references' in text and '```mermaid' in text
+                if model in ['normal','planning-followup','planning-citation-once','planning-dependency-once']:
+                    data=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and x['messages'][-1]['content']!='Reply with OK only.']
+                    readings=[x for x in data if 'Read source evidence before planning' in x.get('instruction','')]
+                    plans=[x for x in data if 'sections:[{title' in x.get('instruction','')]
+                    writes=[x for x in data if 'Write only Markdown' in x.get('instruction','')]
+                    assert readings and data.index(readings[-1])<data.index(plans[0])<data.index(writes[0])
+                    assert all(e['content'] for e in readings[0]['evidence'])
+                    anchor=plans[-1]['source_brief']['findings'][0]['evidence_ids'][0]
+                    assert any(e['id']==anchor for e in plans[-1]['evidence'])
+                    assert any(e['id']==anchor for e in writes[0]['evidence']), 'Planning source anchors did not reach the writer'
+                    assert writes[1]['section_plan']['depends_on']==[0]
+                    if model=='planning-followup':
+                        assert len(readings)==2 and not readings[0]['final_pass'] and readings[1]['final_pass']
+                        assert readings[1]['open_questions']
+                        assert any(e['path'].endswith('service.py') for e in readings[1]['evidence'])
+                    if model=='planning-citation-once':assert len(readings)==2 and 'Unknown or ambiguous evidence ID' in readings[1]['previous_error']
+                    if model=='planning-dependency-once':assert len(plans)==2 and 'earlier zero-based' in plans[1]['previous_error']
                 if model in ['invalid-once','truncate-once','mermaid-once']:
                     writes=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
                     assert writes[0]['evidence']==writes[1]['evidence'], 'Repair discarded evidence'
@@ -199,15 +246,30 @@ def main():
                 if model=='diagram-overflow-once':
                     writes=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
                     assert text.count('```mermaid')==3
-                    assert writes[0]['evidence']==writes[1]['evidence']
-                    assert 'contains 2' in writes[1]['correction']['issues'][0]['message']
+                    assert len(writes)==3
+                    assert 'contains 2' not in text
                 if model=='coherence-format-once':
                     reviews=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Review the whole document' in x['messages'][-1]['content']]
                     assert len(reviews)==2 and 'Invalid review JSON' in reviews[1]['previous_error']
                     assert reviews[1]['valid_sections'][0]['index']==0
                 if model=='headings':
                     assert text.count('## 기능 개요\n')==1 and '### Details' in text
+                if model=='wrapped-markdown':
+                    assert '```markdown' not in text
+                    assert text.count('## 기능 개요\n')==1
+                    assert '[E:' not in text
+                if model=='duplicate-once':
+                    assert text.count('문서 생성기는 소스 근거를 검색하고 선택된 근거만 사용하여')==1
+                    assert 'substantially duplicates' not in text
+                if model=='section-review-format-once':
+                    reviews=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Review this section' in x['messages'][-1]['content']]
+                    assert len(reviews)>=2 and 'Invalid review JSON' in reviews[1]['previous_error']
                 print('PASS generation / repair:',model,flush=True)
+            configure('planning-invalid');t=task('planning-invalid');rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
+            assert r['status']=='failed' and not (out/'planning-invalid.md').exists(),r
+            invalid_requests=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='planning-invalid']
+            assert len(invalid_requests)==3 and all('Read source evidence before planning' in x['instruction'] for x in invalid_requests)
+            print('PASS invalid source understanding cannot fall back to a filename-only outline',flush=True)
             configure('outline-overflow-once');t=task('outline-overflow-once');t['max_diagrams']=2;api('/tasks','POST',t)
             rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
             assert r['status']=='completed',r
@@ -218,7 +280,7 @@ def main():
             configure('tight-budget')
             t=api('/tasks','POST',{'name':'tight-budget','sources':[str(source)],'target':str(out/'tight-budget.md'),'direction':'개발자를 위한 기능 설명과 Mermaid 흐름 정리','max_iterations':2,'max_tokens':50000})
             rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
-            assert r['status']=='completed' and r['tokens']==1600,r
+            assert r['status']=='completed' and r['tokens']==1800,r
             print('PASS confirmed usage releases reservations within fixed task budget',flush=True)
             configure('quota-partial');t=task('quota-partial');rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
             assert r['status']=='completed_with_warnings',r
@@ -266,6 +328,22 @@ def main():
                 except Exception:time.sleep(.1)
             r=poll(rid);assert r['status']=='completed',r
             print('PASS crash/restart checkpoint recovery',flush=True)
+            configure('restart-discovery');t=task('restart-discovery');rid=api(f"/tasks/{t['id']}/run",'POST')['id']
+            end=time.monotonic()+30
+            while time.monotonic()<end:
+                readings=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='restart-discovery']
+                if any(x.get('final_pass') for x in readings):break
+                time.sleep(.05)
+            else:raise AssertionError('Follow-up source reading not reached')
+            process.kill();process.wait();process=subprocess.Popen([str(BINARY)],cwd=ROOT,env=env,stdout=log,stderr=log)
+            for _ in range(100):
+                try:api('/session');break
+                except Exception:time.sleep(.1)
+            r=poll(rid);assert r['status']=='completed',r
+            readings=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='restart-discovery' and 'Read source evidence before planning' in x['messages'][-1]['content']]
+            assert sum(not x['final_pass'] for x in readings)==1, 'Completed initial source reading repeated after restart'
+            assert sum(x['final_pass'] for x in readings)==2
+            print('PASS source-understanding restart retains initial reading and resumes missing-link research',flush=True)
             configure('restart-review');t=task('restart-review');rid=api(f"/tasks/{t['id']}/run",'POST')['id']
             end=time.monotonic()+30
             while time.monotonic()<end:

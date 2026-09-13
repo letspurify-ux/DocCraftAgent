@@ -99,7 +99,10 @@ impl RunContext {
     }
     pub fn reserve(&self, tokens: u64, cost: f64) -> Result<()> {
         let current = self.reserved_tokens.load(Ordering::Relaxed);
-        if current.saturating_add(tokens) > self.snapshot.task.max_tokens {
+        if current
+            .checked_add(tokens)
+            .is_none_or(|total| total > self.snapshot.task.max_tokens)
+        {
             bail!("TOKEN_BUDGET: run token budget exhausted");
         }
         let micro = (cost * 1_000_000.0).ceil() as u64;
@@ -110,7 +113,11 @@ impl RunContext {
             bail!("COST_BUDGET: run cost budget exhausted");
         }
         self.reserved_tokens.fetch_add(tokens, Ordering::Relaxed);
-        self.reserved_cost.fetch_add(micro, Ordering::Relaxed);
+        let _ = self
+            .reserved_cost
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(micro))
+            });
         Ok(())
     }
     pub fn reconcile_tokens(&self, reservation: u64, used: u64) -> u64 {
@@ -184,6 +191,9 @@ pub async fn enqueue(
     });
     {
         let mut controls = state.controls.lock().await;
+        if controls.contains_key(&id) {
+            bail!("This run is already active");
+        }
         if controls
             .values()
             .any(|c| c.target == output_key(&snapshot.task.target))
@@ -192,6 +202,17 @@ pub async fn enqueue(
         }
         if controls.len() >= 64 {
             bail!("Run queue is full (64)");
+        }
+        if existing.is_some() {
+            // A new attempt supersedes the previous attempt's terminal journal.
+            // Serialize removal with registration so recovery cannot replay it
+            // once this worker finishes.
+            match std::fs::remove_file(state.vault.dir.join("terminal").join(format!("{id}.json")))
+            {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         controls.insert(
             id.clone(),
@@ -254,7 +275,7 @@ fn spawn_worker(
                 _=token.cancelled()=>bail!("CANCELLED"),
                 r=tokio::time::timeout(timeout,execute(&ctx))=>r.context("TIME_BUDGET: run deadline reached").and_then(|r|r),
             };
-            match result { Err(_) if ctx.gate.published.load(Ordering::Acquire)=>{publish::recover(&state,&pool).await}, Err(e) if is_budget(&e) || recoverable_generation_failure(&e)=>publish_partial(&ctx,&e.to_string()).await,other=>other }
+            match result { Err(_) if ctx.gate.published.load(Ordering::Acquire)=>{publish::recover_run(&state,&pool,&task_id).await}, Err(e) if is_budget(&e) || recoverable_generation_failure(&e)=>publish_partial(&ctx,&e.to_string()).await,other=>other }
 
         }).catch_unwind().await.unwrap_or_else(|_|Err(anyhow::anyhow!("Execution worker stopped unexpectedly; checkpoint retained")));
         if let Err(e) = outcome {
@@ -410,7 +431,7 @@ pub async fn replay_terminal(state: &Arc<AppState>, pool: &MySqlPool) -> Result<
                     continue;
                 }
                 let v: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-                sqlx::query("UPDATE runs SET status=?,error=? WHERE id=?")
+                sqlx::query("UPDATE runs SET status=?,error=? WHERE id=? AND status NOT IN ('completed','completed_with_warnings')")
                     .bind(v.get("status").and_then(Value::as_str))
                     .bind(v.get("error").and_then(Value::as_str))
                     .bind(id)
@@ -1508,6 +1529,102 @@ async fn publish_partial(ctx: &RunContext, reason: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires DOCCRAFT_TEST_DB_PORT pointing to a disposable MariaDB"]
+    async fn terminal_replay_cannot_downgrade_a_published_run() -> Result<()> {
+        let pool = crate::test_support::pool(1).await?;
+        let run = crate::test_support::TestRun::new(pool.clone())?;
+        let journal = run
+            .ctx
+            .state
+            .vault
+            .dir
+            .join("terminal")
+            .join(format!("{}.json", run.ctx.id));
+        let result: Result<()> = async {
+            for status in ["completed", "completed_with_warnings"] {
+                sqlx::query("INSERT INTO runs(id,task_id,status,snapshot,progress) VALUES(?,?,?,'','{}') ON DUPLICATE KEY UPDATE status=VALUES(status)")
+                    .bind(&run.ctx.id).bind(&run.ctx.snapshot.task.id).bind(status).execute(&pool).await?;
+                crate::config::atomic_private(&journal, br#"{"status":"cancelled","error":"Cancelled by user"}"#)?;
+                replay_terminal(&run.ctx.state, &pool).await?;
+                let saved: String = sqlx::query_scalar("SELECT status FROM runs WHERE id=?")
+                    .bind(&run.ctx.id).fetch_one(&pool).await?;
+                assert_eq!(saved, status);
+                assert!(!journal.exists());
+            }
+            Ok(())
+        }.await;
+        crate::test_support::close(pool).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_duplicate_ids_and_clears_previous_terminal_intent() -> Result<()>
+    {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
+        pool.close().await;
+        let run = crate::test_support::TestRun::new(pool)?;
+        let state = &run.ctx.state;
+        state.controls.lock().await.insert(
+            run.ctx.id.clone(),
+            Control {
+                token: run.ctx.cancel.clone(),
+                target: "a-different-target.md".into(),
+                gate: run.ctx.gate.clone(),
+            },
+        );
+        let error = enqueue(
+            state.clone(),
+            run.ctx.snapshot.clone(),
+            Some(run.ctx.id.clone()),
+        )
+        .await
+        .err()
+        .context("Duplicate run ID should be rejected")?;
+        assert_eq!(error.to_string(), "This run is already active");
+        assert!(
+            state
+                .controls
+                .lock()
+                .await
+                .get(&run.ctx.id)
+                .is_some_and(|c| Arc::ptr_eq(&c.gate, &run.ctx.gate))
+        );
+        state.controls.lock().await.remove(&run.ctx.id);
+        let journal = state
+            .vault
+            .dir
+            .join("terminal")
+            .join(format!("{}.json", run.ctx.id));
+        crate::config::atomic_private(&journal, br#"{"status":"cancelled"}"#)?;
+        // Registration fails against the closed pool, but the stale cancellation
+        // must already be gone before a new attempt can be handed to a worker.
+        assert!(
+            enqueue(
+                state.clone(),
+                run.ctx.snapshot.clone(),
+                Some(run.ctx.id.clone())
+            )
+            .await
+            .is_err()
+        );
+        assert!(!journal.exists());
+        assert!(state.controls.lock().await.is_empty());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn token_reservations_cannot_wrap_past_the_budget() -> Result<()> {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
+        let mut run = crate::test_support::TestRun::new(pool)?;
+        run.ctx.snapshot.task.max_tokens = u64::MAX;
+        run.ctx.reserved_tokens.store(u64::MAX, Ordering::Relaxed);
+        assert!(run.ctx.reserve(1, 0.0).is_err());
+        assert_eq!(run.ctx.reserved_tokens.load(Ordering::Relaxed), u64::MAX);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn dropped_enqueue_cleans_up_after_registration_failure() -> Result<()> {
         // A closed pool fails registration without requiring a database server.

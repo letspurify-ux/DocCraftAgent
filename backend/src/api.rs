@@ -490,29 +490,28 @@ async fn batch(State(s): State<Arc<AppState>>, Json(batch): Json<Batch>) -> ApiR
 }
 #[utoipa::path(get,path="/api/v1/runs",responses((status=200,body=[RunView])))]
 async fn runs_list(State(s): State<Arc<AppState>>) -> ApiResult<Vec<RunView>> {
-    Ok(Json(db::runs(&s.db().await?).await?))
+    let mut runs = db::runs(&s.db().await?).await?;
+    // Cancellation is durable in the journal and delivered directly to the
+    // worker. Reflect it immediately without a DB task that could outlive the
+    // attempt and mutate a later resume.
+    let controls = s.controls.lock().await;
+    for run in &mut runs {
+        if ["queued", "running"].contains(&run.status.as_str())
+            && controls
+                .get(&run.id)
+                .is_some_and(|c| c.token.is_cancelled())
+        {
+            run.status = "cancelling".into();
+        }
+    }
+    Ok(Json(runs))
 }
 #[utoipa::path(post,path="/api/v1/runs/{id}/cancel",params(("id"=String,Path)),responses((status=200)))]
 async fn cancel_run(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult<Value> {
-    let cancelled = request_cancel(&s, &id).await;
-    if cancelled {
-        config::atomic_private(
-            &s.vault.dir.join("terminal").join(format!("{id}.json")),
-            json!({"status":"cancelled","error":"Cancelled by user"})
-                .to_string()
-                .as_bytes(),
-        )?;
-        let state = s.clone();
-        let run = id.clone();
-        tokio::spawn(async move {
-            if let Ok(pool) = state.db().await {
-                let _=sqlx::query("UPDATE runs SET cancel_requested=TRUE,status='cancelling' WHERE id=? AND status IN ('queued','running')").bind(run).execute(&pool).await;
-            }
-        });
-    }
+    let cancelled = request_cancel(&s, &id).await?;
     Ok(Json(json!({"accepted":cancelled,"id":id})))
 }
-async fn request_cancel(s: &AppState, id: &str) -> bool {
+async fn request_cancel(s: &AppState, id: &str) -> Result<bool> {
     let control = {
         let controls = s.controls.lock().await;
         controls
@@ -530,13 +529,25 @@ async fn request_cancel(s: &AppState, id: &str) -> bool {
             .is_some_and(|control| Arc::ptr_eq(&control.gate, &gate))
             && !gate.published.load(std::sync::atomic::Ordering::Acquire)
         {
+            if token.is_cancelled() {
+                return Ok(true);
+            }
+            // Persist intent before waking the worker, while its registry entry
+            // cannot be removed. No deferred DB update may outlive this run and
+            // accidentally cancel a later resume of the same ID.
+            config::atomic_private(
+                &s.vault.dir.join("terminal").join(format!("{id}.json")),
+                json!({"status":"cancelled","error":"Cancelled by user"})
+                    .to_string()
+                    .as_bytes(),
+            )?;
             token.cancel();
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     } else {
-        false
+        Ok(false)
     }
 }
 #[derive(Default, Deserialize)]
@@ -629,13 +640,17 @@ async fn resume_run(
             let mut budget = db::load_checkpoint(&pool, &id, "budget")
                 .await?
                 .unwrap_or(json!({}));
-            budget["tokens"] = json!(
+            let tokens = json!(
                 budget
                     .get("tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0)
                     .saturating_sub(released)
             );
+            budget
+                .as_object_mut()
+                .context("Invalid budget checkpoint: expected an object")?
+                .insert("tokens".into(), tokens);
             let mut tx = pool.begin().await?;
             sqlx::query("UPDATE checkpoints SET data=? WHERE run_id=? AND step='budget'")
                 .bind(budget.to_string())
@@ -777,6 +792,130 @@ async fn artifact(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> Api
 mod origin_tests {
     use super::*;
     #[tokio::test]
+    async fn cancellation_is_not_signalled_when_its_journal_cannot_be_saved() -> Result<()> {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
+        let run = crate::test_support::TestRun::new(pool)?;
+        let state = &run.ctx.state;
+        state.controls.lock().await.insert(
+            run.ctx.id.clone(),
+            runner::Control {
+                token: run.ctx.cancel.clone(),
+                target: run.ctx.snapshot.task.target.clone(),
+                gate: run.ctx.gate.clone(),
+            },
+        );
+        std::fs::write(state.vault.dir.join("terminal"), "blocks journal directory")?;
+        assert!(
+            cancel_run(State(state.clone()), Path(run.ctx.id.clone()))
+                .await
+                .is_err()
+        );
+        assert!(!run.ctx.cancel.is_cancelled());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_cancellation_does_not_recreate_a_finished_journal() -> Result<()> {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
+        let run = crate::test_support::TestRun::new(pool)?;
+        let state = &run.ctx.state;
+        state.controls.lock().await.insert(
+            run.ctx.id.clone(),
+            runner::Control {
+                token: run.ctx.cancel.clone(),
+                target: run.ctx.snapshot.task.target.clone(),
+                gate: run.ctx.gate.clone(),
+            },
+        );
+        assert!(request_cancel(state, &run.ctx.id).await?);
+        let journal = state
+            .vault
+            .dir
+            .join("terminal")
+            .join(format!("{}.json", run.ctx.id));
+        assert!(journal.exists());
+        // The finishing worker removes the durable journal before releasing its
+        // control entry. Another cancellation must not leave a stale record.
+        std::fs::remove_file(&journal)?;
+        assert!(request_cancel(state, &run.ctx.id).await?);
+        assert!(!journal.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DOCCRAFT_TEST_DB_PORT pointing to a disposable MariaDB"]
+    async fn malformed_resume_budget_returns_an_error_without_panicking() -> Result<()> {
+        use futures_util::FutureExt;
+        let pool = crate::test_support::pool(1).await?;
+        let run = crate::test_support::TestRun::new(pool.clone())?;
+        sqlx::query(
+            "INSERT INTO runs(id,task_id,status,snapshot,progress) VALUES(?,?,'failed',?,'{}')",
+        )
+        .bind(&run.ctx.id)
+        .bind(&run.ctx.snapshot.task.id)
+        .bind(
+            run.ctx
+                .state
+                .vault
+                .encrypt(&serde_json::to_string(&run.ctx.snapshot)?)?,
+        )
+        .execute(&pool)
+        .await?;
+        db::checkpoint(&pool, &run.ctx.id, "budget", &json!([])).await?;
+        let result = std::panic::AssertUnwindSafe(resume_run(
+            State(run.ctx.state.clone()),
+            Path(run.ctx.id.clone()),
+            Query(ResumeOptions {
+                current_llm: true,
+                ..Default::default()
+            }),
+        ))
+        .catch_unwind()
+        .await;
+        crate::test_support::close(pool).await?;
+        assert!(
+            result.is_ok(),
+            "malformed checkpoint panicked in HTTP handler"
+        );
+        assert!(result.is_ok_and(|r| r.is_err()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DOCCRAFT_TEST_DB_PORT pointing to a disposable MariaDB"]
+    async fn cancelled_runs_are_visible_while_the_worker_finishes() -> Result<()> {
+        let pool = crate::test_support::pool(1).await?;
+        let run = crate::test_support::TestRun::new(pool.clone())?;
+        let state = &run.ctx.state;
+        state.controls.lock().await.insert(
+            run.ctx.id.clone(),
+            runner::Control {
+                token: run.ctx.cancel.clone(),
+                target: run.ctx.snapshot.task.target.clone(),
+                gate: run.ctx.gate.clone(),
+            },
+        );
+        sqlx::query(
+            "INSERT INTO runs(id,task_id,status,snapshot,progress) VALUES(?,?,'running','','{}')",
+        )
+        .bind(&run.ctx.id)
+        .bind(&run.ctx.snapshot.task.id)
+        .execute(&pool)
+        .await?;
+        let result: Result<()> = async {
+            assert!(request_cancel(state, &run.ctx.id).await?);
+            let Json(runs) = runs_list(State(state.clone())).await.map_err(|e| e.0)?;
+            assert_eq!(runs.first().map(|r| r.status.as_str()), Some("cancelling"));
+            Ok(())
+        }
+        .await;
+        crate::test_support::close(pool).await?;
+        result
+    }
+
+    #[tokio::test]
     #[ignore = "requires DOCCRAFT_TEST_DB_PORT pointing to a disposable MariaDB"]
     async fn mysql_error_numbers_control_recovery_and_http_status() -> Result<()> {
         let pool = crate::test_support::pool(1).await?;
@@ -852,7 +991,7 @@ mod origin_tests {
                     tokio::task::yield_now().await;
                 }
             }).await?;
-            assert!(request_cancel(state, id).await);
+            assert!(request_cancel(state, id).await?);
             blocker.rollback().await?;
             tokio::time::timeout(Duration::from_secs(3), async {
                 while state.controls.lock().await.contains_key(id) {
@@ -862,7 +1001,7 @@ mod origin_tests {
             let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id=?")
                 .bind(id).fetch_one(&pool).await?;
             assert_eq!(status, "cancelled");
-            assert!(!request_cancel(state, id).await);
+            assert!(!request_cancel(state, id).await?);
             Ok(())
         }.await;
         server.abort();
@@ -958,7 +1097,7 @@ mod origin_tests {
             .context("cancellation held the control registry while waiting for publication")?;
         drop(registry);
         drop(held);
-        assert!(request.await?);
+        assert!(request.await??);
         assert!(token.is_cancelled());
         Ok(())
     }
@@ -999,7 +1138,7 @@ mod origin_tests {
         state.controls.lock().await.remove("run");
         drop(held);
 
-        assert!(!request.await?);
+        assert!(!request.await??);
         assert!(!token.is_cancelled());
         Ok(())
     }

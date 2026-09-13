@@ -646,16 +646,28 @@ footer {
   gap: 22px;
   align-items: start;
 }
+.monitor-layout > .run-list,
+.monitor-layout > .panel {
+  height: 2048px;
+  min-width: 0;
+  overflow-y: auto;
+}
+.run-detail {
+  display: flex;
+  flex-direction: column;
+}
+.run-detail > * {
+  flex-shrink: 0;
+}
 .run-list {
   display: flex;
   flex-direction: column;
   gap: 9px;
-  max-height: calc(100vh - 225px);
-  overflow-y: auto;
   padding-right: 4px;
   scrollbar-gutter: stable;
 }
 .run-row {
+  flex-shrink: 0;
   display: block;
   text-align: left;
   background: white;
@@ -705,6 +717,10 @@ footer {
   font-size: 10px;
   color: #abb4c3;
 }
+.resume-note {
+  display: block;
+  margin-top: 8px;
+}
 .mini-stats {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -743,7 +759,8 @@ footer {
   border-bottom: 2px solid #7a86df;
 }
 .event-list {
-  max-height: clamp(220px, calc(100vh - 520px), 620px);
+  flex: 1;
+  min-height: 0;
   overflow: auto;
 }
 .inline-error {
@@ -813,7 +830,8 @@ footer {
   word-break: break-word;
 }
 .file-list {
-  max-height: clamp(220px, calc(100vh - 520px), 620px);
+  flex: 1;
+  min-height: 0;
   overflow: auto;
 }
 .file-row {
@@ -1181,11 +1199,6 @@ summary {
   }
   .settings-nav svg {
     display: none;
-  }
-  .run-list {
-    max-height: 270px;
-    overflow: auto;
-    padding-right: 4px;
   }
   .content {
     padding: 24px 18px;

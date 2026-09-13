@@ -1060,7 +1060,7 @@ function RunDetail({
                 <RefreshCw size={14} />
                 체크포인트 재개
               </button>
-              <small>
+              <small className="resume-note">
                 기존 소스와 완료 섹션을 유지합니다. 검토 완료 경고를 이어서
                 수정하려면 작업의 검토 회차를 늘린 뒤 현재 검토 회차 적용을
                 선택하세요. 시간·비용 한도는 유지합니다.

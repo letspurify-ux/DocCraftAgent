@@ -119,14 +119,35 @@ pub async fn recover(state: &Arc<AppState>, pool: &MySqlPool) -> Result<()> {
     }
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        let p: Publication = serde_json::from_slice(&std::fs::read(&path)?)?;
-        let target = PathBuf::from(&p.path);
-        if target.exists() && hash(&std::fs::read(target)?) == p.hash {
-            commit(pool, &p).await?;
-            std::fs::remove_file(path)?;
-        } else {
-            sqlx::query("UPDATE runs SET status='failed',error='Publication interrupted before commit; resume to regenerate' WHERE id=? AND status NOT IN ('completed','completed_with_warnings')").bind(&p.run_id).execute(pool).await?;
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
         }
+        recover_publication(pool, &path).await?;
+    }
+    Ok(())
+}
+pub async fn recover_run(state: &AppState, pool: &MySqlPool, run_id: &str) -> Result<()> {
+    // A worker only owns its own publication. Scanning other journals here can
+    // mark a concurrent publisher failed before it replaces its target, or race
+    // with that publisher's journal removal after a successful commit.
+    recover_publication(
+        pool,
+        &state
+            .vault
+            .dir
+            .join("publications")
+            .join(format!("{run_id}.json")),
+    )
+    .await
+}
+async fn recover_publication(pool: &MySqlPool, path: &std::path::Path) -> Result<()> {
+    let p: Publication = serde_json::from_slice(&std::fs::read(path)?)?;
+    let target = PathBuf::from(&p.path);
+    if target.exists() && hash(&std::fs::read(target)?) == p.hash {
+        commit(pool, &p).await?;
+        std::fs::remove_file(path)?;
+    } else {
+        sqlx::query("UPDATE runs SET status='failed',error='Publication interrupted before commit; resume to regenerate' WHERE id=? AND status NOT IN ('completed','completed_with_warnings')").bind(&p.run_id).execute(pool).await?;
     }
     Ok(())
 }
@@ -144,25 +165,15 @@ pub async fn validate_mermaid(ctx: &RunContext, markdown: &str) -> Result<()> {
         .kill_on_drop(true)
         .spawn()
         .context("Node.js is required to validate Mermaid diagrams")?;
-    let mut stdin = child.stdin.take().context("Missing Mermaid worker stdin")?;
+    let stdin = child.stdin.take().context("Missing Mermaid worker stdin")?;
     let stderr = child
         .stderr
         .take()
         .context("Missing Mermaid worker stderr")?;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    const DIAGNOSTIC_LIMIT: u64 = 2048;
     tokio::select! {
         _=ctx.cancel.cancelled()=>{let _=child.kill().await;bail!("CANCELLED");},
         result=tokio::time::timeout(Duration::from_secs(15),async{
-            stdin.write_all(markdown.as_bytes()).await?;drop(stdin);
-            let mut diagnostic = Vec::new();
-            let mut limited = stderr.take(DIAGNOSTIC_LIMIT + 1);
-            limited.read_to_end(&mut diagnostic).await?;
-            if diagnostic.len() as u64 > DIAGNOSTIC_LIMIT {
-                return Err(std::io::Error::other(
-                    "Mermaid validator diagnostic exceeded 2 KiB",
-                ));
-            }
+            let diagnostic = exchange_mermaid(stdin, stderr, markdown).await?;
             let status = child.wait().await?;
             Ok::<_, std::io::Error>((status, diagnostic))
         })=>{
@@ -176,9 +187,126 @@ pub async fn validate_mermaid(ctx: &RunContext, markdown: &str) -> Result<()> {
     }
     Ok(())
 }
+async fn exchange_mermaid(
+    mut stdin: impl tokio::io::AsyncWrite + Unpin,
+    stderr: impl tokio::io::AsyncRead + Unpin,
+    markdown: &str,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const DIAGNOSTIC_LIMIT: u64 = 2048;
+    // A worker can fill stderr before reading stdin (for example on startup
+    // failure). Drive both pipes so backpressure cannot block the diagnostic.
+    let (_, diagnostic) = tokio::try_join!(
+        async {
+            stdin.write_all(markdown.as_bytes()).await?;
+            drop(stdin);
+            Ok::<_, std::io::Error>(())
+        },
+        async {
+            let mut diagnostic = Vec::new();
+            stderr
+                .take(DIAGNOSTIC_LIMIT + 1)
+                .read_to_end(&mut diagnostic)
+                .await?;
+            if diagnostic.len() as u64 > DIAGNOSTIC_LIMIT {
+                return Err(std::io::Error::other(
+                    "Mermaid validator diagnostic exceeded 2 KiB",
+                ));
+            }
+            Ok(diagnostic)
+        }
+    )?;
+    Ok(diagnostic)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires DOCCRAFT_TEST_DB_PORT pointing to a disposable MariaDB"]
+    async fn worker_recovery_leaves_other_publications_untouched() -> Result<()> {
+        let pool = crate::test_support::pool(1).await?;
+        let run = crate::test_support::TestRun::new(pool.clone())?;
+        let dir = run.ctx.state.vault.dir.join("publications");
+        for id in [&run.ctx.id, &"other-run".to_string()] {
+            sqlx::query("INSERT INTO runs(id,task_id,status,snapshot,progress) VALUES(?,?,'running','','{}')")
+                .bind(id).bind(&run.ctx.snapshot.task.id).execute(&pool).await?;
+            let p = Publication {
+                id: uuid::Uuid::new_v4().to_string(),
+                run_id: id.clone(),
+                task_id: run.ctx.snapshot.task.id.clone(),
+                path: if id == &run.ctx.id {
+                    run.ctx.snapshot.task.target.clone()
+                } else {
+                    format!("{}.other.md", run.ctx.snapshot.task.target)
+                },
+                hash: hash(b"published"),
+                markdown: "published".into(),
+                warnings: vec![],
+                status: "completed".into(),
+            };
+            atomic_private(&dir.join(format!("{id}.json")), &serde_json::to_vec(&p)?)?;
+        }
+        std::fs::write(&run.ctx.snapshot.task.target, "published")?;
+        let result: Result<()> = async {
+            recover_run(&run.ctx.state, &pool, &run.ctx.id).await?;
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id=?")
+                .bind(&run.ctx.id)
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(status, "completed");
+            let other: String = sqlx::query_scalar("SELECT status FROM runs WHERE id='other-run'")
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(other, "running");
+            assert!(dir.join("other-run.json").exists());
+            assert!(!dir.join(format!("{}.json", run.ctx.id)).exists());
+            Ok(())
+        }
+        .await;
+        crate::test_support::close(pool).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn mermaid_exchange_closes_input_and_preserves_diagnostics() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (stdin, mut worker_stdin) = tokio::io::duplex(64);
+        let (stderr, mut worker_stderr) = tokio::io::duplex(64);
+        let markdown = "한글 Mermaid 입력".repeat(500);
+        let (result, input) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(exchange_mermaid(stdin, stderr, &markdown), async {
+                let mut input = String::new();
+                worker_stderr.write_all(b"syntax diagnostic").await?;
+                worker_stdin.read_to_string(&mut input).await?;
+                drop(worker_stderr);
+                Ok::<_, std::io::Error>(input)
+            })
+        })
+        .await?;
+        assert_eq!(result?, b"syntax diagnostic");
+        assert_eq!(input?, markdown);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn mermaid_drains_stderr_while_sending_input() -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let (stdin, _worker_stdin) = tokio::io::duplex(64);
+        let (stderr, mut worker_stderr) = tokio::io::duplex(64);
+        let markdown = "x".repeat(4096);
+        let (result, _) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(exchange_mermaid(stdin, stderr, &markdown), async {
+                worker_stderr.write_all(&vec![b'e'; 2049]).await
+            })
+        })
+        .await
+        .context("stdin and stderr blocked each other")?;
+        assert!(
+            result
+                .err()
+                .is_some_and(|e| e.to_string().contains("exceeded 2 KiB"))
+        );
+        Ok(())
+    }
     #[test]
     fn atomic_replacement_preserves_complete_content() -> Result<()> {
         let d = tempfile::tempdir()?;

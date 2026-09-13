@@ -3,6 +3,7 @@ mod api;
 mod budget;
 mod config;
 mod db;
+mod editorial;
 mod llm;
 mod maintenance;
 mod model;

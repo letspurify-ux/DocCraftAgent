@@ -63,13 +63,13 @@ impl Default for LlmConfig {
             model: String::new(),
             context_limit: 200_000,
             model_context_limit: 200_000,
-            max_output_tokens: 8192,
+            max_output_tokens: 16384,
             model_max_output: 32768,
             safety_percent: 20,
             token_mode: "estimate".into(),
             token_count_url: String::new(),
             output_parameter: "max_completion_tokens".into(),
-            reasoning: "default".into(),
+            reasoning: "off".into(),
             effort: "medium".into(),
             reasoning_parameter: "reasoning_effort".into(),
             proxy_mode: "none".into(),
@@ -127,6 +127,7 @@ pub struct TaskConfig {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub max_iterations: u32,
+    pub max_diagrams: Option<u32>,
     pub max_seconds: u64,
     pub max_tokens: u64,
     pub max_cost: f64,
@@ -143,6 +144,7 @@ impl Default for TaskConfig {
             include: vec![],
             exclude: vec![],
             max_iterations: 3,
+            max_diagrams: None,
             max_seconds: 7200,
             max_tokens: 2_000_000,
             max_cost: 0.0,
@@ -159,10 +161,22 @@ pub struct RunSnapshot {
 pub struct SectionPlan {
     pub title: String,
     pub query: String,
+    #[serde(default)]
+    pub reader_question: String,
+    #[serde(default)]
+    pub handoff: String,
+    #[serde(default)]
+    pub diagrams: Option<Vec<String>>,
 }
 #[derive(Clone, Serialize, Deserialize, ToSchema)]
 pub struct Outline {
     pub sections: Vec<SectionPlan>,
+    #[serde(default)]
+    pub reader_goal: String,
+    #[serde(default)]
+    pub storyline: String,
+    #[serde(default)]
+    pub terminology: Vec<String>,
 }
 #[derive(Clone, Serialize, Deserialize, ToSchema)]
 pub struct Issue {

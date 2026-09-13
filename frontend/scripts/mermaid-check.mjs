@@ -13,10 +13,13 @@ for await (const chunk of process.stdin) {
   text += chunk;
   if (text.length > 4 * 1024 * 1024) process.exit(2);
 }
+let diagram = 0;
 try {
   for (const match of text.matchAll(/```mermaid\s*\n([\s\S]*?)```/g)) {
+    diagram++;
     await mermaid.parse(match[1]);
   }
-} catch {
-  process.exit(1);
+} catch (error) {
+  process.stderr.write(JSON.stringify({diagram, message: String(error?.message ?? error).slice(0, 1600)}));
+  process.exitCode = 1;
 }

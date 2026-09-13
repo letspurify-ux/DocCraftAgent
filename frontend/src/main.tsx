@@ -23,7 +23,7 @@ import {
   Database,
   PanelLeftClose,
 } from "lucide-react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { diffLines } from "diff";
 import { api, send, newTask, type Task, type Run, type Artifact } from "./api";
@@ -58,6 +58,7 @@ function App() {
   const [settings, setSettings] = useState<any>(null),
     [diagnostics, setDiagnostics] = useState<any>(null),
     [error, setError] = useState(""),
+    [pollError, setPollError] = useState(""),
     [notice, setNotice] = useState(""),
     [edit, setEdit] = useState<Task | null>(null),
     [selected, setSelected] = useState<string | null>(null),
@@ -75,6 +76,11 @@ function App() {
     if (results[2].status === "fulfilled")
       setArtifacts(results[2].value.artifacts);
     if (results[3].status === "fulfilled") setDiagnostics(results[3].value);
+    setPollError(
+      results.some((r) => r.status === "rejected")
+        ? "서버 상태를 갱신하지 못했습니다. 표시된 실행 상태는 마지막 확인값입니다. 연결이 복구되면 자동으로 갱신합니다."
+        : "",
+    );
   }, []);
   useEffect(() => {
     api("/session")
@@ -181,13 +187,26 @@ function App() {
             }
           </span>
           <div
-            className={"connection " + (diagnostics?.database ? "online" : "")}
+            className={
+              "connection " +
+              (!pollError && diagnostics?.database ? "online" : "")
+            }
           >
             <i />
-            {diagnostics?.database ? "MariaDB 연결됨" : "DB 연결 확인 필요"}
+            {pollError
+              ? "서버 연결 확인 필요"
+              : diagnostics?.database
+                ? "MariaDB 연결됨"
+                : "DB 연결 확인 필요"}
           </div>
         </header>
         <div className="content">
+          {pollError && (
+            <div role="alert" className="banner error">
+              <AlertCircle size={18} />
+              <span>{pollError}</span>
+            </div>
+          )}
           {error && (
             <div role="alert" className="banner error">
               <AlertCircle size={18} />
@@ -484,9 +503,12 @@ function App() {
                           );
                         })
                       }
-                      onResume={(id) =>
+                      onResume={(id, currentLlm, currentTokenLimit) =>
                         action(async () => {
-                          await api(`/runs/${id}/resume`, send("POST"));
+                          await api(
+                            `/runs/${id}/resume?current_llm=${currentLlm}&current_token_limit=${currentTokenLimit}`,
+                            send("POST"),
+                          );
                         })
                       }
                     />
@@ -689,6 +711,20 @@ function TaskEditor({
                 onChange={(e) => change("max_iterations", +e.target.value)}
               />
             </Field>
+            <Field label="전체 다이어그램 상한 (빈칸=자동, 0=없음)">
+              <input
+                type="number"
+                min="0"
+                max="32"
+                value={v.max_diagrams ?? ""}
+                onChange={(e) =>
+                  change(
+                    "max_diagrams",
+                    e.target.value === "" ? null : +e.target.value,
+                  )
+                }
+              />
+            </Field>
             <Field label="최대 실행 시간 (초)">
               <input
                 type="number"
@@ -756,8 +792,14 @@ function RunDetail({
 }: {
   run?: Run;
   onCancel: (id: string) => void;
-  onResume: (id: string) => void;
+  onResume: (
+    id: string,
+    currentLlm: boolean,
+    currentTokenLimit: boolean,
+  ) => void;
 }) {
+  const [currentLlm, setCurrentLlm] = useState(false);
+  const [currentTokenLimit, setCurrentTokenLimit] = useState(false);
   const [events, setEvents] = useState<any[]>([]),
     [files, setFiles] = useState<any[]>([]),
     [tab, setTab] = useState("events");
@@ -807,11 +849,41 @@ function RunDetail({
             즉시 중단
           </button>
         ) : (
-          ["failed", "cancelled", "interrupted"].includes(run.status) && (
-            <button className="secondary" onClick={() => onResume(run.id)}>
-              <RefreshCw size={14} />
-              체크포인트 재개
-            </button>
+          (["failed", "cancelled", "interrupted"].includes(run.status) ||
+            (run.status === "completed_with_warnings" &&
+              JSON.stringify(run.progress).includes(
+                "this document is incomplete",
+              ))) && (
+            <div>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={currentLlm}
+                  onChange={(e) => setCurrentLlm(e.target.checked)}
+                />
+                현재 LLM 설정 적용
+              </label>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={currentTokenLimit}
+                  onChange={(e) => setCurrentTokenLimit(e.target.checked)}
+                />
+                현재 작업의 토큰 한도 적용
+              </label>
+              <button
+                className="secondary"
+                onClick={() => onResume(run.id, currentLlm, currentTokenLimit)}
+              >
+                <RefreshCw size={14} />
+                체크포인트 재개
+              </button>
+              <small>
+                기존 소스와 완료 섹션을 유지합니다. 토큰 한도 적용을 선택하면
+                작업에 저장된 최신 한도로 재개합니다. 시간·비용 한도는
+                유지합니다.
+              </small>
+            </div>
           )
         )}
       </div>
@@ -1203,58 +1275,76 @@ function SettingsPage({
     </>
   );
 }
-function Mermaid({ code }: { code: string }) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [err, setErr] = useState("");
-  useEffect(() => {
-    let cancelled = false;
-    import("mermaid").then(async ({ default: m }) => {
+// Keep renderer component identities stable across the app's polling updates.
+let mermaidLoader: Promise<(typeof import("mermaid"))["default"]> | undefined;
+function loadMermaid() {
+  mermaidLoader ??= import("mermaid")
+    .then(({ default: m }) => {
       m.initialize({
         startOnLoad: false,
         securityLevel: "strict",
         theme: "neutral",
         maxTextSize: 50000,
       });
-      try {
+      return m;
+    })
+    .catch((error) => {
+      mermaidLoader = undefined;
+      throw error;
+    });
+  return mermaidLoader;
+}
+function Mermaid({ code }: { code: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    setErr("");
+    loadMermaid()
+      .then(async (m) => {
+        if (cancelled) return;
         const { svg } = await m.render(
           "m" + crypto.randomUUID().replaceAll("-", ""),
           code,
         );
         if (!cancelled && ref.current) ref.current.innerHTML = svg;
-      } catch {
+      })
+      .catch(() => {
         if (!cancelled) setErr("다이어그램 구문을 표시할 수 없습니다.");
-      }
-    });
+      });
     return () => {
       cancelled = true;
     };
   }, [code]);
-  return err ? (
-    <pre>{err + "\n" + code}</pre>
-  ) : (
-    <div className="mermaid" ref={ref} />
+  return (
+    <>
+      {err && <pre>{err + "\n" + code}</pre>}
+      <div className="mermaid" ref={ref} hidden={!!err} />
+    </>
   );
 }
-function Markdown({ text }: { text: string }) {
+const markdownComponents: Components = {
+  code({ className, children, ...props }) {
+    return className === "language-mermaid" ? (
+      <Mermaid code={String(children)} />
+    ) : (
+      <code className={className} {...props}>
+        {children}
+      </code>
+    );
+  },
+};
+const markdownPlugins = [remarkGfm];
+const Markdown = React.memo(function Markdown({ text }: { text: string }) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      components={{
-        code({ className, children, ...props }) {
-          return className === "language-mermaid" ? (
-            <Mermaid code={String(children)} />
-          ) : (
-            <code className={className} {...props}>
-              {children}
-            </code>
-          );
-        },
-      }}
+      remarkPlugins={markdownPlugins}
+      components={markdownComponents}
     >
       {text}
     </ReactMarkdown>
   );
-}
+});
 function Documents({
   artifacts,
   onError,
@@ -1374,11 +1464,14 @@ function Documents({
               ? "최종 검토된 문서가 아닙니다. 누락된 주제와 검토 상태를 확인하세요."
               : "해결되지 않은 사항 또는 분석 범위 제한이 있습니다."}
           </p>
-          <ul>
-            {warnings.map((warning, i) => (
-              <li key={i}>{warning}</li>
-            ))}
-          </ul>
+          <details>
+            <summary>검토 상세 ({warnings.length}건)</summary>
+            <ul>
+              {warnings.map((warning, i) => (
+                <li key={i}>{warning}</li>
+              ))}
+            </ul>
+          </details>
         </aside>
       )}
       {doc ? (

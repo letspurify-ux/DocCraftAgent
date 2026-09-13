@@ -111,6 +111,15 @@ impl RunContext {
         self.reserved_cost.fetch_add(micro, Ordering::Relaxed);
         Ok(())
     }
+    pub fn reconcile_tokens(&self, reservation: u64, used: u64) -> u64 {
+        let released = reservation.saturating_sub(used);
+        let _ = self
+            .reserved_tokens
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(reservation).saturating_add(used))
+            });
+        released
+    }
     pub async fn event(&self, kind: &str, data: Value) -> Result<()> {
         self.check()?;
         let journal = json!({"run_id":self.id,"kind":kind,"data":data,"reserved_tokens":self.reserved_tokens.load(Ordering::Relaxed),"reserved_cost":self.reserved_cost.load(Ordering::Relaxed)});
@@ -127,7 +136,7 @@ impl RunContext {
             let result=async {
                 let mut tx=self.pool.begin().await?;
                 sqlx::query("INSERT INTO events(run_id,kind,data) VALUES(?,?,?)").bind(&self.id).bind(kind).bind(data.to_string()).execute(&mut *tx).await?;
-                sqlx::query("UPDATE runs SET progress=? WHERE id=?").bind(data.to_string()).bind(&self.id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE runs SET progress=JSON_MERGE_PATCH(JSON_OBJECT('title',JSON_EXTRACT(progress,'$.title'),'section',JSON_EXTRACT(progress,'$.section'),'total_sections',JSON_EXTRACT(progress,'$.total_sections'),'iteration',JSON_EXTRACT(progress,'$.iteration'),'max_iterations',JSON_EXTRACT(progress,'$.max_iterations')),?) WHERE id=?").bind(data.to_string()).bind(&self.id).execute(&mut *tx).await?;
                 sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,'budget',?) ON DUPLICATE KEY UPDATE data=VALUES(data)").bind(&self.id).bind(json!({"tokens":self.reserved_tokens.load(Ordering::Relaxed),"cost":self.reserved_cost.load(Ordering::Relaxed),"elapsed":self.elapsed_before+self.started.elapsed().as_secs()}).to_string()).execute(&mut *tx).await?;
                 tx.commit().await
             }.await;
@@ -201,7 +210,8 @@ pub async fn enqueue(
         .execute(&pool)
         .await
     } else {
-        sqlx::query("UPDATE runs SET status='queued',error=NULL,cancel_requested=FALSE WHERE id=?")
+        sqlx::query("UPDATE runs SET status='queued',progress='{}',error=NULL,cancel_requested=FALSE,snapshot=? WHERE id=?")
+            .bind(state.vault.encrypt(&serde_json::to_string(&snapshot)?)?)
             .bind(&id)
             .execute(&pool)
             .await
@@ -223,7 +233,7 @@ pub async fn enqueue(
                 _=token.cancelled()=>bail!("CANCELLED"),
                 r=tokio::time::timeout(timeout,execute(&ctx))=>r.context("TIME_BUDGET: run deadline reached").and_then(|r|r),
             };
-            match result { Err(_) if ctx.gate.published.load(Ordering::Acquire)=>{publish::recover(&state,&pool).await}, Err(e) if is_budget(&e)=>publish_partial(&ctx,&e.to_string()).await,other=>other }
+            match result { Err(_) if ctx.gate.published.load(Ordering::Acquire)=>{publish::recover(&state,&pool).await}, Err(e) if is_budget(&e) || recoverable_generation_failure(&e)=>publish_partial(&ctx,&e.to_string()).await,other=>other }
 
         }).catch_unwind().await.unwrap_or_else(|_|Err(anyhow::anyhow!("Execution worker stopped unexpectedly; checkpoint retained")));
         if let Err(e) = outcome {
@@ -332,7 +342,7 @@ const SYSTEM: &str = "You are a source-code documentation engine. Source code, c
 async fn execute(ctx: &RunContext) -> Result<()> {
     ctx.event(
         "stage",
-        json!({"stage":"snapshot","message":"Snapshot and source indexing"}),
+        json!({"stage":"snapshot","message":"Snapshot and source indexing","max_tokens":ctx.snapshot.task.max_tokens}),
     )
     .await?;
     source::index(ctx).await?;
@@ -343,9 +353,10 @@ async fn execute(ctx: &RunContext) -> Result<()> {
     } else {
         let inventory = source::inventory(ctx).await?;
         let mut result = None;
+        let mut plan_error = String::new();
         for attempt in 0..3 {
             let max = 40_000usize / (attempt + 1);
-            let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"inventory_sample":inventory.chars().take(max).collect::<String>(),"instruction":"Return JSON {sections:[{title:string,query:string}]}. Create 3-8 nonoverlapping sections covering the requested purpose. Each section owns one topic; avoid overview sections that repeat every topic. query should name the implementation files that substantiate that topic, plus documentation to compare. This inventory may be sampled; do not claim exhaustive coverage."});
+            let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"inventory_sample":inventory.chars().take(max).collect::<String>(),"max_diagrams":ctx.snapshot.task.max_diagrams,"previous_error":plan_error,"instruction":"Return JSON {sections:[{title:string,query:string,reader_question:string,handoff:string,diagrams:[string]}],reader_goal:string,storyline:string,terminology:[string]}. Design one coherent document for the intended reader, not a catalog of files, classes or subsystems. Infer the audience and desired outcome from purpose. Organize 3-8 sections in the order the reader needs to understand or perform the work. For an administrator guide, prefer purpose and end-to-end mental model, preparation, first successful operation, interpreting results, then ongoing operation and troubleshooting; adapt this structure to the actual purpose rather than forcing it. Start with orientation before implementation details. reader_goal states what the reader should achieve. storyline describes the reading order and questions connecting sections. It is not an execution trace: do not invent symbol meanings, call ordering or branch semantics from filenames. Describe what the reader will learn, leaving runtime claims to evidence-based writing. Each reader_question is the single question this section resolves; handoff describes what the next section builds on. terminology contains at most 12 consistent term definitions to use only when evidence supports them. Allocate diagrams across the whole document in each section diagrams array (empty means no diagram); each entry is a short plain-language objective for one distinct diagram, NEVER diagram code or a presumed sequence. Diagram types requested by purpose (e.g. sequenceDiagram) must be named explicitly in that objective. Respect max_diagrams (null means no numeric cap) and the total number and types requested by purpose across ALL sections, not per section. Do not repeat the overall flow diagram in every chapter. query names implementation files AND concrete actions, symbols, request routes or state transitions needed to answer reader_question; filenames are retrieval hints, not necessarily headings. Use observed symbols from inventory; do not invent entry function names. For an end-to-end request guide, explicitly include the user/client entry, transport/server handler, core orchestration, and result consumer in the first section retrieval query when present in inventory. This inventory may be sampled; do not claim exhaustive coverage."});
             match llm::call(ctx, SYSTEM, input)
                 .await
                 .and_then(|s| llm::decode::<Outline>(&s))
@@ -353,12 +364,33 @@ async fn execute(ctx: &RunContext) -> Result<()> {
                 Ok(o)
                     if !o.sections.is_empty()
                         && o.sections.len() <= 12
+                        && !o.reader_goal.trim().is_empty()
+                        && o.reader_goal.len() <= 2000
+                        && !o.storyline.trim().is_empty()
+                        && o.storyline.len() <= 4000
+                        && o.terminology.len() <= 12
+                        && o.terminology.iter().all(|t| t.len() <= 500)
                         && o.sections.iter().all(|s| {
                             !s.title.trim().is_empty()
                                 && s.title.len() < 300
                                 && s.query.len() < 2000
+                                && s.reader_question.len() <= 1500
+                                && s.handoff.len() <= 1500
+                                && s.diagrams.as_ref().is_some_and(|d| {
+                                    d.len() <= 4
+                                        && d.iter().all(|v| !v.trim().is_empty() && v.len() <= 1500)
+                                })
                         }) =>
                 {
+                    if let Some(error) = outline_diagram_error(&o, ctx.snapshot.task.max_diagrams) {
+                        plan_error = error;
+                        ctx.event(
+                            "outline_validation",
+                            json!({"stage":"planning","attempt":attempt+1,"error":plan_error}),
+                        )
+                        .await?;
+                        continue;
+                    }
                     result = Some(o);
                     break;
                 }
@@ -385,7 +417,7 @@ async fn execute(ctx: &RunContext) -> Result<()> {
         let section = if let Some(v) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? {
             serde_json::from_value(v)?
         } else {
-            match write_section(ctx, plan, &outline, None).await {
+            match write_section(ctx, plan, &outline, i, None).await {
                 Ok(s) => {
                     db::checkpoint(&ctx.pool, &ctx.id, &key, &serde_json::to_value(&s)?).await?;
                     s
@@ -397,58 +429,74 @@ async fn execute(ctx: &RunContext) -> Result<()> {
     }
     let mut last_issues = vec![];
     for iteration in 0..ctx.snapshot.task.max_iterations {
+        // A later review proves all repairs of this round were committed.
+        if db::load_checkpoint(&ctx.pool, &ctx.id, &format!("review:{}", iteration + 1))
+            .await?
+            .is_some()
+        {
+            continue;
+        }
         ctx.event("review",json!({"stage":"reviewing","iteration":iteration+1,"max_iterations":ctx.snapshot.task.max_iterations})).await?;
-        let mut issues = validate_sections(&sections)?;
-        for (i, section) in sections.iter().enumerate() {
-            let input = json!({"purpose":ctx.snapshot.task.direction,"section_index":i,"section":section,"section_plan":outline.sections.get(i),"other_sections":outline.sections.iter().enumerate().filter(|(j,_)| *j != i).map(|(_,s)| &s.title).collect::<Vec<_>>(),"instruction":"Review this section against its assigned topic only. Other topics belong to other_sections: flag duplication, do not demand their coverage here. For every runtime claim, check that cited implementation actually supports it; README or comments alone are not execution proof. Flag unsupported claims and request concrete implementation identifiers via query. Also check false statements and invalid diagrams. Return JSON {issues:[{severity:'major'|'minor',section:number,message:string,query:string}]}. Empty issues is allowed only if supported. query identifies additional evidence to retrieve."});
-            let mut review = None;
-            for attempt in 0..2 {
-                let mut request = input.clone();
-                request["attempt"] = json!(attempt);
-                match llm::call(ctx, SYSTEM, request)
-                    .await
-                    .and_then(|s| llm::decode::<Review>(&s))
-                {
-                    Ok(r) => {
-                        review = Some(r);
-                        break;
+        let issues: Vec<Issue> = if let Some(saved) =
+            db::load_checkpoint(&ctx.pool, &ctx.id, &format!("review:{iteration}")).await?
+        {
+            serde_json::from_value(saved)?
+        } else {
+            let mut issues = validate_sections(&sections)?;
+            for (i, section) in sections.iter().enumerate() {
+                ctx.event("review_section",json!({"stage":"reviewing","title":section.title,"section":i+1,"total_sections":sections.len(),"iteration":iteration+1})).await?;
+                let input = json!({"purpose":ctx.snapshot.task.direction,"section_index":i,"section":section,"section_plan":outline.sections.get(i),"document_plan":outline,"other_sections":outline.sections.iter().enumerate().filter(|(j,_)| *j != i).map(|(_,s)| &s.title).collect::<Vec<_>>(),"instruction":"Review this section against its assigned topic only. Other topics belong to other_sections: flag duplication, do not demand their coverage here. The document_plan is not ground truth. For every runtime claim and every diagram arrow/branch/exit, check that cited implementation actually supports it; README or comments alone are not execution proof. Flag unsupported claims and request concrete implementation identifiers via query. Also check false statements and invalid diagrams. This is reader-facing documentation, not a code audit or a transcript of previous reviews. Flag leaked review instructions, proposed source patches, and irrelevant implementation details unless explicitly requested by purpose. State corrections in the requested document language. Report only actual defects that require a concrete change. Do not include accurate/supported claims, confirmations, or no-issue observations in issues. Every issue must specify the required correction; query may be empty when no additional evidence is needed. Return JSON {issues:[{severity:'major'|'minor',section:number,message:string,query:string}]}. Empty issues is allowed only if supported. query identifies additional evidence to retrieve."});
+                let mut review = None;
+                for attempt in 0..2 {
+                    let mut request = input.clone();
+                    request["attempt"] = json!(attempt);
+                    match llm::call(ctx, SYSTEM, request)
+                        .await
+                        .and_then(|s| llm::decode::<Review>(&s))
+                    {
+                        Ok(r) => {
+                            review = Some(r);
+                            break;
+                        }
+                        Err(e) if fatal(&e) => return Err(e),
+                        Err(e) if is_budget(&e) => {
+                            return Err(e);
+                        }
+                        Err(_) => {}
                     }
-                    Err(e) if fatal(&e) => return Err(e),
-                    Err(e) if is_budget(&e) => {
-                        return Err(e);
-                    }
-                    Err(_) => {}
+                }
+                if let Some(r) = review {
+                    issues.extend(r.issues.into_iter().take(50).map(|mut issue| {
+                        issue.section = i;
+                        issue
+                    }));
+                } else {
+                    issues.push(Issue {
+                        severity: "major".into(),
+                        section: i,
+                        message: "Automatic review could not complete".into(),
+                        query: String::new(),
+                    });
                 }
             }
-            if let Some(r) = review {
-                issues.extend(r.issues.into_iter().take(50).map(|mut issue| {
-                    issue.section = i;
-                    issue
-                }));
-            } else {
+            issues.extend(review_coherence(ctx, &outline, &sections, iteration).await?);
+            if sections.len() < outline.sections.len() {
                 issues.push(Issue {
                     severity: "major".into(),
-                    section: i,
-                    message: "Automatic review could not complete".into(),
+                    section: sections.len(),
+                    message: "Some planned sections could not be generated".into(),
                     query: String::new(),
                 });
             }
-        }
-        if sections.len() < outline.sections.len() {
-            issues.push(Issue {
-                severity: "major".into(),
-                section: sections.len(),
-                message: "Some planned sections could not be generated".into(),
-                query: String::new(),
-            });
-        }
-        db::checkpoint(
-            &ctx.pool,
-            &ctx.id,
-            &format!("review:{iteration}"),
-            &serde_json::to_value(&issues)?,
-        )
-        .await?;
+            db::checkpoint(
+                &ctx.pool,
+                &ctx.id,
+                &format!("review:{iteration}"),
+                &serde_json::to_value(&issues)?,
+            )
+            .await?;
+            issues
+        };
         ctx.event("review_result",json!({"stage":"reviewed","iteration":iteration+1,"major":issues.iter().filter(|i|i.severity=="major").count(),"minor":issues.iter().filter(|i|i.severity!="major").count(),"issues":issues})).await?;
         last_issues = issues;
         if last_issues.is_empty() {
@@ -458,6 +506,13 @@ async fn execute(ctx: &RunContext) -> Result<()> {
             break;
         }
         for i in 0..sections.len() {
+            let repair_key = format!("repair:{iteration}:{i}");
+            if db::load_checkpoint(&ctx.pool, &ctx.id, &repair_key)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
             let relevant: Vec<&Issue> = last_issues
                 .iter()
                 .filter(|issue| issue.section == i)
@@ -466,13 +521,14 @@ async fn execute(ctx: &RunContext) -> Result<()> {
                 continue;
             }
             if let (Some(plan), Some(old)) = (outline.sections.get(i), sections.get(i)) {
-                let correction = json!({"previous":old.markdown,"issues":relevant});
-                match write_section(ctx, plan, &outline, Some(correction)).await {
+                let correction = json!({"previous":old.markdown,"issues":relevant,"previous_evidence":old.evidence.iter().filter(|e| old.markdown.contains(&format!("[E:{}]", e.id))).collect::<Vec<_>>()});
+                match write_section(ctx, plan, &outline, i, Some(correction)).await {
                     Ok(new) => {
-                        db::checkpoint(
+                        db::checkpoint_repair(
                             &ctx.pool,
                             &ctx.id,
                             &format!("section:{i}"),
+                            &repair_key,
                             &serde_json::to_value(&new)?,
                         )
                         .await?;
@@ -514,6 +570,88 @@ async fn execute(ctx: &RunContext) -> Result<()> {
     publish::save(ctx, &markdown, &warnings).await?;
     Ok(())
 }
+async fn neighboring_sections(
+    ctx: &RunContext,
+    outline: &Outline,
+    index: usize,
+) -> Result<Vec<Value>> {
+    let mut neighbors = vec![];
+    for other in [index.checked_sub(1), index.checked_add(1)]
+        .into_iter()
+        .flatten()
+    {
+        if other >= outline.sections.len() {
+            continue;
+        }
+        if let Some(value) =
+            db::load_checkpoint(&ctx.pool, &ctx.id, &format!("section:{other}")).await?
+        {
+            let section: Section = serde_json::from_value(value)?;
+            neighbors.push(json!({"position":if other<index {"previous"} else {"next"},"context":crate::editorial::digest(&[section], 2000)}));
+        }
+    }
+    Ok(neighbors)
+}
+
+async fn review_coherence(
+    ctx: &RunContext,
+    outline: &Outline,
+    sections: &[Section],
+    iteration: u32,
+) -> Result<Vec<Issue>> {
+    ctx.event("document_review", json!({"stage":"document_review","iteration":iteration+1,"title":"전체 문서 흐름·중복·용어 검토","section":null})).await?;
+    let mut previous_error = String::new();
+    let review_system = format!(
+        "{SYSTEM} You are returning a machine-readable review. Return ONLY JSON {{\"issues\":[{{\"severity\":\"major\" or \"minor\",\"section\":zero-based integer,\"message\":concrete correction,\"query\":\"\"}}]}}. Do not substitute fields such as problem, suggestion or heading. Use the exact indices from valid_sections."
+    );
+    for attempt in 0..3 {
+        let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"document_plan":outline,"previous_error":previous_error,"valid_sections":outline.sections.iter().enumerate().map(|(i,s)| json!({"index":i,"title":s.title})).collect::<Vec<_>>(),"sections":crate::editorial::digest(sections, 24000 >> attempt),"instruction":"Review the whole document for coherence as an editor. These are bounded excerpts (check excerpted); missing middle text is not evidence of a missing explanation. Check the reader journey, prerequisites before use, shared terminology, repeated explanations, contradictions between sections, unexplained handoffs and whether the reader can connect an action to its result. mermaid_count is computed from the full section: check total diagram counts against purpose and assigned diagrams, including repetition of an overview diagram. Reject a catalog of implementation parts when the purpose asks for a user guide. Flag review commentary or source patch suggestions leaked into reader-facing prose. Do not fact-check code from these excerpts; source verification is a separate review. Report only actionable defects with a concrete editing instruction, assigning each issue to its owning zero-based section. Use the requested language. Return JSON {issues:[{severity:'major'|'minor',section:number,message:string,query:string}]}; query should be empty for editorial changes. Return an empty issues array if no defect is supported. Never rewrite source code or invent transitions that assert unsupported system behavior."});
+        match llm::call(ctx, &review_system, input)
+            .await
+            .and_then(|text| llm::decode::<Review>(&text))
+        {
+            Ok(review) if review.issues.iter().all(|i| i.section < sections.len()) => {
+                let issues: Vec<Issue> = review.issues.into_iter().take(24).collect();
+                ctx.event(
+                    "document_review_result",
+                    json!({"stage":"document_reviewed","iteration":iteration+1,"issues":issues}),
+                )
+                .await?;
+                return Ok(issues);
+            }
+            Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
+            Ok(_) => {
+                previous_error = format!(
+                    "Invalid section index. Valid indices are 0 through {} inclusive. Use exact valid_sections indices, not chapter numbers.",
+                    sections.len().saturating_sub(1)
+                );
+            }
+            Err(e) => {
+                previous_error = format!(
+                    "Invalid review JSON: {}. Return exactly issues containing severity, section, message, query; do not use alternate field names.",
+                    safe_error(&e.to_string())
+                );
+            }
+        }
+        ctx.event(
+            "document_review_retry",
+            json!({"stage":"document_review","attempt":attempt+1,"error":previous_error}),
+        )
+        .await?;
+    }
+    Ok(vec![Issue {
+        severity: "major".into(),
+        section: 0,
+        message: "Whole-document coherence review could not complete; integration is unverified."
+            .into(),
+        query: String::new(),
+    }])
+}
+
+fn recoverable_generation_failure(e: &anyhow::Error) -> bool {
+    let message = e.to_string();
+    message.contains("API_RETRIES_EXHAUSTED") || message.contains("SECTION_REPAIR_EXHAUSTED")
+}
 fn fatal(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     e.downcast_ref::<sqlx::Error>().is_some()
@@ -534,8 +672,10 @@ async fn write_section(
     ctx: &RunContext,
     plan: &SectionPlan,
     outline: &Outline,
+    section_index: usize,
     correction: Option<Value>,
 ) -> Result<Section> {
+    let neighbors = neighboring_sections(ctx, outline, section_index).await?;
     let repair_queries = correction
         .as_ref()
         .and_then(|v| v.get("issues"))
@@ -548,9 +688,17 @@ async fn write_section(
                 .join(" ")
         })
         .unwrap_or_default();
-    let query = format!("{} {}", repair_queries, plan.query);
+    let query = format!("{} {} {}", repair_queries, plan.query, plan.reader_question);
     let mut last = String::new();
     let mut correction = correction;
+    let mut previous_evidence: Vec<crate::model::Evidence> = match correction
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .and_then(|v| v.remove("previous_evidence"))
+    {
+        Some(value) => serde_json::from_value(value)?,
+        None => vec![],
+    };
     let mut input_reductions = 0u32;
     let mut output_reductions = 0u32;
     let mut retained_evidence = None;
@@ -563,11 +711,21 @@ async fn write_section(
             .saturating_sub(
                 l.max_output_tokens as usize + ctx.snapshot.task.direction.len() + 16000,
             )
-            .min(60_000);
+            .min(80_000);
         let max_bytes = base / (1usize << input_reductions);
         let evidence = match retained_evidence.take() {
             Some(e) => e,
-            None => source::retrieve(ctx, &query, max_bytes.max(512)).await?,
+            None => {
+                let retrieval_bytes = if previous_evidence.is_empty() {
+                    max_bytes
+                } else {
+                    max_bytes / 2
+                };
+                merge_evidence(
+                    source::retrieve(ctx, &query, retrieval_bytes.max(512)).await?,
+                    &previous_evidence,
+                )
+            }
         };
         if evidence.is_empty() {
             bail!("No evidence available for section {}", plan.title);
@@ -577,8 +735,8 @@ async fn write_section(
             .filter(|e| source::is_implementation(&e.path))
             .map(|e| e.path.as_str())
             .collect();
-        ctx.event("section_attempt", json!({"stage":"writing","title":plan.title,"attempt":attempt+1,"input_reductions":input_reductions,"output_reductions":output_reductions,"evidence_chunks":evidence.len(),"implementation_files":implementation_files,"repair":correction.is_some()})).await?;
-        let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"title":plan.title,"section_plan":plan,"other_sections":outline.sections.iter().filter(|s| s.title != plan.title).map(|s| &s.title).collect::<Vec<_>>(),"evidence":evidence,"correction":correction,"previous_error":last,"instruction":format!("Write only Markdown for the assigned section. The purpose describes the whole document, not a checklist to repeat in each section. Leave other_sections to their owners. Do not repeat the section title; use ### or deeper subheadings. Maximum {} words. Every substantive claim must cite [E:id]. Runtime behavior must cite implementation, not only README/comments/tests. If implementation is absent, explicitly mark the claim unverified rather than infer it. For syntax/citation repairs, retain correct content and supplied evidence, fix only the reported defects. Mermaid labels must be quoted. Do not claim exhaustive coverage.",1200usize/(1usize << output_reductions))});
+        ctx.event("section_attempt", json!({"stage":"writing","title":plan.title,"section":section_index+1,"total_sections":outline.sections.len(),"attempt":attempt+1,"input_reductions":input_reductions,"output_reductions":output_reductions,"evidence_chunks":evidence.len(),"implementation_files":implementation_files,"repair":correction.is_some()})).await?;
+        let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"title":plan.title,"section_plan":plan,"document_plan":outline,"neighbor_drafts":neighbors,"other_sections":outline.sections.iter().filter(|s| s.title != plan.title).map(|s| &s.title).collect::<Vec<_>>(),"evidence":evidence,"correction":correction,"previous_error":last,"instruction":format!("Write only Markdown for the assigned section. Write publishable documentation. Do not output review commentary, proposed source patches, or a reply to the reviewer unless purpose explicitly requests those forms. Apply correction issues silently to the document itself. neighbor_drafts are continuity hints, not source evidence: do not copy their factual claims without evidence supplied to this request. document_plan is unverified editorial guidance, not factual evidence. Correct any plan assumption that conflicts with supplied implementation; never force a planned execution order onto conditional code. Follow document_plan.reader_goal and the reading order in storyline, answer this section reader_question, and use consistent terminology. Begin by relating this step to what the reader has already learned or done; end with the result or decision the next section uses, when there is a next section. These transitions must be meaningful, not generic filler. In the opening orientation section, explain actors and data handoffs before implementation details; omit low-level normalization edge cases and pool sizing unless needed for the reader goal. In a worked example, clearly state hypothetical decisions and follow one input through to its observable result, rather than listing action handlers. Sequence diagrams must represent termination correctly: use a terminating break branch or a single response after the loop, never depict the same request replying twice. Explain cause, action and observable result in connected prose; prefer a worked end-to-end path over enumerating helper functions. Include implementation details only when this reader needs them. When section_plan.diagrams is provided, include exactly one Mermaid diagram per allocated description, and no diagrams when that array is empty. Other sections own their allocated diagrams; refer to those explanations instead of drawing the whole flow again. Use diagrams to connect actors, inputs, decisions and results across modules, not as disconnected component pictures. The purpose describes the whole document, not a checklist to repeat in each section. Leave other_sections to their owners. Do not repeat the section title; use ### or deeper subheadings. Maximum {} words. Every substantive claim must cite [E:id]. Runtime behavior must cite implementation, not only README/comments/tests. If implementation is absent, explicitly mark the claim unverified rather than infer it. For syntax/citation repairs, retain correct content and supplied evidence, fix only the reported defects. Mermaid labels must be quoted. Do not claim exhaustive coverage.",1200usize/(1usize << output_reductions))});
         match llm::call(ctx, SYSTEM, input).await {
             Ok(markdown) => {
                 let section = Section {
@@ -590,6 +748,9 @@ async fn write_section(
                     evidence,
                 };
                 let mut issues = validate_sections(std::slice::from_ref(&section))?;
+                if let Some(issue) = validate_diagram_allocation(plan, &section.markdown) {
+                    issues.push(issue);
+                }
                 if let Err(e) = publish::validate_mermaid(ctx, &section.markdown).await {
                     if fatal(&e) {
                         return Err(e);
@@ -604,6 +765,7 @@ async fn write_section(
                 if issues.is_empty() {
                     return Ok(section);
                 }
+                ctx.event("section_validation", json!({"stage":"repairing","title":plan.title,"section":section_index+1,"total_sections":outline.sections.len(),"attempt":attempt+1,"issues":issues})).await?;
                 last = serde_json::to_string(&issues)?;
                 correction = Some(
                     json!({"previous":section.markdown,"issues":issues,"mode":"targeted_repair"}),
@@ -619,6 +781,7 @@ async fn write_section(
                     "input_limit" => {
                         input_reductions += 1;
                         correction = None;
+                        previous_evidence.clear();
                     }
                     "output_limit" => {
                         output_reductions += 1;
@@ -633,7 +796,7 @@ async fn write_section(
         }
     }
     bail!(
-        "Section generation failed after bounded repair attempts: {}",
+        "SECTION_REPAIR_EXHAUSTED: {}",
         last.chars().take(400).collect::<String>()
     )
 }
@@ -646,6 +809,23 @@ fn repair_kind(error: &str) -> &'static str {
         "targeted_repair"
     }
 }
+fn outline_diagram_error(outline: &Outline, maximum: Option<u32>) -> Option<String> {
+    let maximum = maximum? as usize;
+    let count: usize = outline
+        .sections
+        .iter()
+        .map(|s| s.diagrams.as_ref().map_or(0, Vec::len))
+        .sum();
+    (count > maximum).then(|| format!("The plan allocates {count} diagrams but max_diagrams is {maximum} for the WHOLE document. Keep only distinct diagrams required by purpose and set other section diagrams to []."))
+}
+fn validate_diagram_allocation(plan: &SectionPlan, markdown: &str) -> Option<Issue> {
+    let expected = plan.diagrams.as_ref()?.len();
+    let actual = markdown
+        .lines()
+        .filter(|line| line.trim_start().starts_with("```mermaid"))
+        .count();
+    (actual != expected).then(|| Issue { severity:"major".into(), section:0, message:format!("This section owns {expected} Mermaid diagram(s) in section_plan.diagrams but contains {actual}. Follow that allocation exactly; remove redundant diagrams or add the missing assigned diagram without changing supported facts."), query:String::new() })
+}
 fn normalize_section_headings(markdown: &str, title: &str) -> String {
     let mut fenced = false;
     markdown
@@ -654,10 +834,11 @@ fn normalize_section_headings(markdown: &str, title: &str) -> String {
             if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
                 fenced = !fenced;
             }
-            if !fenced && line.starts_with('#') {
-                let n = line.bytes().take_while(|b| *b == b'#').count();
-                if line.get(n..).is_some_and(|s| s.starts_with(' ')) {
-                    let text = line[n..].trim();
+            let heading = line.trim_start_matches(' ');
+            if !fenced && line.len() - heading.len() <= 3 && heading.starts_with('#') {
+                let n = heading.bytes().take_while(|b| *b == b'#').count();
+                if heading.get(n..).is_some_and(|s| s.starts_with(' ')) {
+                    let text = heading[n..].trim();
                     if text == title.trim() {
                         return None;
                     }
@@ -672,6 +853,19 @@ fn normalize_section_headings(markdown: &str, title: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+fn merge_evidence(
+    mut fresh: Vec<crate::model::Evidence>,
+    previous: &[crate::model::Evidence],
+) -> Vec<crate::model::Evidence> {
+    let mut ids: std::collections::HashSet<String> = fresh.iter().map(|e| e.id.clone()).collect();
+    fresh.extend(
+        previous
+            .iter()
+            .filter(|e| ids.insert(e.id.clone()))
+            .cloned(),
+    );
+    fresh
 }
 fn normalize_citations(markdown: &str, evidence: &[crate::model::Evidence]) -> Result<String> {
     let cite = regex::Regex::new(r"\[E:([^\]\s]+)\]")?;
@@ -709,7 +903,7 @@ pub fn validate_sections(sections: &[Section]) -> Result<Vec<Issue>> {
                 issues.push(Issue {
                     severity: "major".into(),
                     section: i,
-                    message: "Citation references evidence that was not provided".into(),
+                    message: format!("Citation [E:{}] references evidence that was not provided. Replace it with a supplied evidence ID that supports the claim, or remove the unsupported claim.", id.unwrap_or_default()),
                     query: String::new(),
                 });
             }
@@ -734,10 +928,7 @@ pub fn validate_sections(sections: &[Section]) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 fn assemble(ctx: &RunContext, sections: &[Section], warnings: &[String]) -> String {
-    let mut out = format!(
-        "# {}\n\n> Run: `{}` · Source snapshot is fixed for this run.\n\n",
-        ctx.snapshot.task.name, ctx.id
-    );
+    let mut out = format!("# {}\n\n", ctx.snapshot.task.name);
     if !warnings.is_empty() {
         let partial = warnings
             .iter()
@@ -747,29 +938,17 @@ fn assemble(ctx: &RunContext, sections: &[Section], warnings: &[String]) -> Stri
         } else {
             "> **검토 사항 있음** — 해결되지 않은 사항을 확인하세요.\n>\n"
         });
-        for warning in warnings {
-            out.push_str(&format!("> {}\n", warning.replace('\n', " ")));
-        }
-        out.push('\n');
+        out.push_str(
+            "> 세부 검토 사항은 문서 끝의 ‘Unresolved items and coverage limits’를 확인하세요.\n\n",
+        );
     }
-    for s in sections {
-        out.push_str(&format!("## {}\n\n{}\n\n", s.title, s.markdown));
-    }
-    out.push_str("## Source references\n\n");
-    let mut seen = std::collections::HashSet::new();
-    for s in sections {
-        for e in &s.evidence {
-            if seen.insert(e.id.clone()) {
-                out.push_str(&format!(
-                    "- [E:{}] `{}` L{}–L{}\n",
-                    e.id,
-                    e.path.replace('`', ""),
-                    e.start,
-                    e.end
-                ));
-            }
-        }
-    }
+    let (body, references) = crate::editorial::render_sections(sections);
+    out.push_str(&body);
+    out.push_str(&references);
+    out.push_str(&format!(
+        "\n> Run: `{}` · Source snapshot is fixed for this run.\n\n",
+        ctx.id
+    ));
     if !warnings.is_empty() {
         out.push_str("\n## Unresolved items and coverage limits\n\n");
         for w in warnings {
@@ -798,7 +977,7 @@ async fn publish_partial(ctx: &RunContext, reason: &str) -> Result<()> {
     }
     let mut warnings = vec![
         reason.to_string(),
-        "Generation/review stopped at the execution budget; this document is incomplete.".into(),
+        "Generation/review stopped before completion; this document is incomplete.".into(),
     ];
     let missing: Vec<&str> = outline
         .sections
@@ -825,6 +1004,32 @@ async fn publish_partial(ctx: &RunContext, reason: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn outline_diagram_limit_rejects_excess_before_writing() -> Result<()> {
+        let outline: Outline = serde_json::from_value(
+            json!({"sections":[{"title":"Flow", "query":"entry", "diagrams":["a","b"]}]}),
+        )?;
+        assert!(outline_diagram_error(&outline, None).is_none());
+        assert!(outline_diagram_error(&outline, Some(2)).is_none());
+        assert!(outline_diagram_error(&outline, Some(1)).is_some());
+        assert!(outline_diagram_error(&outline, Some(0)).is_some());
+        Ok(())
+    }
+    #[test]
+    fn diagram_allocation_enforces_counts_and_accepts_legacy_plans() -> Result<()> {
+        let mut plan: SectionPlan =
+            serde_json::from_value(json!({"title":"Flow", "query":"entry"}))?;
+        let one = "```mermaid\nflowchart LR\nA-->B\n```";
+        assert!(validate_diagram_allocation(&plan, one).is_none());
+        plan.diagrams = Some(vec![]);
+        assert!(validate_diagram_allocation(&plan, "Text only").is_none());
+        assert!(validate_diagram_allocation(&plan, one).is_some());
+        plan.diagrams = Some(vec!["Request sequence".into()]);
+        assert!(validate_diagram_allocation(&plan, one).is_none());
+        assert!(validate_diagram_allocation(&plan, "Missing").is_some());
+        assert!(validate_diagram_allocation(&plan, &format!("{one}\n{one}")).is_some());
+        Ok(())
+    }
     #[test]
     fn repairs_and_headings_preserve_unaffected_content() {
         assert_eq!(repair_kind("OUTPUT_TRUNCATED: length"), "output_limit");
@@ -868,6 +1073,42 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn review_repairs_retain_old_citations_and_new_evidence() -> Result<()> {
+        let old = crate::model::Evidence {
+            id: "old-id".into(),
+            path: "old.rs".into(),
+            start: 1,
+            end: 1,
+            content: "old fact".into(),
+        };
+        let fresh = crate::model::Evidence {
+            id: "new-id".into(),
+            path: "new.rs".into(),
+            start: 1,
+            end: 1,
+            content: "new fact".into(),
+        };
+        let evidence = merge_evidence(vec![fresh.clone(), old.clone()], &[old]);
+        assert_eq!(evidence.len(), 2);
+        let section = Section {
+            title: "Repair".into(),
+            markdown: "Retained [E:old-id]. Corrected [E:new-id].".into(),
+            evidence,
+        };
+        assert!(validate_sections(&[section])?.is_empty());
+        Ok(())
+    }
+    #[test]
+    fn indented_headings_normalize_without_changing_code() {
+        assert_eq!(
+            normalize_section_headings(
+                " # Topic\n\n  ## Details\n\n```python\n # code comment\n```",
+                "Topic"
+            ),
+            "### Details\n\n```python\n # code comment\n```"
+        );
+    }
+    #[test]
     fn unknown_citation_is_rejected() -> Result<()> {
         let s = Section {
             title: "Test".into(),
@@ -880,7 +1121,8 @@ mod tests {
                 content: "code".into(),
             }],
         };
-        assert!(!validate_sections(&[s])?.is_empty());
+        let issues = validate_sections(&[s])?;
+        assert!(issues.iter().any(|issue| issue.message.contains("[E:999]")));
         Ok(())
     }
 }

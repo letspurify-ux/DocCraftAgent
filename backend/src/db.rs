@@ -105,3 +105,18 @@ pub async fn events(pool: &MySqlPool, run: &str, after: u64) -> Result<Vec<Event
         })
         .collect()
 }
+
+/// Commit repaired content and its completion marker together so recovery cannot
+/// skip an unfinished repair or redo an already committed one.
+pub async fn checkpoint_repair(
+    pool: &MySqlPool,
+    run: &str,
+    section: &str,
+    repair: &str,
+    data: &Value,
+) -> Result<()> {
+    sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,?,?),(?,?,'true') ON DUPLICATE KEY UPDATE data=VALUES(data)")
+        .bind(run).bind(section).bind(serde_json::to_string(data)?)
+        .bind(run).bind(repair).execute(pool).await?;
+    Ok(())
+}

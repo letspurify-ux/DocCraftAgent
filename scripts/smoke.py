@@ -22,6 +22,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             data=json.loads(content)
             instruction=data.get('instruction','')
+            if model=='restart-review' and data.get('correction') and data.get('title')=='오류와 제약' and not getattr(self.server,'repair_delayed',False):
+                self.server.repair_delayed=True;time.sleep(4)
+            if model=='body-disconnect-once' and not getattr(self.server,'body_disconnected',False):
+                self.server.body_disconnected=True
+                self.send_response(200);self.send_header('Content-Length','1000');self.end_headers();self.wfile.write(b'{}');self.wfile.flush();self.close_connection=True;return
+            if model=='provider-error-once' and not getattr(self.server,'provider_error_sent',False):
+                self.server.provider_error_sent=True
+                return self.reply({'error':{'code':503,'message':'temporarily unavailable'}},200)
+            if model=='partial-exhausted' and 'Write only Markdown' in instruction:
+                writes=sum(1 for r in requests if r['model']==model and 'Write only Markdown' in r['messages'][-1]['content'])
+                if writes>1:return self.reply({'error':{'code':503}},503)
             if model=='context-once' and not getattr(self.server,'context_sent',False):
                 self.server.context_sent=True
                 return self.reply({'error':{'code':'context_length_exceeded'}},400)
@@ -32,9 +43,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 writes=sum(1 for r in requests if r['model']==model and 'Write only Markdown' in r['messages'][-1]['content'])
                 if writes>1: return self.reply({'error':{'code':429,'message':'Rate limit exceeded: free-models-per-day'}},429)
             if 'sections:[{title' in instruction:
-                result=json.dumps({'sections':[{'title':'기능 개요','query':'handle_request handleRequest validation'},{'title':'오류와 제약','query':'name_required errors'},{'title':'처리 흐름','query':'return handle_request'}]},ensure_ascii=False)
+                result=json.dumps({'reader_goal':'입력을 보내고 결과와 오류를 이해한다','storyline':'입력 준비에서 실행, 결과 확인과 오류 대응으로 이어진다','terminology':['처리 결과: 검증을 마친 반환값'],'sections':[{'title':'기능 개요','query':'handle_request handleRequest validation','reader_question':'무엇을 할 수 있는가?','handoff':'검증 조건을 확인한다','diagrams':['입력과 검증 흐름']},{'title':'오류와 제약','query':'name_required errors','reader_question':'어떤 입력이 유효한가?','handoff':'검증을 통과한 입력을 처리한다','diagrams':['오류 분기']},{'title':'처리 흐름','query':'return handle_request','reader_question':'결과를 어떻게 확인하는가?','handoff':'','diagrams':['결과 반환 흐름']}]},ensure_ascii=False)
+                if model=='outline-overflow-once' and data.get('previous_error'):
+                    outline=json.loads(result);outline['sections'][-1]['diagrams']=[];result=json.dumps(outline,ensure_ascii=False)
+            elif 'Review the whole document' in instruction:
+                if model=='coherence-format-once' and not getattr(self.server,'coherence_format_sent',False):
+                    self.server.coherence_format_sent=True
+                    result=json.dumps({'issues':[{'section':4,'problem':'wrong review schema','suggestion':'fix'}]})
+                elif model=='coherence-once' and not getattr(self.server,'coherence_sent',False):
+                    self.server.coherence_sent=True
+                    result=json.dumps({'issues':[{'severity':'major','section':1,'message':'앞 절의 입력 준비가 다음 절의 실행으로 이어지도록 결과와 연결을 설명하세요.','query':''}]})
+                else:result=json.dumps({'issues':[]})
             elif 'Review this section' in instruction:
-                if model=='review-once' and not getattr(self.server,'review_sent',False):
+                if model=='restart-review' and not getattr(self.server,'reviewed_'+str(data['section_index']),False):
+                    setattr(self.server,'reviewed_'+str(data['section_index']),True)
+                    result=json.dumps({'issues':[{'severity':'major','section':data['section_index'],'message':'Add the missing validation condition','query':'name_required'}]})
+                elif model=='review-once' and not getattr(self.server,'review_sent',False):
                     self.server.review_sent=True
                     result=json.dumps({'issues':[{'severity':'major','section':data['section_index'],'message':'Document the missing empty-name condition','query':'name_required'}]})
                 else:result=json.dumps({'issues':[]})
@@ -42,6 +66,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 evidences=data.get('evidence',[])
                 eid=evidences[0]['id'] if evidences else 0
                 result=f'입력 이름을 확인하고 처리 결과를 반환합니다. [E:{eid}]\n\n```mermaid\nflowchart LR\n A["입력"] --> B["이름 검증"]\n B --> C["결과 반환"]\n```'
+                if data.get('section_plan',{}).get('diagrams')==[]:result=f'입력 이름을 확인하고 처리 결과를 반환합니다. [E:{eid}]'
+                if model=='diagram-overflow-once' and not getattr(self.server,'diagram_overflow_sent',False):
+                    self.server.diagram_overflow_sent=True;result+='\n\n```mermaid\nflowchart LR\n X-->Y\n```'
                 if model=='headings':result='## '+data['title']+'\n\n## Details\n'+result
                 if data.get('correction'):result+=f'\n\n빈 이름의 오류 조건을 추가로 정리했습니다. [E:{eid}]'
                 if model=='mermaid-once' and not getattr(self.server,'mermaid_sent',False):
@@ -96,6 +123,7 @@ class DbForward(socketserver.BaseRequestHandler):
 def main():
     password=os.environ.get('DOCCRAFT_DB_PASSWORD')
     if password is None: raise SystemExit('Set DOCCRAFT_DB_PASSWORD for local test database')
+    suite_id=str(time.time_ns())
     mock=http.server.ThreadingHTTPServer(('127.0.0.1',MOCK),Handler)
     threading.Thread(target=mock.serve_forever,daemon=True).start()
     with tempfile.TemporaryDirectory(prefix='doccraft-e2e-') as tmp:
@@ -106,7 +134,7 @@ def main():
         jar=http.cookiejar.CookieJar();opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
         def api(path,method='GET',body=None):
             data=None if body is None else json.dumps(body).encode()
-            req=urllib.request.Request(f'http://127.0.0.1:{PORT}/api/v1'+path,data=data,method=method,headers={'Content-Type':'application/json'})
+            req=urllib.request.Request(f'http://127.0.0.1:{PORT}/api/v1'+path,data=data,method=method,headers={'Content-Type':'application/json','Origin':'http://127.0.0.1:6001'})
             try:
                 with opener.open(req,timeout=15) as response:return json.load(response)
             except urllib.error.HTTPError as e:raise RuntimeError(e.read().decode()) from e
@@ -120,7 +148,7 @@ def main():
                 time.sleep(.2)
             raise AssertionError('Run did not finish within deadline')
         def configure(model):
-            s=api('/settings');s['llm']['model']=model;s['llm']['base_url']=f'http://127.0.0.1:{MOCK}/v1';s['llm']['rpm']=1000;s['llm']['tpm']=20000000;s['llm']['timeout_seconds']=20;s['llm']['retries']=1;s['source_roots']=[str(source)];s['output_roots']=[str(out)];return api('/settings','PUT',s)
+            s=api('/settings');s['llm']['model']=model;s['llm']['base_url']=f'http://127.0.0.1:{MOCK}/{suite_id}/v1';s['llm']['rpm']=1000;s['llm']['tpm']=20000000;s['llm']['timeout_seconds']=20;s['llm']['retries']=1;s['source_roots']=[str(source)];s['output_roots']=[str(out)];return api('/settings','PUT',s)
         def task(name):
             return api('/tasks','POST',{'name':name,'sources':[str(source)],'target':str(out/(name+'.md')),'direction':'개발자를 위한 기능 설명과 Mermaid 흐름 정리','max_iterations':2})
         try:
@@ -141,7 +169,7 @@ def main():
             probe['llm']['proxy_mode']='custom';probe['llm']['proxy_url']=f'http://127.0.0.1:{MOCK}';probe['llm']['base_url']='http://upstream.invalid/v1'
             assert api('/settings/test-llm','POST',probe)['ok']
             print('PASS reasoning mappings and explicit HTTP proxy',flush=True)
-            for model in ['normal','context-once','retry-once','invalid-once','review-once','truncate-once','headings','mermaid-once']:
+            for model in ['normal','context-once','retry-once','invalid-once','review-once','truncate-once','headings','mermaid-once','body-disconnect-once','provider-error-once','coherence-once','diagram-overflow-once','coherence-format-once']:
                 configure(model);t=task(model);rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
                 assert r['status']=='completed',r
                 if model=='review-once':assert r['tokens']>=1800,r
@@ -155,11 +183,43 @@ def main():
                         assert 'Maximum 1200 words' in writes[1]['instruction']
                     elif model=='mermaid-once':
                         assert 'Keep this fact' in writes[1]['correction']['previous']
+                        assert 'Parse error' in writes[1]['correction']['issues'][0]['message']
                         assert 'Maximum 1200 words' in writes[1]['instruction']
                     else: assert 'Maximum 600 words' in writes[1]['instruction']
+                if model=='coherence-once':
+                    data=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model]
+                    reviews=[x for x in data if 'Review the whole document' in x.get('instruction','')]
+                    assert len(reviews)==2, 'Global review did not trigger another iteration'
+                    edits=[x for x in data if 'Write only Markdown' in x.get('instruction','') and x.get('correction')]
+                    assert len(edits)==1 and edits[0]['title']=='오류와 제약'
+                    assert edits[0]['document_plan']['storyline']
+                    assert {n['position'] for n in edits[0]['neighbor_drafts']}=={'previous','next'}
+                    assert all('excerpted' in x for x in reviews[0]['sections'])
+                    assert '[^s1]' in text and '[E:' not in text
+                if model=='diagram-overflow-once':
+                    writes=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
+                    assert text.count('```mermaid')==3
+                    assert writes[0]['evidence']==writes[1]['evidence']
+                    assert 'contains 2' in writes[1]['correction']['issues'][0]['message']
+                if model=='coherence-format-once':
+                    reviews=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Review the whole document' in x['messages'][-1]['content']]
+                    assert len(reviews)==2 and 'Invalid review JSON' in reviews[1]['previous_error']
+                    assert reviews[1]['valid_sections'][0]['index']==0
                 if model=='headings':
                     assert text.count('## 기능 개요\n')==1 and '### Details' in text
                 print('PASS generation / repair:',model,flush=True)
+            configure('outline-overflow-once');t=task('outline-overflow-once');t['max_diagrams']=2;api('/tasks','POST',t)
+            rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
+            assert r['status']=='completed',r
+            assert (out/'outline-overflow-once.md').read_text().count('```mermaid')==2
+            plans=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='outline-overflow-once' and 'sections:[{title' in x['messages'][-1]['content']]
+            assert len(plans)==2 and 'allocates 3' in plans[1]['previous_error']
+            print('PASS outline total diagram cap and corrected re-planning',flush=True)
+            configure('tight-budget')
+            t=api('/tasks','POST',{'name':'tight-budget','sources':[str(source)],'target':str(out/'tight-budget.md'),'direction':'개발자를 위한 기능 설명과 Mermaid 흐름 정리','max_iterations':2,'max_tokens':50000})
+            rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
+            assert r['status']=='completed' and r['tokens']==1600,r
+            print('PASS confirmed usage releases reservations within fixed task budget',flush=True)
             configure('quota-partial');t=task('quota-partial');rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
             assert r['status']=='completed_with_warnings',r
             text=(out/'quota-partial.md').read_text()
@@ -167,6 +227,12 @@ def main():
             assert 'Missing planned sections:' in text
             assert sum(1 for x in requests if x['model']=='quota-partial' and 'Write only Markdown' in x['messages'][-1]['content'])==2
             print('PASS quota: single rejection, partial document banner and missing sections',flush=True)
+            configure('partial-exhausted');t=task('partial-exhausted');rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
+            assert r['status']=='completed_with_warnings',r
+            configure('normal');t['max_tokens']=10000000;api('/tasks','POST',t);api(f'/runs/{rid}/resume?current_llm=true&current_token_limit=true','POST');r=poll(rid)
+            assert r['status']=='completed',r
+            assert 'Missing planned sections' not in (out/'partial-exhausted.md').read_text()
+            print('PASS partial result resumes with current LLM and replaces its original output',flush=True)
             configure('slow');t=task('cancel');rid=api(f"/tasks/{t['id']}/run",'POST')['id']
             end=time.monotonic()+10
             while time.monotonic()<end and not any(x['model']=='slow' for x in requests):time.sleep(.05)
@@ -200,6 +266,22 @@ def main():
                 except Exception:time.sleep(.1)
             r=poll(rid);assert r['status']=='completed',r
             print('PASS crash/restart checkpoint recovery',flush=True)
+            configure('restart-review');t=task('restart-review');rid=api(f"/tasks/{t['id']}/run",'POST')['id']
+            end=time.monotonic()+30
+            while time.monotonic()<end:
+                repairs=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='restart-review' and 'Write only Markdown' in x['messages'][-1]['content'] and json.loads(x['messages'][-1]['content']).get('correction')]
+                if len(repairs)>=2:break
+                time.sleep(.05)
+            else:raise AssertionError('Repair phase not reached')
+            process.kill();process.wait();process=subprocess.Popen([str(BINARY)],cwd=ROOT,env=env,stdout=log,stderr=log)
+            for _ in range(100):
+                try:api('/session');break
+                except Exception:time.sleep(.1)
+            r=poll(rid);assert r['status']=='completed',r
+            assert (out/'restart-review.md').read_text().count('빈 이름의 오류 조건')==3, 'Recovery lost pending review corrections'
+            repairs=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='restart-review' and 'Write only Markdown' in x['messages'][-1]['content'] and json.loads(x['messages'][-1]['content']).get('correction')]
+            assert sum(x['title']=='기능 개요' for x in repairs)==1, 'Committed repair repeated'
+            print('PASS review-phase restart retains issues and skips committed repairs',flush=True)
             proxy=DbProxy(('127.0.0.1',18769));threading.Thread(target=proxy.serve_forever,daemon=True).start()
             configure('db-outage');cfg=api('/settings');cfg['db']['port']=18769;api('/settings','PUT',cfg)
             t=task('db-outage');rid=api(f"/tasks/{t['id']}/run",'POST')['id']

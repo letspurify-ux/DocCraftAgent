@@ -60,7 +60,13 @@ test("create, run, inspect and render a document through the UI", async ({
   await page
     .getByRole("button", { name: "개발자 흐름도", exact: true })
     .click();
+  await page.getByLabel("전체 다이어그램 상한 (빈칸=자동, 0=없음)").fill("3");
   await page.getByRole("button", { name: "작업 저장", exact: true }).click();
+  const savedTasks = await (await page.request.get("/api/v1/tasks")).json();
+  expect(
+    savedTasks.find((task: { name: string }) => task.name === title)
+      .max_diagrams,
+  ).toBe(3);
   const card = page
     .locator(".task-card")
     .filter({ has: page.getByRole("heading", { name: title, exact: true }) });
@@ -85,6 +91,11 @@ test("create, run, inspect and render a document through the UI", async ({
   await page.getByLabel("문서 선택").selectOption(option!);
   await expect(page.locator(".markdown h1")).toHaveText(title);
   await expect(page.locator(".mermaid svg").first()).toBeVisible();
+  const reference = page.locator(".markdown [data-footnote-ref]").first();
+  await expect(reference).toBeVisible();
+  const footnote = (await reference.getAttribute("href"))!.slice(1);
+  await reference.click();
+  await expect(page.locator(`[id="${footnote}"]`)).toBeVisible();
   await page.screenshot({ path: "test-results/document.png", fullPage: true });
 });
 
@@ -111,6 +122,9 @@ test("partial artifact shows review warning before document", async ({
   await expect(page.locator(".document-warning")).toContainText(
     "부분 생성 · 전체 검토 미완료",
   );
+  await expect(page.locator(".document-warning li").first()).not.toBeVisible();
+  await page.locator(".document-warning summary").click();
+  await expect(page.locator(".document-warning li").first()).toBeVisible();
   await expect(page.locator(".document-warning")).toContainText(
     "Missing planned sections",
   );

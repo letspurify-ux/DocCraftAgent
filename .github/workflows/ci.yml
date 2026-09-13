@@ -19,11 +19,15 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
         working-directory: frontend
+      - run: node --experimental-strip-types --test frontend/scripts/api-response.test.mjs
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
       - run: npm run build
         working-directory: frontend
+      - run: cargo build --locked
+      - run: node scripts/test-all.mjs
+        timeout-minutes: 5
   integration:
     runs-on: ubuntu-latest
     services:

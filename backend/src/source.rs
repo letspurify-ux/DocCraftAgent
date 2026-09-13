@@ -56,7 +56,8 @@ pub fn validate_task(
     if task.direction.len() > 32_000 || task.name.len() > 200 || task.sources.len() > 50 {
         bail!("Task definition is too large");
     }
-    if task.max_iterations == 0
+    if task.max_diagrams.is_some_and(|n| n > 32)
+        || task.max_iterations == 0
         || task.max_iterations > 10
         || task.max_seconds < 30
         || task.max_seconds > 86400
@@ -362,28 +363,55 @@ async fn worker(ctx: &RunContext, path: &Path, lang: &str) -> Result<parser::Par
     Ok(serde_json::from_slice(&bytes)?)
 }
 pub async fn inventory(ctx: &RunContext) -> Result<String> {
-    let rows = sqlx::query("SELECT path,language,LEFT(detail,300) detail FROM files WHERE run_id=? AND status='indexed' ORDER BY CASE WHEN path LIKE '%/src/%' THEN 0 WHEN path LIKE '%README%' OR path LIKE '%/context.md' OR path LIKE '%/package.json' OR path LIKE '%/Cargo.toml' THEN 1 WHEN path LIKE '%/test/%' OR path LIKE '%/tests/%' THEN 3 ELSE 2 END,path LIMIT 500")
+    let rows = sqlx::query("SELECT path,language,LEFT(detail,150) detail,(SELECT LEFT(GROUP_CONCAT(COALESCE(b.symbols,c.symbols) ORDER BY c.start_line SEPARATOR ' '),600) FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.file_id=files.id) symbols FROM files WHERE run_id=? AND status='indexed' ORDER BY CASE WHEN path LIKE '%/src/%' THEN 0 WHEN path LIKE '%README%' OR path LIKE '%/context.md' OR path LIKE '%/package.json' OR path LIKE '%/Cargo.toml' THEN 1 WHEN path LIKE '%/test/%' OR path LIKE '%/tests/%' THEN 3 ELSE 2 END,path LIMIT 500")
         .bind(&ctx.id).fetch_all(&ctx.pool).await?;
-    let mut out = String::new();
+    // Show file coverage before optional details so a verbose early file cannot
+    // hide the client or server entry points later in the inventory.
+    let mut entries = Vec::new();
     for row in rows {
+        ctx.check()?;
         let path: String = row.try_get("path")?;
         let lang: String = row.try_get("language")?;
         let detail: String = row.try_get("detail")?;
-        out.push_str(&format!(
-            "{path} ({lang}) {}\n",
-            detail.chars().take(300).collect::<String>()
-        ));
-        if out.len() > 40_000 {
+        let symbols: Option<String> = row.try_get("symbols")?;
+        entries.push((path, lang, symbols.unwrap_or_default(), detail));
+    }
+    Ok(inventory_text(entries))
+}
+fn inventory_text(entries: Vec<(String, String, String, String)>) -> String {
+    let mut out = String::from("Indexed file sample:\n");
+    let mut details = Vec::new();
+    for (path, lang, symbols, detail) in entries {
+        if out.len() + path.len() + lang.len() + 8 > 24_000 {
             break;
         }
+        out.push_str(&format!("{path} ({lang})\n"));
+        if is_implementation(&path) {
+            details.push((path, symbols, detail));
+        }
     }
-    Ok(out)
+    out.push_str("\nSampled definition names and relationships (not execution proof):\n");
+    let per = (40_000usize.saturating_sub(out.len()) / details.len().max(1)).max(1);
+    for (path, symbols, detail) in details {
+        let name = Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&path);
+        let hint = format!("{name}: {symbols} · {detail}");
+        let line = crate::editorial::excerpt(&hint, per.saturating_sub(1));
+        if out.len() + line.len() + 1 > 40_000 {
+            break;
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
 }
 pub async fn retrieve(ctx: &RunContext, query: &str, max_bytes: usize) -> Result<Vec<Evidence>> {
     let fingerprint = db::load_checkpoint(&ctx.pool, &ctx.id, "index_fingerprint")
         .await?
         .unwrap_or(json!(ctx.id));
-    let key = hash(format!("retrieval-v4:{fingerprint}:{query}:{max_bytes}").as_bytes());
+    let key = hash(format!("retrieval-v7:{fingerprint}:{query}:{max_bytes}").as_bytes());
     if let Some(row) = sqlx::query("SELECT data FROM retrieval_cache WHERE hash=?")
         .bind(&key)
         .fetch_optional(&ctx.pool)
@@ -441,7 +469,8 @@ pub async fn retrieve(ctx: &RunContext, query: &str, max_bytes: usize) -> Result
         .collect::<std::collections::HashSet<_>>()
         .len()
         .clamp(1, 8);
-    let ranked = diverse_evidence(best);
+    let mut ranked = diverse_evidence(best);
+    prioritize_named(&mut ranked, query);
     let per_file = (max_bytes / distinct).max(1024);
     let mut used = 0;
     let mut result = vec![];
@@ -456,11 +485,8 @@ pub async fn retrieve(ctx: &RunContext, query: &str, max_bytes: usize) -> Result
             continue;
         }
         if e.content.len() > available {
-            let mut end = available;
-            while !e.content.is_char_boundary(end) {
-                end = end.saturating_sub(1);
-            }
-            let shortened = e.content.get(..end).unwrap_or_default();
+            let (offset, shortened) = focused_excerpt(&e.content, available, &terms);
+            e.start += e.content[..offset].bytes().filter(|b| *b == b'\n').count() as u32;
             let lines = shortened.bytes().filter(|b| *b == b'\n').count() as u32;
             e.end = e.start + lines - u32::from(shortened.ends_with('\n'));
             e.content = shortened.to_string();
@@ -476,6 +502,74 @@ pub async fn retrieve(ctx: &RunContext, query: &str, max_bytes: usize) -> Result
     }
     sqlx::query("INSERT INTO retrieval_cache(hash,data) VALUES(?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)").bind(&key).bind(serde_json::to_string(&result)?).execute(&ctx.pool).await?;
     Ok(result)
+}
+
+fn prioritize_named(ranked: &mut [(u8, i64, Evidence)], query: &str) {
+    let query = query.to_lowercase();
+    let mut counts = std::collections::HashMap::new();
+    let mut priorities = std::collections::HashMap::new();
+    for (tier, _, e) in ranked.iter() {
+        let named = Path::new(&e.path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| query.contains(&name.to_lowercase()));
+        let priority = if named && is_implementation(&e.path) {
+            let count = counts.entry(e.path.clone()).or_insert(0usize);
+            let priority = *count;
+            *count += 1;
+            priority
+        } else {
+            100 + usize::from(*tier)
+        };
+        priorities.insert(e.id.clone(), priority);
+    }
+    ranked.sort_by_key(|(_, _, e)| priorities.get(&e.id).copied().unwrap_or(usize::MAX));
+}
+
+fn focused_excerpt<'a>(content: &'a str, limit: usize, terms: &[String]) -> (usize, &'a str) {
+    if content.len() <= limit {
+        return (0, content);
+    }
+    let mut anchors = vec![0];
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        if terms.iter().any(|term| line.to_lowercase().contains(term)) {
+            anchors.push(offset);
+        }
+        offset += line.len();
+    }
+    let stride = anchors.len().div_ceil(128).max(1);
+    let mut best = (0usize, 0usize, 0usize);
+    for anchor in anchors.iter().step_by(stride) {
+        let mut start = anchor.saturating_sub(limit / 3);
+        while !content.is_char_boundary(start) {
+            start = start.saturating_sub(1);
+        }
+        if start > 0 {
+            start = content[..start].rfind('\n').map_or(0, |n| n + 1);
+        }
+        let mut end = (start + limit).min(content.len());
+        while !content.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        if let Some(n) = content[start..end].rfind('\n') {
+            end = start + n + 1;
+        }
+        let text = content[start..end].to_lowercase();
+        let code = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with('*'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let score = terms
+            .iter()
+            .map(|t| usize::from(text.contains(t)) + 3 * usize::from(code.contains(t)))
+            .sum::<usize>();
+        if end > start && (score > best.0 || best.2 == 0) {
+            best = (score, start, end);
+        }
+    }
+    (best.1, &content[best.1..best.2])
 }
 
 fn diverse_evidence(best: Vec<(i64, Evidence)>) -> Vec<(u8, i64, Evidence)> {
@@ -549,7 +643,15 @@ fn search_terms(query: &str) -> Vec<String> {
         .collect()
 }
 fn evidence_score(query: &str, terms: &[String], path: &str, symbols: &str, content: &str) -> i64 {
-    let hay = content.to_lowercase();
+    let hay = content
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !line.starts_with("//") && !line.starts_with('*') && !line.starts_with("/*")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
     let names = format!("{path} {symbols}").to_lowercase();
     let filename = Path::new(path)
         .file_name()
@@ -568,13 +670,8 @@ fn evidence_score(query: &str, terms: &[String], path: &str, symbols: &str, cont
         + terms
             .iter()
             .map(|t| {
-                if names.contains(t) {
-                    10
-                } else if hay.contains(t) {
-                    2
-                } else {
-                    0
-                }
+                i64::from(names.contains(t)) * 10
+                    + hay.matches(t.as_str()).count().min(4) as i64 * 6
             })
             .sum::<i64>()
 }
@@ -582,6 +679,39 @@ fn evidence_score(query: &str, terms: &[String], path: &str, symbols: &str, cont
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inventory_lists_all_entry_files_before_verbose_details() -> Result<()> {
+        let mut entries = vec![(
+            "/repo/backend/src/agent.js".into(),
+            "javascript".into(),
+            "helper ".repeat(3000),
+            "import ".repeat(5000),
+        )];
+        for i in 0..150 {
+            entries.push((
+                format!("/repo/backend/src/module_{i}.js"),
+                "javascript".into(),
+                "function ".repeat(200),
+                "detail".repeat(100),
+            ));
+        }
+        entries.push((
+            "/repo/frontend/src/App.jsx".into(),
+            "javascript".into(),
+            "App".into(),
+            String::new(),
+        ));
+        let text = inventory_text(entries);
+        assert!(text.len() <= 40_000);
+        assert!(
+            text.find("/repo/frontend/src/App.jsx")
+                .context("client file absent")?
+                < text
+                    .find("Sampled definition")
+                    .context("detail boundary absent")?
+        );
+        Ok(())
+    }
     #[test]
     fn relevant_implementation_files_precede_repeated_chunks_and_readme() {
         let e = |path: &str| Evidence {
@@ -610,6 +740,54 @@ mod tests {
             ]
         );
         assert!(!is_implementation("/src/helper.test.ts"));
+    }
+    #[test]
+    fn explicit_files_keep_relevant_followup_chunks_before_unrelated_files() {
+        let e = |id: &str, path: &str| Evidence {
+            id: id.into(),
+            path: path.into(),
+            start: 1,
+            end: 1,
+            content: String::new(),
+        };
+        let mut ranked = vec![
+            (0, 100, e("first", "/src/agent.js")),
+            (0, 90, e("unrelated", "/src/helper.js")),
+            (2, 80, e("loop", "/src/agent.js")),
+        ];
+        prioritize_named(&mut ranked, "agent.js read_result");
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|(_, _, e)| e.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "loop", "unrelated"]
+        );
+    }
+    #[test]
+    fn truncated_evidence_keeps_the_matching_logic_and_source_range() {
+        let content = format!(
+            "{}if (decision.action === 'read_result') {{\n  updateView();\n  continue;\n}}\n{}",
+            "// 초기 설명\n".repeat(120),
+            "// 뒤쪽 설명\n".repeat(80)
+        );
+        let (start, excerpt) =
+            focused_excerpt(&content, 300, &["read_result".into(), "continue".into()]);
+        assert!(start > 0 && excerpt.len() <= 300);
+        assert!(excerpt.contains("read_result") && excerpt.contains("continue"));
+        assert_eq!(content.get(start..start + excerpt.len()), Some(excerpt));
+        assert!(content[..start].ends_with('\n'));
+    }
+    #[test]
+    fn runtime_branches_rank_above_introductory_comment_summaries() {
+        let query = "agent.js answer search expand read_result";
+        let terms = search_terms(query);
+        let comments = "// answer search expand read_result\n".repeat(50);
+        let code = "if (decision.action === 'read_result') { readStoredResult(); continue; }\nif (decision.action === 'answer') return answerOf(decision);\nif (decision.action === 'search') await runSearch();";
+        assert!(
+            evidence_score(query, &terms, "/src/agent.js", "", code)
+                > evidence_score(query, &terms, "/src/agent.js", "", &comments)
+        );
     }
     #[test]
     fn source_names_outweigh_generic_test_paths() {

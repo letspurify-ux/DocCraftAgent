@@ -1,8 +1,8 @@
 {
   "status": "passed",
   "benchmarks": [],
-  "requests": 102,
-  "cancel_seconds": 0.22838433273136616,
+  "requests": 191,
+  "cancel_seconds": 0.24347650026902556,
   "database": "doccraft_agent_test",
   "platform": "Darwin"
 }

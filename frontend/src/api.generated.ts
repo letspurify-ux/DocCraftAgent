@@ -178,7 +178,7 @@ export interface components {
       input_price: number;
       /**
        * Format: int32
-       * @default 8192
+       * @default 16384
        */
       max_output_tokens: number;
       /** @default  */
@@ -208,7 +208,7 @@ export interface components {
       proxy_url: string;
       /** @default  */
       proxy_user: string;
-      /** @default default */
+      /** @default off */
       reasoning: string;
       /** @default reasoning_effort */
       reasoning_parameter: string;
@@ -243,7 +243,10 @@ export interface components {
       tpm: number;
     };
     Outline: {
+      reader_goal?: string;
       sections: components["schemas"]["SectionPlan"][];
+      storyline?: string;
+      terminology?: string[];
     };
     RunId: {
       id: string;
@@ -262,7 +265,10 @@ export interface components {
       updated_at: string;
     };
     SectionPlan: {
+      diagrams?: string[] | null;
+      handoff?: string;
       query: string;
+      reader_question?: string;
       title: string;
     };
     Settings: {
@@ -292,7 +298,7 @@ export interface components {
        *       "context_limit": 200000,
        *       "effort": "medium",
        *       "input_price": 0,
-       *       "max_output_tokens": 8192,
+       *       "max_output_tokens": 16384,
        *       "model": "",
        *       "model_context_limit": 200000,
        *       "model_max_output": 32768,
@@ -302,7 +308,7 @@ export interface components {
        *       "proxy_password": "",
        *       "proxy_url": "",
        *       "proxy_user": "",
-       *       "reasoning": "default",
+       *       "reasoning": "off",
        *       "reasoning_parameter": "reasoning_effort",
        *       "retries": 3,
        *       "rpm": 30,
@@ -349,6 +355,11 @@ export interface components {
        * @default 0
        */
       max_cost: number;
+      /**
+       * Format: int32
+       * @default null
+       */
+      max_diagrams: number | null;
       /**
        * Format: int32
        * @default 3
@@ -420,7 +431,12 @@ export interface operations {
   };
   resume_run: {
     parameters: {
-      query?: never;
+      query?: {
+        /** @description Apply current LLM settings while preserving completed sections and task budget */
+        current_llm?: boolean;
+        /** @description Apply the saved task token limit explicitly; other run limits stay fixed */
+        current_token_limit?: boolean;
+      };
       header?: never;
       path: {
         id: string;

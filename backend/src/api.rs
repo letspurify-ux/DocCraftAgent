@@ -116,6 +116,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn(local_only))
         .with_state(state)
 }
+fn allowed_origin(origin: &str, backend_port: u16, frontend_port: u16) -> bool {
+    reqwest::Url::parse(origin).ok().is_some_and(|u| {
+        u.scheme() == "http"
+            && [Some("127.0.0.1"), Some("localhost")].contains(&u.host_str())
+            && [Some(backend_port), Some(frontend_port)].contains(&u.port_or_known_default())
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.path() == "/"
+            && u.query().is_none()
+            && u.fragment().is_none()
+    })
+}
 async fn local_only(req: Request, next: Next) -> Response {
     let valid = |value: &str| -> bool {
         let value = value
@@ -130,29 +142,26 @@ async fn local_only(req: Request, next: Next) -> Response {
         .and_then(|v| v.to_str().ok())
         .is_some_and(valid)
     {
-        return StatusCode::FORBIDDEN.into_response();
+        return (StatusCode::FORBIDDEN, Json(json!({"error":"로컬 요청의 Host 또는 Origin이 허용되지 않습니다. 프론트엔드·백엔드 포트 설정을 확인하세요."}))).into_response();
     }
     if let Some(origin) = req
         .headers()
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
     {
-        let allowed = reqwest::Url::parse(origin).ok().is_some_and(|u| {
-            u.scheme() == "http"
-                && [Some("127.0.0.1"), Some("localhost")].contains(&u.host_str())
-                && [
-                    Some(5173),
-                    Some(
-                        std::env::var("DOCCRAFT_PORT")
-                            .ok()
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(8765),
-                    ),
-                ]
-                .contains(&u.port_or_known_default())
-        });
+        let port = |key: &str, fallback| {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(fallback)
+        };
+        let allowed = allowed_origin(
+            origin,
+            port("DOCCRAFT_PORT", 8765),
+            port("DOCCRAFT_FRONTEND_PORT", 6001),
+        );
         if !allowed {
-            return StatusCode::FORBIDDEN.into_response();
+            return (StatusCode::FORBIDDEN, Json(json!({"error":"로컬 요청의 Host 또는 Origin이 허용되지 않습니다. 프론트엔드·백엔드 포트 설정을 확인하세요."}))).into_response();
         }
     }
     if req
@@ -161,7 +170,7 @@ async fn local_only(req: Request, next: Next) -> Response {
         .and_then(|v| v.to_str().ok())
         == Some("cross-site")
     {
-        return StatusCode::FORBIDDEN.into_response();
+        return (StatusCode::FORBIDDEN, Json(json!({"error":"로컬 요청의 Host 또는 Origin이 허용되지 않습니다. 프론트엔드·백엔드 포트 설정을 확인하세요."}))).into_response();
     }
     let mut response = next.run(req).await;
     response.headers_mut().insert(
@@ -463,27 +472,117 @@ async fn cancel_run(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> A
     }
     Ok(Json(json!({"accepted":cancelled,"id":id})))
 }
-#[utoipa::path(post,path="/api/v1/runs/{id}/resume",params(("id"=String,Path)),responses((status=200,body=RunId)))]
-async fn resume_run(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult<RunId> {
+#[derive(Default, Deserialize)]
+struct ResumeOptions {
+    #[serde(default)]
+    current_llm: bool,
+    #[serde(default)]
+    current_token_limit: bool,
+}
+#[utoipa::path(post,path="/api/v1/runs/{id}/resume",params(("id"=String,Path),("current_llm"=Option<bool>,Query,description="Apply current LLM settings while preserving completed sections and task budget"),("current_token_limit"=Option<bool>,Query,description="Apply the saved task token limit explicitly; other run limits stay fixed")),responses((status=200,body=RunId)))]
+async fn resume_run(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(options): Query<ResumeOptions>,
+) -> ApiResult<RunId> {
     let _permit = s
         .lifecycle
         .try_acquire()
         .context("Another lifecycle operation is running")?;
     let pool = s.db().await?;
-    let row = sqlx::query("SELECT snapshot,status FROM runs WHERE id=?")
+    let row = sqlx::query("SELECT snapshot,status,progress FROM runs WHERE id=?")
         .bind(&id)
         .fetch_one(&pool)
         .await?;
     let status: String = row.try_get("status")?;
-    if !["failed", "cancelled", "interrupted"].contains(&status.as_str()) {
+    let partial = status == "completed_with_warnings"
+        && row
+            .try_get::<String, _>("progress")?
+            .contains("this document is incomplete");
+    if !partial && !["failed", "cancelled", "interrupted"].contains(&status.as_str()) {
         bail_api("Only stopped or failed runs can resume")?;
     }
     let mut snapshot: RunSnapshot =
         serde_json::from_str(&s.vault.decrypt(&row.try_get::<String, _>("snapshot")?)?)?;
+    if partial
+        && let Some(artifact) = sqlx::query(
+            "SELECT hash FROM artifacts WHERE run_id=? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_optional(&pool)
+        .await?
+    {
+        snapshot.original_hash = Some(artifact.try_get("hash")?);
+    }
     // Credentials may have been repaired; analysis settings and sources stay fixed.
     let settings = s.settings.read().await.clone();
-    snapshot.settings.llm.api_key = settings.llm.api_key;
-    snapshot.settings.llm.proxy_password = settings.llm.proxy_password;
+    if options.current_llm {
+        snapshot.settings.llm = settings.llm;
+        config::validate(&snapshot.settings)?;
+        // Only reclaim confirmed legacy over-reservations. Unknown/failed calls remain charged.
+        if db::load_checkpoint(&pool, &id, "legacy_reservations_reconciled")
+            .await?
+            .is_none()
+        {
+            let rows = sqlx::query("SELECT kind,data FROM events WHERE run_id=? AND kind IN ('llm_request','llm_response') ORDER BY id").bind(&id).fetch_all(&pool).await?;
+            let mut pending = 0u64;
+            let mut released = 0u64;
+            for row in rows {
+                let data: Value = serde_json::from_str(&row.try_get::<String, _>("data")?)?;
+                if row.try_get::<String, _>("kind")? == "llm_request" {
+                    pending = data
+                        .pointer("/budget/input")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        .saturating_add(
+                            data.pointer("/budget/output")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                        );
+                } else {
+                    if data.get("reservation_released").is_none()
+                        && data.get("usage_estimated").and_then(Value::as_bool) == Some(false)
+                        && let (Some(input), Some(output)) = (
+                            data.get("input_tokens").and_then(Value::as_u64),
+                            data.get("output_tokens").and_then(Value::as_u64),
+                        )
+                    {
+                        released = released
+                            .saturating_add(pending.saturating_sub(input.saturating_add(output)));
+                    }
+                    pending = 0;
+                }
+            }
+            let mut budget = db::load_checkpoint(&pool, &id, "budget")
+                .await?
+                .unwrap_or(json!({}));
+            budget["tokens"] = json!(
+                budget
+                    .get("tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_sub(released)
+            );
+            let mut tx = pool.begin().await?;
+            sqlx::query("UPDATE checkpoints SET data=? WHERE run_id=? AND step='budget'")
+                .bind(budget.to_string())
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,'legacy_reservations_reconciled',?)").bind(&id).bind(json!(released).to_string()).execute(&mut *tx).await?;
+            tx.commit().await?;
+        }
+    } else {
+        snapshot.settings.llm.api_key = settings.llm.api_key;
+        snapshot.settings.llm.proxy_password = settings.llm.proxy_password;
+    }
+    if options.current_token_limit {
+        let config: String = sqlx::query_scalar("SELECT config FROM tasks WHERE id=?")
+            .bind(&snapshot.task.id)
+            .fetch_one(&pool)
+            .await?;
+        snapshot.task.max_tokens = serde_json::from_str::<TaskConfig>(&config)?.max_tokens;
+    }
     source::validate_task(&snapshot.task, &snapshot.settings)?;
     Ok(Json(RunId {
         id: runner::enqueue(s.clone(), snapshot, Some(id)).await?,
@@ -548,4 +647,26 @@ async fn artifact(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> Api
     Ok(Json(
         json!({"markdown":r.try_get::<String,_>("markdown")?,"path":r.try_get::<String,_>("path")?}),
     ))
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    #[test]
+    fn frontend_origin_matches_configured_ports_only() {
+        assert!(allowed_origin("http://127.0.0.1:6001", 8765, 6001));
+        assert!(allowed_origin("http://localhost:6001", 8765, 6001));
+        assert!(allowed_origin("http://127.0.0.1:8765", 8765, 6001));
+        assert!(allowed_origin("http://localhost:16001", 18765, 16001));
+        for origin in [
+            "http://localhost:5173",
+            "http://localhost:6002",
+            "http://evil.test:6001",
+            "null",
+            "http://evil@localhost:6001",
+            "http://localhost:6001/extra",
+        ] {
+            assert!(!allowed_origin(origin, 8765, 6001), "{origin}");
+        }
+    }
 }

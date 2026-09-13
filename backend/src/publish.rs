@@ -140,16 +140,31 @@ pub async fn validate_mermaid(ctx: &RunContext, markdown: &str) -> Result<()> {
         .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("Node.js is required to validate Mermaid diagrams")?;
     let mut stdin = child.stdin.take().context("Missing Mermaid worker stdin")?;
-    use tokio::io::AsyncWriteExt;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Missing Mermaid worker stderr")?;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     tokio::select! {
         _=ctx.cancel.cancelled()=>{let _=child.kill().await;bail!("CANCELLED");},
-        result=tokio::time::timeout(Duration::from_secs(15),async{stdin.write_all(markdown.as_bytes()).await?;drop(stdin);child.wait().await})=>{
-            if !result.context("Mermaid validation timed out")??.success(){bail!("MERMAID_INVALID: diagram failed syntax validation");}
+        result=tokio::time::timeout(Duration::from_secs(15),async{
+            stdin.write_all(markdown.as_bytes()).await?;drop(stdin);
+            let mut diagnostic = Vec::new();
+            stderr.take(2048).read_to_end(&mut diagnostic).await?;
+            let status = child.wait().await?;
+            Ok::<_, std::io::Error>((status, diagnostic))
+        })=>{
+            let (status, diagnostic) = result.context("Mermaid validation timed out")??;
+            if !status.success(){
+                let detail = String::from_utf8_lossy(&diagnostic);
+                if detail.trim().is_empty() { bail!("MERMAID_INVALID: diagram failed syntax validation"); }
+                bail!("MERMAID_INVALID: {}", detail.trim());
+            }
         }
     }
     Ok(())

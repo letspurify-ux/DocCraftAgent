@@ -63,6 +63,24 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "current_llm",
+            "in": "query",
+            "description": "Apply current LLM settings while preserving completed sections and task budget",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "current_token_limit",
+            "in": "query",
+            "description": "Apply the saved task token limit explicitly; other run limits stay fixed",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -261,12 +279,7 @@
       },
       "EventView": {
         "type": "object",
-        "required": [
-          "id",
-          "run_id",
-          "kind",
-          "data"
-        ],
+        "required": ["id", "run_id", "kind", "data"],
         "properties": {
           "data": {},
           "id": {
@@ -284,11 +297,7 @@
       },
       "Issue": {
         "type": "object",
-        "required": [
-          "severity",
-          "section",
-          "message"
-        ],
+        "required": ["severity", "section", "message"],
         "properties": {
           "message": {
             "type": "string"
@@ -343,7 +352,7 @@
           "max_output_tokens": {
             "type": "integer",
             "format": "int32",
-            "default": 8192,
+            "default": 16384,
             "minimum": 0
           },
           "model": {
@@ -389,7 +398,7 @@
           },
           "reasoning": {
             "type": "string",
-            "default": "default"
+            "default": "off"
           },
           "reasoning_parameter": {
             "type": "string",
@@ -437,23 +446,31 @@
       },
       "Outline": {
         "type": "object",
-        "required": [
-          "sections"
-        ],
+        "required": ["sections"],
         "properties": {
+          "reader_goal": {
+            "type": "string"
+          },
           "sections": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/SectionPlan"
+            }
+          },
+          "storyline": {
+            "type": "string"
+          },
+          "terminology": {
+            "type": "array",
+            "items": {
+              "type": "string"
             }
           }
         }
       },
       "RunId": {
         "type": "object",
-        "required": [
-          "id"
-        ],
+        "required": ["id"],
         "properties": {
           "id": {
             "type": "string"
@@ -481,10 +498,7 @@
             "type": "string"
           },
           "error": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": ["string", "null"]
           },
           "id": {
             "type": "string"
@@ -508,12 +522,21 @@
       },
       "SectionPlan": {
         "type": "object",
-        "required": [
-          "title",
-          "query"
-        ],
+        "required": ["title", "query"],
         "properties": {
+          "diagrams": {
+            "type": ["array", "null"],
+            "items": {
+              "type": "string"
+            }
+          },
+          "handoff": {
+            "type": "string"
+          },
           "query": {
+            "type": "string"
+          },
+          "reader_question": {
             "type": "string"
           },
           "title": {
@@ -560,7 +583,7 @@
               "context_limit": 200000,
               "effort": "medium",
               "input_price": 0.0,
-              "max_output_tokens": 8192,
+              "max_output_tokens": 16384,
               "model": "",
               "model_context_limit": 200000,
               "model_max_output": 32768,
@@ -570,7 +593,7 @@
               "proxy_password": "",
               "proxy_url": "",
               "proxy_user": "",
-              "reasoning": "default",
+              "reasoning": "off",
               "reasoning_parameter": "reasoning_effort",
               "retries": 3,
               "rpm": 30,
@@ -652,6 +675,12 @@
             "type": "number",
             "format": "double",
             "default": 0.0
+          },
+          "max_diagrams": {
+            "type": ["integer", "null"],
+            "format": "int32",
+            "default": null,
+            "minimum": 0
           },
           "max_iterations": {
             "type": "integer",

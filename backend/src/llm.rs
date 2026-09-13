@@ -52,9 +52,10 @@ async fn read_response(response: reqwest::Response) -> Result<Value> {
     }
     serde_json::from_slice(&bytes).context("API returned invalid JSON")
 }
-pub async fn call(ctx: &RunContext, system: &str, input: Value) -> Result<String> {
+pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<String> {
     ctx.check()?;
     let c = &ctx.snapshot.settings.llm;
+    crate::editorial::compact_evidence_ids(&mut input);
     let request = payload(
         c,
         json!([{"role":"system","content":system},{"role":"user","content":input.to_string()}]),
@@ -124,7 +125,41 @@ pub async fn call(ctx: &RunContext, system: &str, input: Value) -> Result<String
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0)
                     .min(60);
-                let body = tokio::select! { _=ctx.cancel.cancelled()=>{bail!("CANCELLED");}, r=read_response(response)=>r }?;
+                let body = match tokio::select! { _=ctx.cancel.cancelled()=>{bail!("CANCELLED");}, r=read_response(response)=>r }
+                {
+                    Ok(body) => body,
+                    Err(e) if e.downcast_ref::<reqwest::Error>().is_some() => {
+                        ctx.event("retry", json!({"stage":"retry","attempt":attempt+1,"reason":"response_body_connection_or_timeout","exhausted":attempt==c.retries})).await?;
+                        if attempt == c.retries {
+                            bail!("API_RETRIES_EXHAUSTED: response body connection or timeout");
+                        }
+                        cancellable_delay(ctx, Duration::from_secs(1u64 << attempt)).await?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                if status.is_success() && body.get("error").is_some() {
+                    let message = body
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    let code = body
+                        .pointer("/error/code")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if provider_quota_exhausted(code, &message) {
+                        bail!("PROVIDER_BUDGET: provider daily quota or credits exhausted");
+                    }
+                    ctx.event("retry",json!({"stage":"retry","attempt":attempt+1,"reason":"provider_error_in_success_response","exhausted":attempt==c.retries})).await?;
+                    if attempt == c.retries {
+                        bail!(
+                            "API_RETRIES_EXHAUSTED: provider returned an error instead of a completion"
+                        );
+                    }
+                    cancellable_delay(ctx, Duration::from_secs(1u64 << attempt)).await?;
+                    continue;
+                }
                 if status.is_success() {
                     let usage = body.get("usage").cloned().unwrap_or(json!({}));
                     let input_tokens = usage
@@ -141,9 +176,22 @@ pub async fn call(ctx: &RunContext, system: &str, input: Value) -> Result<String
                     let actual_cost = (input_tokens as f64 * c.input_price
                         + output_tokens as f64 * c.output_price)
                         / 1_000_000.0;
+                    let released = if usage.get("prompt_tokens").and_then(Value::as_u64).is_some()
+                        && usage
+                            .get("completion_tokens")
+                            .and_then(Value::as_u64)
+                            .is_some()
+                    {
+                        ctx.reconcile_tokens(
+                            reservation,
+                            input_tokens.saturating_add(output_tokens),
+                        )
+                    } else {
+                        0
+                    };
                     ctx.usage(input_tokens.saturating_add(output_tokens), actual_cost)
                         .await?;
-                    ctx.event("llm_response",json!({"stage":"llm","input_tokens":input_tokens,"output_tokens":output_tokens,"reasoning_tokens":reasoning,"usage_estimated":usage.get("prompt_tokens").is_none(),"elapsed_ms":start.elapsed().as_millis() as u64,"cost":actual_cost})).await?;
+                    ctx.event("llm_response",json!({"stage":"llm","input_tokens":input_tokens,"output_tokens":output_tokens,"reasoning_tokens":reasoning,"reservation_released":released,"usage_estimated":usage.get("prompt_tokens").and_then(Value::as_u64).is_none() || usage.get("completion_tokens").and_then(Value::as_u64).is_none(),"elapsed_ms":start.elapsed().as_millis() as u64,"cost":actual_cost})).await?;
                     if input_tokens > b.input {
                         ctx.extra_margin
                             .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
@@ -156,6 +204,7 @@ pub async fn call(ctx: &RunContext, system: &str, input: Value) -> Result<String
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     if finish == "length" {
+                        ctx.event("output_limit",json!({"stage":"repairing","output_tokens":output_tokens,"reasoning_tokens":reasoning,"reasoning_dominated":reasoning_dominated(output_tokens,reasoning),"message":if reasoning_dominated(output_tokens,reasoning) { "출력 한도의 대부분을 추론에 사용했습니다. Reasoning 설정 또는 출력 한도를 확인하세요." } else { "출력이 잘려 더 짧은 초안을 생성합니다." }})).await?;
                         bail!("OUTPUT_TRUNCATED: retry a smaller section");
                     }
                     if finish != "stop" {
@@ -311,6 +360,9 @@ pub async fn test(c: &LlmConfig) -> Result<Value> {
         json!({"ok":true,"latency_ms":start.elapsed().as_millis() as u64,"finish_reason":body.pointer("/choices/0/finish_reason"),"usage":body.get("usage"),"token_mode":c.token_mode,"note":"Probe validates connectivity and parameter acceptance; it cannot prove server token accounting."}),
     )
 }
+fn reasoning_dominated(output: u64, reasoning: Option<u64>) -> bool {
+    output > 0 && reasoning.is_some_and(|r| r.saturating_mul(100) / output >= 75)
+}
 fn provider_quota_exhausted(code: &str, message: &str) -> bool {
     code == "insufficient_quota"
         || message.contains("free-models-per-day")
@@ -332,6 +384,10 @@ mod quota_tests {
     use super::*;
     #[test]
     fn exhausted_quota_is_distinct_from_transient_rate_limits() {
+        assert!(reasoning_dominated(8192, Some(7712)));
+        assert!(!reasoning_dominated(8192, None));
+        assert!(!reasoning_dominated(8192, Some(200)));
+        assert!(!reasoning_dominated(0, Some(0)));
         assert!(provider_quota_exhausted(
             "",
             "rate limit exceeded: free-models-per-day"

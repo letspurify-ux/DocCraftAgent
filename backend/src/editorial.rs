@@ -2,6 +2,94 @@
 use crate::model::Section;
 use serde_json::{Value, json};
 
+/// Byte ranges of code literals, so citation examples are not treated as references.
+pub fn code_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut fence: Option<(u8, usize, usize)> = None;
+    let mut offset = 0;
+    for line in markdown.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let marker = trimmed.as_bytes().first().copied().unwrap_or_default();
+        let width = trimmed.bytes().take_while(|b| *b == marker).count();
+        if let Some((kind, size, start)) = fence {
+            if indent <= 3 && marker == kind && width >= size && trimmed[width..].trim().is_empty()
+            {
+                ranges.push(start..offset + line.len());
+                fence = None;
+            }
+        } else if indent <= 3
+            && matches!(marker, b'`' | b'~')
+            && width >= 3
+            && (marker != b'`' || !trimmed[width..].contains('`'))
+        {
+            fence = Some((marker, width, offset));
+        } else if indent >= 4 || line.starts_with('\t') {
+            ranges.push(offset..offset + line.len());
+        }
+        offset += line.len();
+    }
+    if let Some((_, _, start)) = fence {
+        ranges.push(start..markdown.len());
+    }
+    let blocks = ranges.clone();
+    let bytes = markdown.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(range) = blocks.iter().find(|r| r.contains(&i)) {
+            i = range.end;
+            continue;
+        }
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i] == b'`' {
+            i += 1;
+        }
+        let width = i - start;
+        let mut end = i;
+        while end < bytes.len() && !blocks.iter().any(|r| r.contains(&end)) {
+            if bytes[end] != b'`' {
+                end += 1;
+                continue;
+            }
+            let close = end;
+            while end < bytes.len() && bytes[end] == b'`' {
+                end += 1;
+            }
+            if end - close == width {
+                ranges.push(start..end);
+                i = end;
+                break;
+            }
+        }
+    }
+    ranges
+}
+
+pub fn replace_citation(markdown: &str, id: &str, replacement: &str) -> String {
+    let ranges = code_ranges(markdown);
+    let needle = format!("[E:{id}]");
+    let mut out = String::new();
+    let mut cursor = 0;
+    for (start, matched) in markdown.match_indices(&needle) {
+        if ranges.iter().any(|r| r.contains(&start)) {
+            continue;
+        }
+        out.push_str(&markdown[cursor..start]);
+        out.push_str(replacement);
+        cursor = start + matched.len();
+    }
+    out.push_str(&markdown[cursor..]);
+    out
+}
+
 pub fn excerpt(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_owned();
@@ -26,7 +114,7 @@ pub fn digest(sections: &[Section], byte_budget: usize) -> Vec<Value> {
     let per = byte_budget / sections.len().max(1);
     sections.iter().enumerate().map(|(index, section)| {
         let mut text = section.markdown.clone();
-        for e in &section.evidence { text = text.replace(&format!("[E:{}]", e.id), "[source]"); }
+        for e in &section.evidence { text = replace_citation(&text, &e.id, "[source]"); }
         let headings = text.lines().filter(|line| line.starts_with('#')).take(16).collect::<Vec<_>>().join("\n");
         json!({"section":index,"title":section.title,"headings":excerpt(&headings,per/3),"text":excerpt(&text,per*2/3),"excerpted":text.len()>per*2/3,"mermaid_count":section.markdown.lines().filter(|line| line.trim_start().starts_with("```mermaid")).count(),"heading_count":section.markdown.lines().filter(|line| line.trim_start().starts_with('#')).count()})
     }).collect()
@@ -37,7 +125,9 @@ pub fn render_sections(sections: &[Section]) -> (String, String) {
     let mut references = String::from("## Source references\n\n");
     for section in sections {
         for e in &section.evidence {
-            if section.markdown.contains(&format!("[E:{}]", e.id)) && !numbers.contains_key(&e.id) {
+            if replace_citation(&section.markdown, &e.id, "") != section.markdown
+                && !numbers.contains_key(&e.id)
+            {
                 let number = numbers.len() + 1;
                 numbers.insert(e.id.clone(), number);
                 references.push_str(&format!(
@@ -54,7 +144,7 @@ pub fn render_sections(sections: &[Section]) -> (String, String) {
     for section in sections {
         let mut markdown = section.markdown.clone();
         for (id, number) in &numbers {
-            markdown = markdown.replace(&format!("[E:{id}]"), &format!("[^s{number}]"));
+            markdown = replace_citation(&markdown, id, &format!("[^s{number}]"));
         }
         body.push_str(&format!("## {}\n\n{}\n\n", section.title, markdown));
     }

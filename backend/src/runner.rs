@@ -736,7 +736,7 @@ async fn write_section(
             .map(|e| e.path.as_str())
             .collect();
         ctx.event("section_attempt", json!({"stage":"writing","title":plan.title,"section":section_index+1,"total_sections":outline.sections.len(),"attempt":attempt+1,"input_reductions":input_reductions,"output_reductions":output_reductions,"evidence_chunks":evidence.len(),"implementation_files":implementation_files,"repair":correction.is_some()})).await?;
-        let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"title":plan.title,"section_plan":plan,"document_plan":outline,"neighbor_drafts":neighbors,"other_sections":outline.sections.iter().filter(|s| s.title != plan.title).map(|s| &s.title).collect::<Vec<_>>(),"evidence":evidence,"correction":correction,"previous_error":last,"instruction":format!("Write only Markdown for the assigned section. Write publishable documentation. Do not output review commentary, proposed source patches, or a reply to the reviewer unless purpose explicitly requests those forms. Apply correction issues silently to the document itself. neighbor_drafts are continuity hints, not source evidence: do not copy their factual claims without evidence supplied to this request. document_plan is unverified editorial guidance, not factual evidence. Correct any plan assumption that conflicts with supplied implementation; never force a planned execution order onto conditional code. Follow document_plan.reader_goal and the reading order in storyline, answer this section reader_question, and use consistent terminology. Begin by relating this step to what the reader has already learned or done; end with the result or decision the next section uses, when there is a next section. These transitions must be meaningful, not generic filler. In the opening orientation section, explain actors and data handoffs before implementation details; omit low-level normalization edge cases and pool sizing unless needed for the reader goal. In a worked example, clearly state hypothetical decisions and follow one input through to its observable result, rather than listing action handlers. Sequence diagrams must represent termination correctly: use a terminating break branch or a single response after the loop, never depict the same request replying twice. Explain cause, action and observable result in connected prose; prefer a worked end-to-end path over enumerating helper functions. Include implementation details only when this reader needs them. When section_plan.diagrams is provided, include exactly one Mermaid diagram per allocated description, and no diagrams when that array is empty. Other sections own their allocated diagrams; refer to those explanations instead of drawing the whole flow again. Use diagrams to connect actors, inputs, decisions and results across modules, not as disconnected component pictures. The purpose describes the whole document, not a checklist to repeat in each section. Leave other_sections to their owners. Do not repeat the section title; use ### or deeper subheadings. Maximum {} words. Every substantive claim must cite [E:id]. Runtime behavior must cite implementation, not only README/comments/tests. If implementation is absent, explicitly mark the claim unverified rather than infer it. For syntax/citation repairs, retain correct content and supplied evidence, fix only the reported defects. Mermaid labels must be quoted. Do not claim exhaustive coverage.",1200usize/(1usize << output_reductions))});
+        let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"title":plan.title,"section_plan":plan,"document_plan":outline,"neighbor_drafts":neighbors,"other_sections":outline.sections.iter().filter(|s| s.title != plan.title).map(|s| &s.title).collect::<Vec<_>>(),"evidence":evidence,"correction":correction,"previous_error":last,"instruction":format!("Write only Markdown for the assigned section. Write publishable documentation. Do not output review commentary, proposed source patches, or a reply to the reviewer unless purpose explicitly requests those forms. Apply correction issues silently to the document itself. neighbor_drafts are continuity hints, not source evidence: do not copy their factual claims without evidence supplied to this request. document_plan is unverified editorial guidance, not factual evidence. Correct any plan assumption that conflicts with supplied implementation; never force a planned execution order onto conditional code. Follow document_plan.reader_goal and the reading order in storyline, answer this section reader_question, and use consistent terminology. Begin by relating this step to what the reader has already learned or done; end with the result or decision the next section uses, when there is a next section. These transitions must be meaningful, not generic filler. In the opening orientation section, explain actors and data handoffs before implementation details; omit low-level normalization edge cases and pool sizing unless needed for the reader goal. In a worked example, clearly state hypothetical decisions and follow one input through to its observable result, rather than listing action handlers. Sequence diagrams must represent termination correctly: use a terminating break branch or a single response after the loop, never depict the same request replying twice. Explain cause, action and observable result in connected prose; prefer a worked end-to-end path over enumerating helper functions. Include implementation details only when this reader needs them. When section_plan.diagrams is provided, include exactly one Mermaid diagram per allocated description, and no diagrams when that array is empty. Other sections own their allocated diagrams; refer to those explanations instead of drawing the whole flow again. Use diagrams to connect actors, inputs, decisions and results across modules, not as disconnected component pictures. The purpose describes the whole document, not a checklist to repeat in each section. Leave other_sections to their owners. Do not repeat the section title; use ### or deeper subheadings. Maximum {} words. Every substantive claim must cite [E:id] outside code literals, replacing id with a supplied evidence ID. When explaining citation syntax, put literal examples inside backticks or fenced code blocks; these examples are not source citations. Runtime behavior must cite implementation, not only README/comments/tests. If implementation is absent, explicitly mark the claim unverified rather than infer it. For syntax/citation repairs, retain correct content and supplied evidence, fix only the reported defects. Mermaid labels must be quoted. Do not claim exhaustive coverage.",1200usize/(1usize << output_reductions))});
         match llm::call(ctx, SYSTEM, input).await {
             Ok(markdown) => {
                 let section = Section {
@@ -868,9 +868,16 @@ fn merge_evidence(
     fresh
 }
 fn normalize_citations(markdown: &str, evidence: &[crate::model::Evidence]) -> Result<String> {
+    let literals = crate::editorial::code_ranges(markdown);
     let cite = regex::Regex::new(r"\[E:([^\]\s]+)\]")?;
     Ok(cite
         .replace_all(markdown, |captures: &regex::Captures<'_>| {
+            if captures
+                .get(0)
+                .is_some_and(|m| literals.iter().any(|r| r.contains(&m.start())))
+            {
+                return captures[0].to_string();
+            }
             let id = &captures[1];
             let matches: std::collections::HashSet<&str> = evidence
                 .iter()
@@ -896,7 +903,13 @@ pub fn validate_sections(sections: &[Section]) -> Result<Vec<Issue>> {
         let ids: std::collections::HashSet<&str> =
             s.evidence.iter().map(|e| e.id.as_str()).collect();
         let mut count = 0;
+        let literals = crate::editorial::code_ranges(&s.markdown);
         for m in cite.captures_iter(&s.markdown) {
+            if m.get(0)
+                .is_some_and(|m| literals.iter().any(|r| r.contains(&m.start())))
+            {
+                continue;
+            }
             count += 1;
             let id = m.get(1).map(|m| m.as_str());
             if !id.is_some_and(|id| ids.contains(&id)) {
@@ -1107,6 +1120,42 @@ mod tests {
             ),
             "### Details\n\n```python\n # code comment\n```"
         );
+    }
+    #[test]
+    fn citation_examples_are_not_evidence_and_survive_publication() -> Result<()> {
+        let evidence = vec![Evidence {
+            id: "12345678aaaaaaaa".into(),
+            path: "runner.rs".into(),
+            start: 1,
+            end: 2,
+            content: "code".into(),
+        }];
+        let examples = "Syntax `[E:id]`, ``[E:12345678] ` nested``.\n~~~~rust\n[E:chunk_id]\n~~~~\n    [E:indented]\n";
+        let markdown = normalize_citations(&format!("{examples}Claim [E:12345678]"), &evidence)?;
+        assert!(markdown.starts_with(examples));
+        let section = Section {
+            title: "Citations".into(),
+            markdown,
+            evidence: evidence.clone(),
+        };
+        assert!(validate_sections(std::slice::from_ref(&section))?.is_empty());
+        let (body, _) = crate::editorial::render_sections(&[section]);
+        assert!(body.contains(examples));
+        assert!(body.contains("Claim [^s1]"));
+        let only_code = Section {
+            title: "Examples".into(),
+            markdown: "`[E:12345678aaaaaaaa]`".into(),
+            evidence,
+        };
+        assert!(
+            validate_sections(std::slice::from_ref(&only_code))?
+                .iter()
+                .any(|i| i.message == "Section has no source citations")
+        );
+        let (body, refs) = crate::editorial::render_sections(&[only_code]);
+        assert!(body.contains("`[E:12345678aaaaaaaa]`"));
+        assert!(!refs.contains("[^s"));
+        Ok(())
     }
     #[test]
     fn unknown_citation_is_rejected() -> Result<()> {

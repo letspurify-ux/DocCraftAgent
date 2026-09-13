@@ -176,6 +176,7 @@ pub async fn enqueue(
     let id = existing
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let encrypted = state.vault.encrypt(&serde_json::to_string(&snapshot)?)?;
     let token = CancellationToken::new();
     let gate = Arc::new(CommitGate {
         lock: Mutex::new(()),
@@ -201,28 +202,46 @@ pub async fn enqueue(
             },
         );
     }
-    let result = if existing.is_none() {
-        let encrypted = state.vault.encrypt(&serde_json::to_string(&snapshot)?)?;
-        sqlx::query(
-            "INSERT INTO runs(id,task_id,status,snapshot,progress) VALUES(?,?,'queued',?,'{}')",
-        )
-        .bind(&id)
-        .bind(&snapshot.task.id)
-        .bind(encrypted)
-        .execute(&pool)
-        .await
-    } else {
-        sqlx::query("UPDATE runs SET status='queued',progress='{}',error=NULL,cancel_requested=FALSE,snapshot=? WHERE id=?")
-            .bind(state.vault.encrypt(&serde_json::to_string(&snapshot)?)?)
+    // There is no suspension point between registry insertion and handing off
+    // registration. Dropping an HTTP request must not abandon a registered run.
+    // The registry also keeps settings/cleanup blocked after the caller releases
+    // its lifecycle permit, until registration fails or the worker finishes.
+    tokio::spawn(async move {
+        let result = if existing.is_none() {
+            sqlx::query(
+                "INSERT INTO runs(id,task_id,status,snapshot,progress) VALUES(?,?,'queued',?,'{}')",
+            )
             .bind(&id)
+            .bind(&snapshot.task.id)
+            .bind(encrypted)
             .execute(&pool)
             .await
-    };
-    if let Err(e) = result {
-        state.controls.lock().await.remove(&id);
-        return Err(e.into());
-    }
-    let task_id = id.clone();
+        } else {
+            sqlx::query("UPDATE runs SET status='queued',progress='{}',error=NULL,cancel_requested=FALSE,snapshot=? WHERE id=?")
+                .bind(encrypted)
+                .bind(&id)
+                .execute(&pool)
+                .await
+        };
+        if let Err(e) = result {
+            state.controls.lock().await.remove(&id);
+            return Err(e.into());
+        }
+        spawn_worker(state, pool, snapshot, id.clone(), token, gate);
+        Ok(id)
+    })
+    .await
+    .context("Run registration task stopped unexpectedly")?
+}
+
+fn spawn_worker(
+    state: Arc<AppState>,
+    pool: MySqlPool,
+    snapshot: RunSnapshot,
+    task_id: String,
+    token: CancellationToken,
+    gate: Arc<CommitGate>,
+) {
     tokio::spawn(async move {
         let outcome=std::panic::AssertUnwindSafe(async {
             let _slot=tokio::select!{_=token.cancelled()=>bail!("CANCELLED"),p=state.jobs.acquire()=>p?};
@@ -249,9 +268,10 @@ pub async fn enqueue(
             };
             let error = if cancelled {
                 "Cancelled by user".into()
-            } else if e.downcast_ref::<sqlx::Error>().is_some_and(|e| {
-                matches!(e,sqlx::Error::Io(_)|sqlx::Error::PoolTimedOut|sqlx::Error::PoolClosed|sqlx::Error::Protocol(_)) || matches!(e,sqlx::Error::Database(d) if d.code().is_some_and(|c|c=="1213"||c=="1205"))
-            }) {
+            } else if e
+                .downcast_ref::<sqlx::Error>()
+                .is_some_and(db::temporarily_unavailable)
+            {
                 "DB_UNAVAILABLE: transient database connection failure".into()
             } else {
                 safe_error(&e.to_string())
@@ -274,7 +294,6 @@ pub async fn enqueue(
         }
         state.controls.lock().await.remove(&task_id);
     });
-    Ok(id)
 }
 fn safe_error(text: &str) -> String {
     // Transport errors can include proxy URLs; report categories instead of URLs or headers.
@@ -1427,6 +1446,31 @@ async fn publish_partial(ctx: &RunContext, reason: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn dropped_enqueue_cleans_up_after_registration_failure() -> Result<()> {
+        // A closed pool fails registration without requiring a database server.
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
+        pool.close().await;
+        let run = crate::test_support::TestRun::new(pool)?;
+        let state = &run.ctx.state;
+        // Poll the caller once: enqueue registers the control and hands the
+        // database operation to its task before yielding the JoinHandle.
+        let mut registration = Box::pin(enqueue(state.clone(), run.ctx.snapshot.clone(), None));
+        assert!(futures_util::poll!(registration.as_mut()).is_pending());
+        assert_eq!(state.controls.lock().await.len(), 1);
+        drop(registration);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.controls.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
     #[test]
     fn outline_diagram_limit_rejects_excess_before_writing() -> Result<()> {
         let outline: Outline = serde_json::from_value(

@@ -240,51 +240,7 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
             .bind(&ctx.id).bind(&normalized).bind(snapshot_path.to_string_lossy().as_ref()).bind(&digest).bind(lang).bind("indexed")
             .bind(json!({"parse_errors":parsed.has_errors,"limited":lang=="text","relations":parsed.relations}).to_string()).execute(&ctx.pool).await?;
         let file_id = result.last_insert_id();
-        let mut tx = ctx.pool.begin().await?;
-        let blobs: Vec<_> = parsed
-            .chunks
-            .iter()
-            .map(|chunk| {
-                (
-                    hash(format!("{}:{}", chunk.symbols.join(" "), chunk.content).as_bytes()),
-                    chunk,
-                )
-            })
-            .collect();
-        // Concurrent runs can share the same blobs. Lock every shared hash in a
-        // stable global order before inserting run-specific chunks, including
-        // files whose evidence spans more than one SQL batch.
-        let shared_blobs = ordered_by_hash(&blobs);
-        for batch in shared_blobs.chunks(64) {
-            ctx.check()?;
-            let mut shared = sqlx::QueryBuilder::<sqlx::MySql>::new(
-                "INSERT IGNORE INTO chunk_blobs(hash,symbols,content) ",
-            );
-            shared.push_values(batch, |mut b, blob| {
-                b.push_bind(blob.0.as_str())
-                    .push_bind(blob.1.symbols.join(" "))
-                    .push_bind(&blob.1.content);
-            });
-            shared.build().execute(&mut *tx).await?;
-        }
-        for batch in blobs.chunks(64) {
-            ctx.check()?;
-            let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
-                "INSERT INTO chunks(run_id,file_id,path,start_line,end_line,symbols,content,blob_hash) ",
-            );
-            query.push_values(batch, |mut b, (hash, chunk)| {
-                b.push_bind(&ctx.id)
-                    .push_bind(file_id)
-                    .push_bind(&normalized)
-                    .push_bind(chunk.start)
-                    .push_bind(chunk.end)
-                    .push_bind("")
-                    .push_bind("")
-                    .push_bind(hash);
-            });
-            query.build().execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
+        persist_chunks(ctx, file_id, &normalized, &parsed.chunks).await?;
         indexed += 1;
         if indexed.is_multiple_of(10) || indexed == 1 {
             ctx.event("index", json!({"stage":"indexing","indexed":indexed,"skipped":skipped,"parse_cache_hits":cache_hits,"current_file":normalized})).await?;
@@ -311,6 +267,97 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
     ctx.event("index",json!({"stage":"indexed","indexed":indexed,"skipped":skipped,"parse_cache_hits":cache_hits})).await?;
     Ok(())
 }
+
+/// A conflicting statement may leave earlier batches in the transaction alive
+/// (1205), or roll back the entire transaction (1213). Retry the whole file only
+/// after rollback, so no run-specific chunks are duplicated or omitted.
+async fn persist_chunks(
+    ctx: &RunContext,
+    file_id: u64,
+    path: &str,
+    chunks: &[parser::Chunk],
+) -> Result<()> {
+    let blobs: Vec<_> = chunks
+        .iter()
+        .map(|chunk| {
+            (
+                hash(format!("{}:{}", chunk.symbols.join(" "), chunk.content).as_bytes()),
+                chunk,
+            )
+        })
+        .collect();
+    let mut retries = 0;
+    loop {
+        ctx.check()?;
+        let mut tx = ctx.pool.begin().await?;
+        let written: Result<()> = async {
+            // Concurrent runs can share the same blobs. Lock every shared hash in a
+            // stable global order before inserting run-specific chunks, including
+            // files whose evidence spans more than one SQL batch.
+            let shared_blobs = ordered_by_hash(&blobs);
+            for batch in shared_blobs.chunks(64) {
+                ctx.check()?;
+                let mut shared = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                    "INSERT IGNORE INTO chunk_blobs(hash,symbols,content) ",
+                );
+                shared.push_values(batch, |mut b, blob| {
+                    b.push_bind(blob.0.as_str())
+                        .push_bind(blob.1.symbols.join(" "))
+                        .push_bind(&blob.1.content);
+                });
+                shared.build().execute(&mut *tx).await?;
+            }
+            for batch in blobs.chunks(64) {
+                ctx.check()?;
+                let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                    "INSERT INTO chunks(run_id,file_id,path,start_line,end_line,symbols,content,blob_hash) ",
+                );
+                query.push_values(batch, |mut b, (hash, chunk)| {
+                    b.push_bind(&ctx.id)
+                        .push_bind(file_id)
+                        .push_bind(path)
+                        .push_bind(chunk.start)
+                        .push_bind(chunk.end)
+                        .push_bind("")
+                        .push_bind("")
+                        .push_bind(hash);
+                });
+                query.build().execute(&mut *tx).await?;
+            }
+
+            Ok(())
+        }
+        .await;
+        let result = match written {
+            Ok(()) => tx.commit().await.map_err(Into::into),
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if retries < 3
+                    && error
+                        .downcast_ref::<sqlx::Error>()
+                        .is_some_and(db::transaction_conflict) =>
+            {
+                let delay = Duration::from_millis(
+                    (50u64 << retries) + u64::from(rand::random::<u8>() % 50),
+                );
+                retries += 1;
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => bail!("CANCELLED"),
+                    _ = ctx.state.shutdown.cancelled() => bail!("CANCELLED"),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 async fn snapshot_file(ctx: &RunContext, path: &Path, dir: &Path) -> Result<(Vec<u8>, PathBuf)> {
     for _ in 0..3 {
         ctx.check()?;
@@ -696,6 +743,195 @@ fn evidence_score(query: &str, terms: &[String], path: &str, symbols: &str, cont
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires DOCCRAFT_TEST_DB_PORT pointing to a disposable MariaDB"]
+    async fn conflicting_chunk_batches_rollback_retry_and_stop_at_limit() -> Result<()> {
+        let pool = crate::test_support::pool(1).await?;
+        let run = crate::test_support::TestRun::new(pool.clone())?;
+        let chunks: Vec<_> = (1..=130)
+            .map(|line| parser::Chunk {
+                start: line,
+                end: line,
+                symbols: vec![],
+                content: format!("{} line {line}", run.ctx.id),
+            })
+            .collect();
+        let trigger = format!("retry_{}", uuid::Uuid::new_v4().simple());
+        // Fail in the second batch, after 64 run-specific rows have been written.
+        // Session variables survive rollback; table writes must not survive it.
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger} BEFORE INSERT ON chunks FOR EACH ROW BEGIN \
+             IF NEW.run_id='{}' AND NEW.start_line=65 AND @remaining_conflicts>0 THEN \
+             SET @remaining_conflicts=@remaining_conflicts-1; \
+             SIGNAL SQLSTATE '40001' SET MYSQL_ERRNO=@conflict_number; END IF; END",
+            run.ctx.id
+        ))
+        .execute(&pool)
+        .await?;
+        let result: Result<()> = async {
+            for number in [1205, 1213] {
+                sqlx::query("SET @remaining_conflicts=1, @conflict_number=?")
+                    .bind(number)
+                    .execute(&pool)
+                    .await?;
+                persist_chunks(&run.ctx, 1, "source.rs", &chunks).await?;
+                let rows: (i64, i64) = sqlx::query_as(
+                    "SELECT COUNT(*), COUNT(DISTINCT start_line) FROM chunks WHERE run_id=?",
+                )
+                .bind(&run.ctx.id)
+                .fetch_one(&pool)
+                .await?;
+                assert_eq!(rows, (130, 130));
+                let remaining: i64 = sqlx::query_scalar("SELECT @remaining_conflicts")
+                    .fetch_one(&pool)
+                    .await?;
+                assert_eq!(remaining, 0);
+                sqlx::query("DELETE FROM chunks WHERE run_id=?")
+                    .bind(&run.ctx.id)
+                    .execute(&pool)
+                    .await?;
+            }
+            sqlx::query("SET @remaining_conflicts=10, @conflict_number=1213")
+                .execute(&pool)
+                .await?;
+            let error = persist_chunks(&run.ctx, 1, "source.rs", &chunks)
+                .await
+                .err()
+                .context("Retries should be bounded")?;
+            assert!(
+                error
+                    .downcast_ref::<sqlx::Error>()
+                    .is_some_and(db::transaction_conflict)
+            );
+            let remaining: i64 = sqlx::query_scalar("SELECT @remaining_conflicts")
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(remaining, 6);
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE run_id=?")
+                .bind(&run.ctx.id)
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(count, 0);
+            // Cancel after the first conflict, while the retry delay is pending.
+            sqlx::query("SET @remaining_conflicts=10")
+                .execute(&pool)
+                .await?;
+            let (write, cancel) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(persist_chunks(&run.ctx, 1, "source.rs", &chunks), async {
+                    loop {
+                        let remaining: i64 = sqlx::query_scalar("SELECT @remaining_conflicts")
+                            .fetch_one(&pool)
+                            .await?;
+                        if remaining < 10 {
+                            run.ctx.cancel.cancel();
+                            break Ok::<_, anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+            })
+            .await?;
+            cancel?;
+            let error = write.err().context("Cancelled indexing must fail")?;
+            assert_eq!(error.to_string(), "CANCELLED");
+            let remaining: i64 = sqlx::query_scalar("SELECT @remaining_conflicts")
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(remaining, 9);
+            Ok(())
+        }
+        .await;
+        sqlx::query(&format!("DROP TRIGGER {trigger}"))
+            .execute(&pool)
+            .await?;
+        crate::test_support::close(pool).await?;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DOCCRAFT_TEST_DB_PORT pointing to a disposable MariaDB"]
+    async fn shared_blob_deadlock_is_retried() -> Result<()> {
+        let pool = crate::test_support::pool(4).await?;
+        let run = crate::test_support::TestRun::new(pool.clone())?;
+        let chunks: Vec<_> = (1..=2)
+            .map(|line| parser::Chunk {
+                start: line,
+                end: line,
+                symbols: vec![],
+                content: format!("{} line {line}", run.ctx.id),
+            })
+            .collect();
+        let mut hashes: Vec<_> = chunks
+            .iter()
+            .map(|chunk| hash(format!(":{}", chunk.content).as_bytes()))
+            .collect();
+        hashes.sort();
+        let (_, before): (String, String) =
+            sqlx::query_as("SHOW GLOBAL STATUS LIKE 'Innodb_deadlocks'")
+                .fetch_one(&pool)
+                .await?;
+        let mut blocker = pool.begin().await?;
+        // Give the blocker more undo work so InnoDB selects the indexing
+        // transaction as its victim. It holds the second hash; indexing will
+        // hold the first hash and wait for the second, even within one SQL batch.
+        for step in 0..10 {
+            sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,?,'{}')")
+                .bind(&run.ctx.id)
+                .bind(format!("blocker:{step}"))
+                .execute(&mut *blocker)
+                .await?;
+        }
+        sqlx::query("INSERT INTO chunk_blobs(hash,symbols,content) VALUES(?,'','blocker')")
+            .bind(&hashes[1])
+            .execute(&mut *blocker)
+            .await?;
+        let result: Result<()> = async {
+            let conflict = async {
+                tokio::time::timeout(Duration::from_secs(4), async {
+                    loop {
+                        let waits: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM information_schema.INNODB_LOCK_WAITS",
+                        )
+                        .fetch_one(&pool)
+                        .await?;
+                        if waits > 0 {
+                            break Ok::<_, anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await??;
+                // Close the lock cycle deliberately; normal indexers use the
+                // sorted order. This tests recovery with a real 1213 packet.
+                sqlx::query(
+                    "INSERT IGNORE INTO chunk_blobs(hash,symbols,content) VALUES(?,'','blocker')",
+                )
+                .bind(&hashes[0])
+                .execute(&mut *blocker)
+                .await?;
+                blocker.rollback().await?;
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::try_join!(persist_chunks(&run.ctx, 1, "source.rs", &chunks), conflict)?;
+            let (_, after): (String, String) =
+                sqlx::query_as("SHOW GLOBAL STATUS LIKE 'Innodb_deadlocks'")
+                    .fetch_one(&pool)
+                    .await?;
+            assert!(
+                after.parse::<u64>()? > before.parse::<u64>()?,
+                "The test must cause a real InnoDB deadlock"
+            );
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE run_id=?")
+                .bind(&run.ctx.id)
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(count, 2);
+            Ok(())
+        }
+        .await;
+        crate::test_support::close(pool).await?;
+        result
+    }
     #[test]
     fn inventory_lists_all_entry_files_before_verbose_details() -> Result<()> {
         let mut entries = vec![(

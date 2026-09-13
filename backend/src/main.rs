@@ -12,6 +12,8 @@ mod planning;
 mod publish;
 mod runner;
 mod source;
+#[cfg(test)]
+mod test_support;
 
 use anyhow::{Context, Result};
 use fs2::FileExt;

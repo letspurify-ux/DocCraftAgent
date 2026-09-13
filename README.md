@@ -93,6 +93,12 @@ npm --prefix frontend run generate:api
 python3 scripts/smoke.py
 ```
 
+요청 연결 종료와 DB deadlock 회귀 테스트는 별도 MariaDB 인스턴스에서 실행합니다. `DOCCRAFT_TEST_DB_PASSWORD`를 해당 인스턴스의 root 암호로 설정한 뒤 실행하세요. 테스트마다 `doccraft_agent_test_<UUID>` 스키마를 생성해 오류를 주입하며, 검사가 끝나면 해당 스키마를 삭제합니다.
+
+```sh
+DOCCRAFT_TEST_DB_PORT=3306 cargo test --locked -- --ignored --test-threads=1
+```
+
 `DOCCRAFT_UI_TEST=1`을 추가하면 Playwright 브라우저 테스트를 실행합니다. 먼저 `frontend`에서 `npx playwright install chromium`을 실행하세요. `DOCCRAFT_LARGE_TEST=1`은 10만·100만 줄의 구조 분석과 캐시 재실행을 추가합니다. 테스트는 `doccraft_agent_test`에만 애플리케이션 데이터를 기록합니다. 기존 테스트 결과는 보존 기간에 따라 정리됩니다.
 
 ## 구성

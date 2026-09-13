@@ -39,28 +39,10 @@ fn public_api_error(error: &anyhow::Error) -> (StatusCode, String) {
     if let Some(error) = error.downcast_ref::<sqlx::Error>() {
         return match error {
             sqlx::Error::RowNotFound => (StatusCode::NOT_FOUND, "Resource not found".into()),
-            sqlx::Error::Io(_)
-            | sqlx::Error::Tls(_)
-            | sqlx::Error::PoolTimedOut
-            | sqlx::Error::PoolClosed
-            | sqlx::Error::WorkerCrashed => (
+            error if db::temporarily_unavailable(error) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Database temporarily unavailable".into(),
             ),
-            sqlx::Error::Database(database)
-                if database.code().as_deref().is_some_and(|code| {
-                    [
-                        "1040", "1042", "1152", "1153", "1158", "1159", "1160", "1161", "1205",
-                        "1213", "2002", "2003", "2006", "2013",
-                    ]
-                    .contains(&code)
-                }) =>
-            {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database temporarily unavailable".into(),
-                )
-            }
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error".into(),
@@ -771,6 +753,100 @@ async fn artifact(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> Api
 #[cfg(test)]
 mod origin_tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires DOCCRAFT_TEST_DB_PORT pointing to a disposable MariaDB"]
+    async fn mysql_error_numbers_control_recovery_and_http_status() -> Result<()> {
+        let pool = crate::test_support::pool(1).await?;
+        for (number, state, retry, status) in [
+            (1213, "40001", true, StatusCode::SERVICE_UNAVAILABLE),
+            (1205, "HY000", true, StatusCode::SERVICE_UNAVAILABLE),
+            (1040, "08004", false, StatusCode::SERVICE_UNAVAILABLE),
+            (1062, "23000", false, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let error = sqlx::query(&format!(
+                "SIGNAL SQLSTATE '{state}' SET MYSQL_ERRNO={number}, MESSAGE_TEXT='regression'"
+            ))
+            .execute(&pool)
+            .await
+            .err()
+            .context("Expected server error")?;
+            assert_eq!(db::transaction_conflict(&error), retry);
+            assert_eq!(
+                db::temporarily_unavailable(&error),
+                status == StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(public_api_error(&error.into()).0, status);
+        }
+        crate::test_support::close(pool).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DOCCRAFT_TEST_DB_PORT pointing to a disposable MariaDB"]
+    async fn disconnected_resume_still_starts_and_cancels_its_worker() -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let pool = crate::test_support::pool(5).await?;
+        let run = crate::test_support::TestRun::new(pool.clone())?;
+        let state = &run.ctx.state;
+        let id = &run.ctx.id;
+        sqlx::query(
+            "INSERT INTO runs(id,task_id,status,snapshot,progress) VALUES(?,?,'failed',?,'{}')",
+        )
+        .bind(id)
+        .bind(&run.ctx.snapshot.task.id)
+        .bind(
+            state
+                .vault
+                .encrypt(&serde_json::to_string(&run.ctx.snapshot)?)?,
+        )
+        .execute(&pool)
+        .await?;
+        let mut blocker = pool.begin().await?;
+        sqlx::query("SELECT id FROM runs WHERE id=? FOR UPDATE")
+            .bind(id)
+            .fetch_one(&mut *blocker)
+            .await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let app = router(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let result: Result<()> = async {
+            let mut client = tokio::net::TcpStream::connect(address).await?;
+            client.write_all(format!(
+                "POST /api/v1/runs/{id}/resume HTTP/1.1\r\nHost: localhost\r\nCookie: doccraft_session={}\r\nContent-Length: 0\r\n\r\n", state.session
+            ).as_bytes()).await?;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !state.controls.lock().await.contains_key(id) {
+                    tokio::task::yield_now().await;
+                }
+            }).await?;
+            drop(client);
+            // Wait until Axum drops the request's lifecycle permit, confirming
+            // cancellation before the blocked database registration completes.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if state.lifecycle.try_acquire().is_ok() { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await?;
+            assert!(request_cancel(state, id).await);
+            blocker.rollback().await?;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while state.controls.lock().await.contains_key(id) {
+                    tokio::task::yield_now().await;
+                }
+            }).await?;
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id=?")
+                .bind(id).fetch_one(&pool).await?;
+            assert_eq!(status, "cancelled");
+            assert!(!request_cancel(state, id).await);
+            Ok(())
+        }.await;
+        server.abort();
+        let _ = server.await;
+        crate::test_support::close(pool).await?;
+        result
+    }
     #[test]
     fn frontend_origin_matches_configured_ports_only() {
         assert!(allowed_origin("http://127.0.0.1:6001", 8765, 6001));

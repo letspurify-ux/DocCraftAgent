@@ -54,6 +54,10 @@ jobs:
       - run: npm run build
         working-directory: frontend
       - run: cargo build --locked
+      - run: cargo test --locked -- --ignored --test-threads=1
+        env:
+          DOCCRAFT_TEST_DB_PORT: '3306'
+          DOCCRAFT_TEST_DB_PASSWORD: ci-only-password
       - run: python3 scripts/smoke.py
         env:
           DOCCRAFT_DB_PASSWORD: ci-only-password

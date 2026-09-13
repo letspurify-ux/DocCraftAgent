@@ -7,6 +7,47 @@ use sqlx::{
 };
 use std::time::Duration;
 
+fn mysql_error_number(error: &sqlx::Error) -> Option<u16> {
+    error
+        .as_database_error()?
+        .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+        .map(sqlx::mysql::MySqlDatabaseError::number)
+}
+
+pub fn transaction_conflict(error: &sqlx::Error) -> bool {
+    matches!(mysql_error_number(error), Some(1205 | 1213))
+}
+
+pub fn temporarily_unavailable(error: &sqlx::Error) -> bool {
+    // DatabaseError::code() is SQLSTATE (e.g. 40001), not the MySQL error number.
+    matches!(
+        error,
+        sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed
+            | sqlx::Error::Protocol(_)
+    ) || matches!(
+        mysql_error_number(error),
+        Some(
+            1040 | 1042
+                | 1152
+                | 1153
+                | 1158
+                | 1159
+                | 1160
+                | 1161
+                | 1205
+                | 1213
+                | 2002
+                | 2003
+                | 2006
+                | 2013
+        )
+    )
+}
+
 pub async fn connect(c: &DbConfig, migrate: bool) -> Result<MySqlPool> {
     if !["doccraft_agent", "doccraft_agent_test"].contains(&c.database.as_str()) {
         bail!("Only dedicated application databases are allowed");

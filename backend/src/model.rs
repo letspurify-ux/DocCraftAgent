@@ -96,7 +96,6 @@ pub struct Settings {
     pub output_roots: Vec<String>,
     pub max_jobs: usize,
     pub max_file_bytes: u64,
-    pub max_files: usize,
     pub retention_days: u32,
     pub cache_max_mb: u64,
 }
@@ -109,7 +108,6 @@ impl Default for Settings {
             output_roots: vec![],
             max_jobs: 2,
             max_file_bytes: 20 * 1024 * 1024,
-            max_files: 100_000,
             retention_days: 30,
             cache_max_mb: 1024,
         }
@@ -131,6 +129,7 @@ pub struct TaskConfig {
     pub max_seconds: u64,
     pub max_tokens: u64,
     pub max_cost: f64,
+    pub preview_outline: bool,
 }
 impl Default for TaskConfig {
     fn default() -> Self {
@@ -148,6 +147,7 @@ impl Default for TaskConfig {
             max_seconds: 7200,
             max_tokens: 2_000_000,
             max_cost: 0.0,
+            preview_outline: false,
         }
     }
 }
@@ -157,8 +157,10 @@ pub struct RunSnapshot {
     pub settings: Settings,
     pub original_hash: Option<String>,
 }
-#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct SectionPlan {
+    #[serde(default)]
+    pub id: String,
     pub title: String,
     pub query: String,
     #[serde(default)]
@@ -173,8 +175,14 @@ pub struct SectionPlan {
     /// Source passages read before planning, retained for the section writer.
     #[serde(default)]
     pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub owns_requirement_ids: Vec<String>,
+    #[serde(default)]
+    pub key_points: Vec<String>,
+    #[serde(default)]
+    pub out_of_scope: Vec<String>,
 }
-#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct Outline {
     pub sections: Vec<SectionPlan>,
     #[serde(default)]
@@ -183,6 +191,31 @@ pub struct Outline {
     pub storyline: String,
     #[serde(default)]
     pub terminology: Vec<String>,
+    #[serde(default)]
+    pub requirements: Vec<Requirement>,
+    #[serde(default)]
+    pub revision: u32,
+}
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+pub struct Requirement {
+    pub id: String,
+    pub question: String,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OutlineReview {
+    pub issues: Vec<OutlineIssue>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OutlineIssue {
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub section_ids: Vec<String>,
+    #[serde(default)]
+    pub requirement_ids: Vec<String>,
+    #[serde(default)]
+    pub query: String,
 }
 #[derive(Clone, Serialize, Deserialize, ToSchema)]
 pub struct Issue {
@@ -195,6 +228,8 @@ pub struct Issue {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Review {
     pub issues: Vec<Issue>,
+    #[serde(default)]
+    pub outline_issues: Vec<OutlineIssue>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Section {

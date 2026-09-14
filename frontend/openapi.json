@@ -51,6 +51,116 @@
         }
       }
     },
+    "/api/v1/runs/{id}/outline": {
+      "get": {
+        "tags": [
+          "crate::composition"
+        ],
+        "operationId": "outline",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/outline/continue": {
+      "post": {
+        "tags": [
+          "crate::composition"
+        ],
+        "operationId": "continue_outline",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Approval"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "409": {
+            "description": "Stale revision or active run"
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/outline/revisions": {
+      "post": {
+        "tags": [
+          "crate::composition"
+        ],
+        "operationId": "revise",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Revision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "409": {
+            "description": "Stale revision or active run"
+          }
+        }
+      }
+    },
     "/api/v1/runs/{id}/resume": {
       "post": {
         "tags": [],
@@ -100,6 +210,42 @@
                 "schema": {
                   "$ref": "#/components/schemas/RunId"
                 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/understanding": {
+      "get": {
+        "tags": [
+          "crate::composition"
+        ],
+        "operationId": "understanding",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {}
               }
             }
           }
@@ -249,6 +395,19 @@
   },
   "components": {
     "schemas": {
+      "Approval": {
+        "type": "object",
+        "required": [
+          "revision"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "DbConfig": {
         "type": "object",
         "properties": {
@@ -288,7 +447,12 @@
       },
       "EventView": {
         "type": "object",
-        "required": ["id", "run_id", "kind", "data"],
+        "required": [
+          "id",
+          "run_id",
+          "kind",
+          "data"
+        ],
         "properties": {
           "data": {},
           "id": {
@@ -306,7 +470,11 @@
       },
       "Issue": {
         "type": "object",
-        "required": ["severity", "section", "message"],
+        "required": [
+          "severity",
+          "section",
+          "message"
+        ],
         "properties": {
           "message": {
             "type": "string"
@@ -455,10 +623,23 @@
       },
       "Outline": {
         "type": "object",
-        "required": ["sections"],
+        "required": [
+          "sections"
+        ],
         "properties": {
           "reader_goal": {
             "type": "string"
+          },
+          "requirements": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Requirement"
+            }
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           },
           "sections": {
             "type": "array",
@@ -477,9 +658,59 @@
           }
         }
       },
+      "Requirement": {
+        "type": "object",
+        "required": [
+          "id",
+          "question"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "question": {
+            "type": "string"
+          }
+        }
+      },
+      "Revision": {
+        "type": "object",
+        "required": [
+          "base_revision",
+          "request_id"
+        ],
+        "properties": {
+          "base_revision": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "feedback": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outline": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Outline"
+              }
+            ]
+          },
+          "request_id": {
+            "type": "string"
+          }
+        }
+      },
       "RunId": {
         "type": "object",
-        "required": ["id"],
+        "required": [
+          "id"
+        ],
         "properties": {
           "id": {
             "type": "string"
@@ -507,7 +738,10 @@
             "type": "string"
           },
           "error": {
-            "type": ["string", "null"]
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "type": "string"
@@ -531,7 +765,10 @@
       },
       "SectionPlan": {
         "type": "object",
-        "required": ["title", "query"],
+        "required": [
+          "title",
+          "query"
+        ],
         "properties": {
           "depends_on": {
             "type": "array",
@@ -542,7 +779,10 @@
             "description": "Reading prerequisites, expressed as earlier zero-based section indices."
           },
           "diagrams": {
-            "type": ["array", "null"],
+            "type": [
+              "array",
+              "null"
+            ],
             "items": {
               "type": "string"
             }
@@ -556,6 +796,27 @@
           },
           "handoff": {
             "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "key_points": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "out_of_scope": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "owns_requirement_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "query": {
             "type": "string"
@@ -634,11 +895,6 @@
             "default": 20971520,
             "minimum": 0
           },
-          "max_files": {
-            "type": "integer",
-            "default": 100000,
-            "minimum": 0
-          },
           "max_jobs": {
             "type": "integer",
             "default": 2,
@@ -701,7 +957,10 @@
             "default": 0.0
           },
           "max_diagrams": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int32",
             "default": null,
             "minimum": 0
@@ -727,6 +986,10 @@
           "name": {
             "type": "string",
             "default": ""
+          },
+          "preview_outline": {
+            "type": "boolean",
+            "default": false
           },
           "sources": {
             "type": "array",

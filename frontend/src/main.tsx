@@ -28,6 +28,7 @@ import remarkGfm from "remark-gfm";
 import { diffLines } from "diff";
 import { api, send, newTask, type Task, type Run, type Artifact } from "./api";
 import "./styles.css";
+import { Composition } from "./composition";
 
 type Page = "tasks" | "runs" | "documents" | "settings";
 type RunEvent = { id: number; kind: string; data: unknown };
@@ -51,7 +52,9 @@ const labels: Record<string, string> = {
   completed: "완료",
   completed_with_warnings: "검토 사항 있음",
   interrupted: "복구 대기",
-  indexed: "분석 완료",
+  awaiting_source: "소스 분석 대기",
+  awaiting_outline: "목차 확인 필요",
+  indexed: "색인 완료",
   excluded: "분석 제외",
   skipped: "분석 실패",
 };
@@ -727,6 +730,14 @@ function TaskEditor({
               placeholder="어떤 독자를 위해, 무엇을 중심으로 정리할까요?"
             />
           </Field>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={v.preview_outline}
+              onChange={(e) => change("preview_outline", e.target.checked)}
+            />
+            본문 작성 전에 목차 먼저 확인
+          </label>
           <div className="preset-buttons">
             <button
               type="button"
@@ -875,6 +886,23 @@ function RunDetail({
   useEffect(() => {
     setEvents([]);
     setEventError("");
+  }, [run?.id]);
+  useEffect(() => {
+    if (!run || streamActive) return;
+    const controller = new AbortController();
+    api<{ events?: RunEvent[] }>(`/runs/${run.id}/history`, {
+      signal: controller.signal,
+    })
+      .then((value) => {
+        if (Array.isArray(value.events)) setEvents(value.events);
+      })
+      .catch((error) => {
+        if (error.name !== "AbortError")
+          setEventError("이벤트 기록을 불러오지 못했습니다.");
+      });
+    return () => controller.abort();
+  }, [run?.id, run?.updated_at, streamActive]);
+  useEffect(() => {
     if (!run || !streamActive) return;
     const es = new EventSource(`/api/v1/runs/${run.id}/events`);
     let active = true;
@@ -1019,7 +1047,13 @@ function RunDetail({
             즉시 중단
           </button>
         ) : (
-          (["failed", "cancelled", "interrupted"].includes(run.status) ||
+          ([
+            "failed",
+            "cancelled",
+            "interrupted",
+            "awaiting_source",
+            "awaiting_outline",
+          ].includes(run.status) ||
             run.status === "completed_with_warnings") && (
             <div>
               <label className="checkbox">
@@ -1084,6 +1118,7 @@ function RunDetail({
         </div>
       </div>
       {run.error && <div className="banner error">{run.error}</div>}
+      <Composition run={run} />
       <div className="tabs">
         <button
           className={tab === "events" ? "active" : ""}
@@ -1471,7 +1506,6 @@ function SettingsPage({
               <div className="form-grid">
                 {input("", "max_jobs", "동시 작업 수", "number")}
                 {input("", "max_file_bytes", "파일당 최대 바이트", "number")}
-                {input("", "max_files", "최대 파일 수", "number")}
                 {input("", "retention_days", "이력 보존 기간 (일)", "number")}
                 {input("", "cache_max_mb", "캐시 최대 크기 (MiB)", "number")}
               </div>

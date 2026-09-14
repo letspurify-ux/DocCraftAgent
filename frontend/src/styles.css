@@ -1327,3 +1327,40 @@ summary {
   margin-bottom: 0;
   padding-left: 20px;
 }
+.composition {
+  margin: 16px 0;
+  border: 1px solid var(--border, #dbe2ea);
+  border-radius: 10px;
+}
+.composition-body {
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+.composition-body label {
+  display: grid;
+  gap: 6px;
+}
+.composition-body .checkbox {
+  display: flex;
+}
+.outline-section {
+  border: 1px solid var(--border, #dbe2ea);
+  border-radius: 8px;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.composition-body input:not([type="checkbox"]),
+.composition-body textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+.composition-body details {
+  padding: 8px;
+}
+.composition-body summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}

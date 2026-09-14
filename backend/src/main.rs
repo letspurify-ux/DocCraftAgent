@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 mod api;
 mod budget;
+mod composition;
 mod config;
 mod db;
 mod editorial;
@@ -14,6 +15,7 @@ mod runner;
 mod source;
 #[cfg(test)]
 mod test_support;
+mod understanding;
 
 use anyhow::{Context, Result};
 use fs2::FileExt;

@@ -77,6 +77,9 @@ fn public_api_error(error: &anyhow::Error) -> (StatusCode, String) {
         );
     }
     let text = error.to_string();
+    if text.starts_with("CONFLICT:") {
+        return (StatusCode::CONFLICT, text);
+    }
     let text = if text.contains("http://") || text.contains("https://") {
         "Network operation failed; check connection settings".into()
     } else {
@@ -108,7 +111,11 @@ pub struct Cursor {
         start_run,
         runs_list,
         cancel_run,
-        resume_run
+        resume_run,
+        crate::composition::understanding,
+        crate::composition::outline,
+        crate::composition::revise,
+        crate::composition::continue_outline
     ),
     components(schemas(
         Settings,
@@ -143,7 +150,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/runs/{id}/resume", post(resume_run))
         .route("/runs/{id}/events", get(events))
+        .route("/runs/{id}/history", get(event_history))
         .route("/runs/{id}/files", get(files))
+        .route(
+            "/runs/{id}/understanding",
+            get(crate::composition::understanding),
+        )
+        .route("/runs/{id}/understanding/continue", post(resume_run))
+        .route("/runs/{id}/outline", get(crate::composition::outline))
+        .route(
+            "/runs/{id}/outline/revisions",
+            post(crate::composition::revise),
+        )
+        .route(
+            "/runs/{id}/outline/continue",
+            post(crate::composition::continue_outline),
+        )
         .route("/artifacts", get(artifacts))
         .route("/artifacts/{id}", get(artifact))
         .route("/openapi.json", get(|| async { Json(ApiDoc::openapi()) }))
@@ -581,7 +603,14 @@ async fn resume_run(
             .try_get::<String, _>("progress")?
             .contains("this document is incomplete");
     if !completed_with_warnings
-        && !["failed", "cancelled", "interrupted"].contains(&status.as_str())
+        && ![
+            "failed",
+            "cancelled",
+            "interrupted",
+            "awaiting_source",
+            "awaiting_outline",
+        ]
+        .contains(&status.as_str())
     {
         bail_api("Only stopped, failed, or warning-completed runs can resume")?;
     }
@@ -772,6 +801,18 @@ fn event_cursor(after: Option<u64>, headers: &HeaderMap) -> u64 {
 
 fn stream_terminal(status: &str) -> bool {
     !["queued", "running", "cancelling", "interrupted"].contains(&status)
+}
+async fn event_history(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult<Value> {
+    let rows =
+        sqlx::query("SELECT id,kind,data FROM events WHERE run_id=? ORDER BY id DESC LIMIT 500")
+            .bind(id)
+            .fetch_all(&s.db().await?)
+            .await?;
+    let mut events = vec![];
+    for row in rows.into_iter().rev() {
+        events.push(json!({"id":row.try_get::<u64,_>("id")?,"kind":row.try_get::<String,_>("kind")?,"data":serde_json::from_str::<Value>(&row.try_get::<String,_>("data")?)?}));
+    }
+    Ok(Json(json!({"events":events})))
 }
 async fn files(
     State(s): State<Arc<AppState>>,

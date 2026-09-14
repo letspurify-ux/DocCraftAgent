@@ -36,6 +36,54 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/runs/{id}/outline": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["outline"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/runs/{id}/outline/continue": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["continue_outline"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/runs/{id}/outline/revisions": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["revise"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/runs/{id}/resume": {
     parameters: {
       query?: never;
@@ -46,6 +94,22 @@ export interface paths {
     get?: never;
     put?: never;
     post: operations["resume_run"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/runs/{id}/understanding": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["understanding"];
+    put?: never;
+    post?: never;
     delete?: never;
     options?: never;
     head?: never;
@@ -120,6 +184,10 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
   schemas: {
+    Approval: {
+      /** Format: int32 */
+      revision: number;
+    };
     DbConfig: {
       /** @default doccraft_agent */
       database: string;
@@ -244,9 +312,23 @@ export interface components {
     };
     Outline: {
       reader_goal?: string;
+      requirements?: components["schemas"]["Requirement"][];
+      /** Format: int32 */
+      revision?: number;
       sections: components["schemas"]["SectionPlan"][];
       storyline?: string;
       terminology?: string[];
+    };
+    Requirement: {
+      id: string;
+      question: string;
+    };
+    Revision: {
+      /** Format: int32 */
+      base_revision: number;
+      feedback?: string | null;
+      outline?: null | components["schemas"]["Outline"];
+      request_id: string;
     };
     RunId: {
       id: string;
@@ -271,6 +353,10 @@ export interface components {
       /** @description Source passages read before planning, retained for the section writer. */
       evidence_ids?: string[];
       handoff?: string;
+      id?: string;
+      key_points?: string[];
+      out_of_scope?: string[];
+      owns_requirement_ids?: string[];
       query: string;
       reader_question?: string;
       title: string;
@@ -329,8 +415,6 @@ export interface components {
        * @default 20971520
        */
       max_file_bytes: number;
-      /** @default 100000 */
-      max_files: number;
       /** @default 2 */
       max_jobs: number;
       /** @default [] */
@@ -381,6 +465,8 @@ export interface components {
       max_tokens: number;
       /** @default  */
       name: string;
+      /** @default false */
+      preview_outline: boolean;
       /** @default [] */
       sources: string[];
       /** @default  */
@@ -433,6 +519,91 @@ export interface operations {
       };
     };
   };
+  outline: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": unknown;
+        };
+      };
+    };
+  };
+  continue_outline: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["Approval"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Stale revision or active run */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  revise: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["Revision"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Stale revision or active run */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
   resume_run: {
     parameters: {
       query?: {
@@ -457,6 +628,29 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["RunId"];
+        };
+      };
+    };
+  };
+  understanding: {
+    parameters: {
+      query?: {
+        after?: string;
+      };
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": unknown;
         };
       };
     };

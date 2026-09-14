@@ -2,7 +2,7 @@
 //! and checkpointed independently of the final outline and section drafts.
 use crate::{
     db, editorial, llm,
-    model::{Evidence, Outline, SectionPlan},
+    model::{Evidence, Outline, OutlineReview, Requirement, SectionPlan},
     runner::{RunContext, fatal, is_budget, outline_diagram_error},
     source,
 };
@@ -11,36 +11,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 
-const DISCOVERY: &str = "Read source evidence before planning the document. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[string]}. Do not produce a table of contents yet. Infer the intended reader and task from purpose, then read actual source passages to identify the relevant entry, prerequisites, actors, inputs, processing, persisted or returned results, consumer, and important alternative/error paths. Adapt to the supplied project; do not force a web request model onto unrelated code. Each finding must explain a concrete connection or behavior, including conditions and outputs, rather than list symbols. Use at most 12 findings, each with a short topic and observation (maximum 1200 characters), and 1-6 supplied evidence IDs. Runtime findings require implementation evidence; filenames, imports, README, comments and tests alone do not prove execution. Context findings can describe documented setup or intended usage, explicitly distinguished from observed implementation. Inventory is only a sampled navigation aid. Do not infer a call order from names or treat separate alternatives as consecutive steps. Mark missing links in uncertainties (at most 8). Request at most 3 focused followup_queries naming observed files/symbols or unresolved connections most important to the reader; prefer finding missing entry/result/branch evidence over more detail on already understood helpers. Do not invent identifiers. On the final pass, return no followup_queries and retain unresolved links in uncertainties. Rebuild findings from the evidence in THIS request; prior gaps are research questions, not facts. Use the requested language for observations and uncertainties. Empty findings are invalid; if only contextual evidence exists, say so without inventing runtime behavior.";
+const DISCOVERY: &str = "Read source evidence before planning the document. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[string]}. Do not produce a table of contents yet. Infer the intended reader and task from purpose, then read actual source passages to identify the relevant entry, prerequisites, actors, inputs, processing, persisted or returned results, consumer, and important alternative/error paths. Adapt to the supplied project; do not force a web request model onto unrelated code. Each finding must explain a concrete connection or behavior, including conditions and outputs, rather than list symbols. Use at most 12 findings, each with a short topic and observation (maximum 1200 characters), and 1-6 supplied evidence IDs. Runtime findings require implementation evidence; filenames, imports, README, comments and tests alone do not prove execution. Context findings can describe documented setup or intended usage, explicitly distinguished from observed implementation. Inventory is only a sampled navigation aid. Do not infer a call order from names or treat separate alternatives as consecutive steps. Mark missing links in uncertainties (at most 8). Request at most 3 focused followup_queries naming observed files/symbols or unresolved connections most important to the reader; prefer finding missing entry/result/branch evidence over more detail on already understood helpers. Do not invent identifiers. On the final pass, return no followup_queries and retain unresolved links in uncertainties. Carry relevant findings from verified_overview using its previously_read source anchors; those observations were checked against the originals in the exhaustive reading. Use passages in THIS request for new claims and connections. Do not treat omitted excerpts as missing project coverage; prior gaps are research questions, not facts. Use the requested language for observations and uncertainties. Empty findings are invalid; if only contextual evidence exists, say so without inventing runtime behavior.";
 
-const PLAN: &str = "Return JSON {sections:[{title:string,query:string,reader_question:string,handoff:string,diagrams:[string],depends_on:[number],evidence_ids:[string]}],reader_goal:string,storyline:string,terminology:[string]}. Design one coherent document for the intended reader using the source_brief AND actual evidence read before this plan. The brief is an evidence-linked analysis, not independently verified truth: resolve contradictions against supplied implementation and respect its uncertainties. inventory_sample is only a navigation map: its paths may be named in section queries but are not evidence and must never appear in evidence_ids. Infer the audience and desired outcome from purpose. Organize 3-8 distinct sections in the order the reader needs to understand or perform the work; a narrow topic may need fewer. Start with orientation and the relevant end-to-end picture, then introduce prerequisites before the actions that need them, show one normal path through to an observable result, and place alternatives/troubleshooting where they help the reader. Adapt the order to the actual source and purpose, not a fixed template or catalog of files/classes/subsystems. Separate reading order from runtime order: conditional branches and independent workflows must not become a fictional single execution trace. reader_goal states what the reader should achieve. storyline explains how the questions connect and why this order helps that goal. Each reader_question is one non-duplicated question this section resolves; handoff identifies the concrete result or decision the next section builds on (empty only for the final section). depends_on lists only earlier zero-based SECTION indices needed to understand this section; it is a reading prerequisite, not a function call graph. Every section must carry 1-8 supplied evidence_ids that anchor its topic. query names concrete implementation files, symbols and actions needed to deepen those anchors during writing. For cross-layer or end-to-end documentation, distribute queries across the relevant entry, orchestration, persistence, maintenance and result-consumer modules visible in inventory_sample instead of repeatedly relying on the same few files. For an end-to-end guide, include the evidenced entry, orchestration and result consumer in the opening section's anchors/query where available. Do not invent missing links to make the story smooth; explain limits or separate paths. Assign each explanation to one section to avoid repeated overviews. terminology contains at most 12 short, consistent definitions supported by evidence. Allocate diagrams across the WHOLE document, at most 4 per section: each diagrams entry is one plain-language objective, NEVER diagram code or an assumed call sequence. An empty array means no diagram. Name diagram types explicitly when purpose requests them. Respect max_diagrams (null means no numeric cap) and the requested global number/types; do not repeat an overall flow diagram in every section. Keep titles under 300 bytes, query under 2000 bytes, reader_question and handoff under 1500 bytes, reader_goal under 2000 bytes, storyline under 4000 bytes and each terminology entry under 500 bytes. Use the requested document language. Coverage is selective; never claim all code was understood.";
+const PLAN: &str = "Return JSON {sections:[{title:string,query:string,reader_question:string,handoff:string,diagrams:[string],depends_on:[number],evidence_ids:[string]}],reader_goal:string,storyline:string,terminology:[string]}. Design one coherent document for the intended reader using the source_brief AND actual evidence read before this plan. The brief is an evidence-linked analysis, not independently verified truth: resolve contradictions against supplied implementation and respect its uncertainties. inventory_sample is only a navigation map: its paths may be named in section queries but are not evidence and must never appear in evidence_ids. Infer the audience and desired outcome from purpose. Organize 3-8 distinct sections in the order the reader needs to understand or perform the work; a narrow topic may need fewer. Start with orientation and the relevant end-to-end picture, then introduce prerequisites before the actions that need them, show one normal path through to an observable result, and place alternatives/troubleshooting where they help the reader. Adapt the order to the actual source and purpose, not a fixed template or catalog of files/classes/subsystems. Separate reading order from runtime order: conditional branches and independent workflows must not become a fictional single execution trace. reader_goal states what the reader should achieve. storyline explains how the questions connect and why this order helps that goal. Each reader_question is one non-duplicated question this section resolves; handoff identifies the concrete result or decision the next section builds on (empty only for the final section). depends_on lists only earlier zero-based SECTION indices needed to understand this section; it is a reading prerequisite, not a function call graph. Every section must carry 1-8 supplied evidence_ids that anchor its topic. previously_read source_anchors are originals checked during earlier reading and can anchor an existing source_brief finding even if the passage is not repeated in this bounded request; they do not justify inventing new behavior. query names concrete implementation files, symbols and actions needed to deepen those anchors during writing. For cross-layer or end-to-end documentation, distribute queries across the relevant entry, orchestration, persistence, maintenance and result-consumer modules visible in inventory_sample instead of repeatedly relying on the same few files. For an end-to-end guide, include the evidenced entry, orchestration and result consumer in the opening section's anchors/query where available. Do not invent missing links to make the story smooth; explain limits or separate paths. Assign each explanation to one section to avoid repeated overviews. terminology contains at most 12 short, consistent definitions supported by evidence. Allocate diagrams across the WHOLE document, at most 4 per section: each diagrams entry is one plain-language objective, NEVER diagram code or an assumed call sequence. An empty array means no diagram. Name diagram types explicitly when purpose requests them. Respect max_diagrams (null means no numeric cap) and the requested global number/types; do not repeat an overall flow diagram in every section. Keep titles under 300 bytes, query under 2000 bytes, reader_question and handoff under 1500 bytes, reader_goal under 2000 bytes, storyline under 4000 bytes and each terminology entry under 500 bytes. Use the requested document language. Coverage is selective; never claim all code was understood.";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum FindingKind {
+pub(crate) enum FindingKind {
     Runtime,
     Context,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Finding {
-    topic: String,
-    observation: String,
-    kind: FindingKind,
-    evidence_ids: Vec<String>,
+pub(crate) struct Finding {
+    pub topic: String,
+    pub observation: String,
+    pub kind: FindingKind,
+    pub evidence_ids: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct SourceBrief {
-    findings: Vec<Finding>,
-    uncertainties: Vec<String>,
-    followup_queries: Vec<String>,
+pub(crate) struct SourceBrief {
+    pub findings: Vec<Finding>,
+    pub uncertainties: Vec<String>,
+    pub followup_queries: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Discovery {
-    brief: SourceBrief,
-    evidence: Vec<Evidence>,
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Discovery {
+    pub brief: SourceBrief,
+    pub evidence: Vec<Evidence>,
 }
 
 fn bounded_text(value: &str, max: usize) -> bool {
@@ -70,7 +70,11 @@ fn resolve_ids(ids: &mut [String], evidence: &[Evidence], max: usize) -> Result<
     Ok(())
 }
 
-fn validate_brief(brief: &mut SourceBrief, evidence: &[Evidence], final_pass: bool) -> Result<()> {
+pub(crate) fn validate_brief(
+    brief: &mut SourceBrief,
+    evidence: &[Evidence],
+    final_pass: bool,
+) -> Result<()> {
     ensure!(
         !brief.findings.is_empty() && brief.findings.len() <= 12,
         "Supply 1-12 source findings"
@@ -79,15 +83,32 @@ fn validate_brief(brief: &mut SourceBrief, evidence: &[Evidence], final_pass: bo
         brief.uncertainties.len() <= 8 && brief.uncertainties.iter().all(|s| bounded_text(s, 1500)),
         "Invalid uncertainties"
     );
+    // Empty strings are a common representation of no further questions.
+    brief
+        .followup_queries
+        .retain(|query| !query.trim().is_empty());
     ensure!(
-        brief.followup_queries.len() <= 3
+        brief.followup_queries.len() <= if final_pass { 8 } else { 3 }
             && brief.followup_queries.iter().all(|s| bounded_text(s, 1500)),
-        "Invalid followup_queries"
+        "Supply at most {} nonempty followup_queries, each at most 1500 bytes (received {} queries; lengths {:?})",
+        if final_pass { 8 } else { 3 },
+        brief.followup_queries.len(),
+        brief
+            .followup_queries
+            .iter()
+            .map(|s| s.len())
+            .collect::<Vec<_>>()
     );
-    ensure!(
-        !final_pass || brief.followup_queries.is_empty(),
-        "Final source reading must leave unresolved links in uncertainties, not request another pass"
-    );
+    // Some providers return useful research questions even on the final pass.
+    // Preserve those gaps rather than failing an otherwise grounded reading or
+    // silently pretending the requested investigation happened.
+    if final_pass {
+        for query in std::mem::take(&mut brief.followup_queries) {
+            if !brief.uncertainties.contains(&query) {
+                brief.uncertainties.push(query);
+            }
+        }
+    }
     for finding in &mut brief.findings {
         ensure!(
             bounded_text(&finding.topic, 300) && bounded_text(&finding.observation, 4000),
@@ -100,14 +121,20 @@ fn validate_brief(brief: &mut SourceBrief, evidence: &[Evidence], final_pass: bo
                     .iter()
                     .any(|e| finding.evidence_ids.contains(&e.id)
                         && source::is_implementation(&e.path)),
-                "Runtime finding must cite implementation evidence"
+                "Finding {:?} cites only context evidence ({:?}); classify it as context and describe documented/test intent, or cite an actual supplied implementation passage. Runtime finding must cite implementation evidence",
+                finding.topic,
+                evidence
+                    .iter()
+                    .filter(|e| finding.evidence_ids.contains(&e.id))
+                    .map(|e| &e.path)
+                    .collect::<Vec<_>>()
             );
         }
     }
     Ok(())
 }
 
-fn validate_outline(
+pub(crate) fn validate_outline(
     outline: &mut Outline,
     evidence: &[Evidence],
     maximum: Option<u32>,
@@ -126,8 +153,43 @@ fn validate_outline(
     );
     let mut titles = HashSet::new();
     let mut questions = HashSet::new();
+    let mut ids = HashSet::new();
+    let mut ownership = HashSet::new();
     let count = outline.sections.len();
     for (index, section) in outline.sections.iter_mut().enumerate() {
+        if section.id.is_empty() {
+            section.id =
+                source::hash(format!("{}:{}", section.title, section.reader_question).as_bytes());
+        }
+        ensure!(
+            section.id.len() <= 64
+                && section
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && ids.insert(section.id.clone()),
+            "Invalid or repeated section ID"
+        );
+        if !outline.requirements.is_empty() {
+            ensure!(
+                !section.key_points.is_empty()
+                    && section.key_points.len() <= 12
+                    && section.key_points.iter().all(|p| bounded_text(p, 1500)),
+                "Supply 1-12 key_points per section"
+            );
+            ensure!(
+                section.out_of_scope.len() <= 12
+                    && section.out_of_scope.iter().all(|p| bounded_text(p, 1500)),
+                "Invalid out_of_scope"
+            );
+            for requirement in &section.owns_requirement_ids {
+                ensure!(
+                    outline.requirements.iter().any(|r| &r.id == requirement)
+                        && ownership.insert(requirement.clone()),
+                    "Each requirement must have exactly one owning section"
+                );
+            }
+        }
         ensure!(
             bounded_text(&section.title, 299)
                 && bounded_text(&section.query, 1999)
@@ -167,6 +229,13 @@ fn validate_outline(
         );
         resolve_ids(&mut section.evidence_ids, evidence, 8)?;
     }
+    ensure!(
+        outline
+            .requirements
+            .iter()
+            .all(|r| ownership.contains(&r.id)),
+        "Missing required topic ownership"
+    );
     if let Some(error) = outline_diagram_error(outline, maximum) {
         bail!("{error}");
     }
@@ -175,7 +244,7 @@ fn validate_outline(
 
 /// Keep real passages intact (and their hashes valid), distributing space across
 /// independent retrieval queries before taking more results from any one query.
-fn pack_evidence(groups: &[Vec<Evidence>], limit: usize) -> Vec<Evidence> {
+pub(crate) fn pack_evidence(groups: &[Vec<Evidence>], limit: usize) -> Vec<Evidence> {
     let mut selected = Vec::new();
     let mut seen = HashSet::new();
     let mut used = 0;
@@ -252,17 +321,40 @@ async fn read_sources(
             !evidence.is_empty(),
             "No source evidence available before planning"
         );
+        let mut available = evidence.clone();
+        if let Some(prior) = previous {
+            for e in &prior.evidence {
+                if !available.iter().any(|a| a.id == e.id) {
+                    available.push(e.clone());
+                }
+            }
+        }
         let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
+            "verified_overview":previous.map(|p| &p.brief),
+            "source_anchors":previous.map(|p| p.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>()),
             "inventory_sample":editorial::excerpt(inventory, 16000 >> attempt),"evidence":evidence,
             "open_questions":previous.map(|p| &p.brief.uncertainties),"final_pass":final_pass,
             "previous_error":previous_error,"attempt":attempt+1,"instruction":DISCOVERY});
         let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
             let mut brief: SourceBrief = llm::decode(&s)?;
-            validate_brief(&mut brief, &evidence, final_pass)?;
+            validate_brief(&mut brief, &available, final_pass)?;
             Ok(brief)
         });
         match result {
-            Ok(brief) => return Ok(Discovery { brief, evidence }),
+            Ok(brief) => {
+                return Ok(Discovery {
+                    evidence: available
+                        .into_iter()
+                        .filter(|e| {
+                            brief
+                                .findings
+                                .iter()
+                                .any(|f| f.evidence_ids.contains(&e.id))
+                        })
+                        .collect(),
+                    brief,
+                });
+            }
             Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
             Err(e) => {
                 llm::forget(ctx, system, input).await?;
@@ -281,15 +373,21 @@ async fn read_sources(
     bail!("Unable to understand source before planning: {previous_error}")
 }
 
-async fn discover(ctx: &RunContext, system: &str, inventory: &str) -> Result<Discovery> {
+async fn discover(ctx: &RunContext, system: &str) -> Result<Discovery> {
     if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "source_understanding").await? {
         return Ok(serde_json::from_value(saved)?);
     }
+    let mut whole = crate::understanding::analyze(ctx, system).await?;
+    whole.brief.followup_queries = vec![format!(
+        "{} entry result errors",
+        ctx.snapshot.task.direction
+    )];
     let first: Discovery =
         if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "source_reading:0").await? {
             serde_json::from_value(saved)?
         } else {
-            let read = read_sources(ctx, system, inventory, None).await?;
+            let overview = serde_json::to_string(&whole.brief)?;
+            let read = read_sources(ctx, system, &overview, Some(&whole)).await?;
             db::checkpoint(
                 &ctx.pool,
                 &ctx.id,
@@ -302,7 +400,13 @@ async fn discover(ctx: &RunContext, system: &str, inventory: &str) -> Result<Dis
     let complete = if first.brief.followup_queries.is_empty() {
         first
     } else {
-        read_sources(ctx, system, inventory, Some(&first)).await?
+        read_sources(
+            ctx,
+            system,
+            &serde_json::to_string(&whole.brief)?,
+            Some(&first),
+        )
+        .await?
     };
     db::checkpoint(
         &ctx.pool,
@@ -321,61 +425,248 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
     if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "outline").await? {
         return Ok(serde_json::from_value(saved)?);
     }
-    let inventory = source::inventory(ctx).await?;
-    let discovery = discover(ctx, system, &inventory).await?;
-    let mut limit = evidence_budget(ctx);
-    let mut previous_error = String::new();
-    for attempt in 0..3 {
-        let evidence = pack_evidence(std::slice::from_ref(&discovery.evidence), limit);
-        ensure!(
-            !evidence.is_empty(),
-            "CONTEXT_BUDGET: insufficient room for grounded outline"
-        );
-        // A reduced request must not retain findings whose source was dropped.
-        let mut brief = discovery.brief.clone();
-        let all_present = |f: &Finding| {
+    let discovery = discover(ctx, system).await?;
+    let inventory = serde_json::to_string(&discovery.brief)?;
+    let requirements = requirements(ctx, system).await?;
+    let state = db::load_checkpoint(&ctx.pool, &ctx.id, "outline_state")
+        .await?
+        .unwrap_or(json!({"revision":0,"round":0}));
+    let mut revision = state["revision"].as_u64().unwrap_or(0) as u32;
+    let mut round = state["round"].as_u64().unwrap_or(0);
+    let mut extra_queries = state["extra_queries"].as_u64().unwrap_or(0) as usize;
+    let mut feedback = db::load_checkpoint(&ctx.pool, &ctx.id, "outline_feedback")
+        .await?
+        .unwrap_or(json!({}));
+    let mut discovery = discovery;
+    loop {
+        let pending = db::load_checkpoint(&ctx.pool, &ctx.id, "outline_candidate").await?;
+        if pending.is_none() {
+            revision += 1;
+        }
+        let mut limit = evidence_budget(ctx);
+        let mut previous_error = String::new();
+        let mut candidate = pending.map(serde_json::from_value::<Outline>).transpose()?;
+        for attempt in 0..3 {
+            if candidate.is_some() {
+                break;
+            }
+            let evidence = pack_evidence(std::slice::from_ref(&discovery.evidence), limit);
+            ensure!(
+                !evidence.is_empty(),
+                "CONTEXT_BUDGET: insufficient room for grounded outline"
+            );
+            let brief = &discovery.brief;
+            ctx.event("outline_planning", json!({"stage":"planning","title":"구현 근거에 맞춰 설명 순서 구성","attempt":attempt+1,"evidence_chunks":evidence.len()})).await?;
+            let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
+            "source_brief":brief,"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"project_overview":inventory,"requirements":requirements,"feedback":feedback,"revision":revision,
+            "evidence":evidence,"max_diagrams":ctx.snapshot.task.max_diagrams,
+            "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{PLAN} Additionally each section must include owns_requirement_ids (each supplied requirement has exactly ONE owner across the document), key_points (1-12 concrete explanations), and out_of_scope (topics owned elsewhere). Respect user feedback and preserve valid existing section IDs when supplied. Do not remove requirements to hide missing coverage.")});
+            let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
+                let mut plan: Outline = llm::decode(&s)?;
+                plan.requirements = requirements.clone();
+                plan.revision = revision;
+                validate_outline(
+                    &mut plan,
+                    &discovery.evidence,
+                    ctx.snapshot.task.max_diagrams,
+                )?;
+                Ok(plan)
+            });
+            match result {
+                Ok(plan) => {
+                    candidate = Some(plan);
+                    break;
+                }
+                Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
+                Err(e) => {
+                    llm::forget(ctx, system, input).await?;
+                    previous_error = editorial::excerpt(&e.to_string(), 1500);
+                    if previous_error.contains("CONTEXT_BUDGET") {
+                        limit /= 2;
+                    }
+                    ctx.event(
+                        "outline_validation",
+                        json!({"stage":"planning","attempt":attempt+1,"error":previous_error}),
+                    )
+                    .await?;
+                }
+            }
+        }
+        let plan = candidate.ok_or_else(|| {
+            anyhow::anyhow!(
+                "AWAITING_OUTLINE: Invalid outline after three attempts: {previous_error}"
+            )
+        })?;
+        db::checkpoint(
+            &ctx.pool,
+            &ctx.id,
+            "outline_candidate",
+            &serde_json::to_value(&plan)?,
+        )
+        .await?;
+        db::checkpoint(
+            &ctx.pool,
+            &ctx.id,
+            &format!("outline_candidate:{revision}"),
+            &serde_json::to_value(&plan)?,
+        )
+        .await?;
+        db::checkpoint(
+            &ctx.pool,
+            &ctx.id,
+            "outline_state",
+            &json!({"revision":revision,"round":round,"extra_queries":extra_queries}),
+        )
+        .await?;
+        let review = review_outline(ctx, system, &plan, &discovery).await?;
+        ctx.event("outline_review", json!({"stage":"outline_review","title":"목차의 누락·중복·순서 검토","revision":revision,"issues":review.issues})).await?;
+        if review.issues.iter().all(|i| i.severity != "major") {
+            let approved = db::load_checkpoint(&ctx.pool, &ctx.id, "outline_approved")
+                .await?
+                .and_then(|v| v.as_u64())
+                == Some(u64::from(revision));
+            if ctx.snapshot.task.preview_outline && !approved {
+                bail!("AWAITING_OUTLINE: 목차를 확인하고 본문 작성을 시작하세요");
+            }
+            db::checkpoint(&ctx.pool, &ctx.id, "outline", &serde_json::to_value(&plan)?).await?;
+            return Ok(plan);
+        }
+        if round >= 2 {
+            bail!(
+                "AWAITING_OUTLINE: 두 차례 보정 후 주요 구성 문제가 남았습니다. 목차 또는 방향을 수정하세요"
+            );
+        }
+        // Ground requested structural corrections before generating the next plan.
+        let mut extra = vec![discovery.evidence.clone()];
+        for query in review
+            .issues
+            .iter()
+            .filter(|i| !i.query.trim().is_empty())
+            .take(3usize.saturating_sub(extra_queries))
+        {
+            extra.push(source::retrieve(ctx, &query.query, evidence_budget(ctx) / 3).await?);
+            extra_queries += 1;
+        }
+        discovery.evidence = pack_evidence(&extra, evidence_budget(ctx));
+        discovery.brief.findings.retain(|f| {
             f.evidence_ids
                 .iter()
-                .all(|id| evidence.iter().any(|e| &e.id == id))
-        };
-        brief.findings.retain(all_present);
-        if brief.findings.len() != discovery.brief.findings.len() {
-            brief.uncertainties.push("Some source findings were omitted to fit this request; do not infer their behavior.".into());
-        }
-        ctx.event("outline_planning", json!({"stage":"planning","title":"구현 근거에 맞춰 설명 순서 구성","attempt":attempt+1,"evidence_chunks":evidence.len()})).await?;
-        let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
-            "source_brief":brief,"inventory_sample":editorial::excerpt(&inventory, 8000 >> attempt),
-            "evidence":evidence,"max_diagrams":ctx.snapshot.task.max_diagrams,
-            "previous_error":previous_error,"attempt":attempt+1,"instruction":PLAN});
-        let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
-            let mut plan: Outline = llm::decode(&s)?;
-            validate_outline(&mut plan, &evidence, ctx.snapshot.task.max_diagrams)?;
-            Ok(plan)
+                .all(|id| discovery.evidence.iter().any(|e| &e.id == id))
         });
-        match result {
-            Ok(plan) => {
-                db::checkpoint(&ctx.pool, &ctx.id, "outline", &serde_json::to_value(&plan)?)
-                    .await?;
-                return Ok(plan);
+        round += 1;
+        feedback = json!({"previous_plan":plan,"issues":review.issues});
+        let mut tx = ctx.pool.begin().await?;
+        for (step, value) in [
+            ("source_understanding", serde_json::to_value(&discovery)?),
+            ("outline_feedback", feedback.clone()),
+            (
+                "outline_state",
+                json!({"revision":revision,"round":round,"extra_queries":extra_queries}),
+            ),
+        ] {
+            sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)").bind(&ctx.id).bind(step).bind(value.to_string()).execute(&mut *tx).await?;
+        }
+        sqlx::query("DELETE FROM checkpoints WHERE run_id=? AND step='outline_candidate'")
+            .bind(&ctx.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
+}
+
+async fn requirements(ctx: &RunContext, system: &str) -> Result<Vec<Requirement>> {
+    if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "document_requirements").await? {
+        return Ok(serde_json::from_value(saved)?);
+    }
+    let mut error = String::new();
+    for attempt in 0..3 {
+        let input = json!({"phase":"document_intent","purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"attempt":attempt,"previous_error":error,"instruction":"Extract the required reader questions from the user's purpose. Return JSON {requirements:[{id:string,question:string}]}. Supply 1-12 concise questions that together fulfill the explicit purpose. Do not add unrelated installation, security or operations topics. Each question must be under 1000 characters. Use the requested language."});
+        let parsed = llm::call(ctx, system, input.clone())
+            .await
+            .and_then(|text| {
+                #[derive(Deserialize)]
+                struct Intent {
+                    requirements: Vec<Requirement>,
+                }
+                let mut r = llm::decode::<Intent>(&text)?.requirements;
+                ensure!(
+                    !r.is_empty()
+                        && r.len() <= 12
+                        && r.iter().all(|v| bounded_text(&v.question, 3000)),
+                    "Supply 1-12 bounded reader questions"
+                );
+                for (i, v) in r.iter_mut().enumerate() {
+                    v.id = format!("r{}", i + 1);
+                }
+                Ok(r)
+            });
+        match parsed {
+            Ok(r) => {
+                db::checkpoint(
+                    &ctx.pool,
+                    &ctx.id,
+                    "document_requirements",
+                    &serde_json::to_value(&r)?,
+                )
+                .await?;
+                return Ok(r);
             }
             Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
             Err(e) => {
                 llm::forget(ctx, system, input).await?;
-                previous_error = editorial::excerpt(&e.to_string(), 1500);
-                if previous_error.contains("CONTEXT_BUDGET") {
-                    limit /= 2;
-                }
-                ctx.event(
-                    "outline_validation",
-                    json!({"stage":"planning","attempt":attempt+1,"error":previous_error}),
-                )
-                .await?;
+                error = editorial::excerpt(&e.to_string(), 1000);
             }
         }
     }
-    bail!(
-        "Unable to generate a grounded documentation outline after three attempts: {previous_error}"
-    )
+    bail!("AWAITING_OUTLINE: Could not extract document requirements: {error}")
+}
+
+async fn review_outline(
+    ctx: &RunContext,
+    system: &str,
+    plan: &Outline,
+    discovery: &Discovery,
+) -> Result<OutlineReview> {
+    let key = format!("outline_review:{}", plan.revision);
+    if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? {
+        return Ok(serde_json::from_value(saved)?);
+    }
+    let mut error = String::new();
+    for attempt in 0..3 {
+        let input = json!({"phase":"outline_review","purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"outline":plan,"source_brief":discovery.brief,"evidence":pack_evidence(std::slice::from_ref(&discovery.evidence),evidence_budget(ctx)),"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"attempt":attempt,"previous_error":error,"instruction":"Review this outline BEFORE writing. Return JSON {issues:[{severity:'major'|'minor',code:string,message:string,section_ids:[string],requirement_ids:[string],query:string}]}. Check missing reader requirements, semantic overlap, prerequisites after use, oversized or empty sections, audience mismatch, unsupported runtime ordering and missing important source branches. A short orientation referencing a detailed section is valid. Sharing evidence is not duplication. Every issue must identify concrete affected IDs and a necessary correction, grounded in the supplied outline or source. For missing evidence query names observed files/symbols. Previously_read anchors support observations already checked in the source_brief. Do not invent defects or infer absence from an excerpt. Empty issues means no concrete defect supported. Use the requested language. At most 12 issues."});
+        let parsed = llm::call(ctx, system, input.clone()).await.and_then(|s| {
+            let r: OutlineReview = llm::decode(&s)?;
+            ensure!(
+                r.issues.len() <= 12
+                    && r.issues
+                        .iter()
+                        .all(|i| ["major", "minor"].contains(&i.severity.as_str())
+                            && bounded_text(&i.message, 4000)
+                            && bounded_text(&i.code, 100)
+                            && i.query.len() <= 2000
+                            && i.section_ids
+                                .iter()
+                                .all(|id| plan.sections.iter().any(|s| &s.id == id))
+                            && i.requirement_ids
+                                .iter()
+                                .all(|id| plan.requirements.iter().any(|r| &r.id == id))),
+                "Invalid outline review issue or reference"
+            );
+            Ok(r)
+        });
+        match parsed {
+            Ok(r) => {
+                db::checkpoint(&ctx.pool, &ctx.id, &key, &serde_json::to_value(&r)?).await?;
+                return Ok(r);
+            }
+            Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
+            Err(e) => {
+                llm::forget(ctx, system, input).await?;
+                error = editorial::excerpt(&e.to_string(), 1000);
+            }
+        }
+    }
+    bail!("AWAITING_OUTLINE: Outline review could not complete: {error}")
 }
 
 pub async fn section_evidence(ctx: &RunContext, plan: &SectionPlan) -> Result<Vec<Evidence>> {
@@ -419,12 +710,18 @@ mod tests {
         let mut brief: SourceBrief = serde_json::from_value(json!({
             "findings":[{"topic":"entry","observation":"receive passes input to finish",
                 "kind":"runtime","evidence_ids":[&implementation.id[..8]]}],
-            "uncertainties":["finish implementation is missing"],"followup_queries":["finish"]
+            "uncertainties":["finish implementation is missing"],"followup_queries":["finish", "", "  "]
         }))?;
         let sources = vec![implementation.clone(), readme.clone()];
         validate_brief(&mut brief, &sources, false)?;
         assert_eq!(brief.findings[0].evidence_ids[0], implementation.id);
-        assert!(validate_brief(&mut brief, &sources, true).is_err());
+        brief
+            .followup_queries
+            .extend(["input", "output", "cancel"].map(String::from));
+        assert!(validate_brief(&mut brief, &sources, false).is_err());
+        validate_brief(&mut brief, &sources, true)?;
+        assert!(brief.followup_queries.is_empty());
+        assert!(brief.uncertainties.iter().any(|s| s == "finish"));
         brief.followup_queries.clear();
         brief.findings[0].evidence_ids = vec![readme.id];
         assert!(validate_brief(&mut brief, &sources, true).is_err());
@@ -469,6 +766,22 @@ mod tests {
         plan.sections[1].reader_question = "What does the result mean?".into();
         plan.sections[1].evidence_ids.clear();
         assert!(validate_outline(&mut plan, &[source], None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn requirement_ownership_rejects_missing_and_duplicate_coverage() -> Result<()> {
+        let e = evidence("/project/a.py", "def process(): return 1");
+        let mut plan: Outline = serde_json::from_value(
+            json!({"reader_goal":"Understand result","storyline":"Prepare and inspect","requirements":[{"id":"r1","question":"What result?"}],"sections":[
+                {"title":"Result","query":"process","reader_question":"What is returned?","handoff":"","diagrams":[],"evidence_ids":[e.id],"key_points":["Return value"],"owns_requirement_ids":[]}
+            ]}),
+        )?;
+        assert!(validate_outline(&mut plan, std::slice::from_ref(&e), None).is_err());
+        plan.sections[0].owns_requirement_ids = vec!["r1".into()];
+        validate_outline(&mut plan, std::slice::from_ref(&e), None)?;
+        plan.sections[0].owns_requirement_ids.push("r1".into());
+        assert!(validate_outline(&mut plan, std::slice::from_ref(&e), None).is_err());
         Ok(())
     }
 

@@ -264,7 +264,8 @@ pub fn compact_evidence_ids(input: &mut Value) {
         match value {
             Value::Object(map) => {
                 if map.contains_key("path")
-                    && map.contains_key("content")
+                    && (map.contains_key("content")
+                        || map.get("previously_read").and_then(Value::as_bool) == Some(true))
                     && let Some(id) = map.get("id").and_then(Value::as_str)
                     && id.len() == 64
                     && id.bytes().all(|b| b.is_ascii_hexdigit())
@@ -336,9 +337,10 @@ mod citation_view_tests {
         let a = format!("12345678a{}", "0".repeat(55));
         let b = format!("12345678b{}", "0".repeat(55));
         let source = format!("// Source contains [E:{a}]");
-        let mut input = json!({"evidence":[{"id":a,"path":"a.rs","content":source},{"id":b,"path":"b.rs","content":"code"}],"correction":{"previous":format!("Fact [E:{a}] [E:{b}] [E:unknown]")}});
+        let mut input = json!({"evidence":[{"id":a,"path":"a.rs","content":source},{"id":b,"path":"b.rs","content":"code"}],"source_anchors":[{"id":a,"path":"a.rs","previously_read":true}],"correction":{"previous":format!("Fact [E:{a}] [E:{b}] [E:unknown]")}});
         compact_evidence_ids(&mut input);
         assert_eq!(input["evidence"][0]["id"], "12345678a");
+        assert_eq!(input["source_anchors"][0]["id"], "12345678a");
         assert_eq!(input["evidence"][1]["id"], "12345678b");
         assert_eq!(input["evidence"][0]["content"], source);
         assert_eq!(

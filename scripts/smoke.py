@@ -42,23 +42,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if model=='quota-partial' and 'Write only Markdown' in instruction:
                 writes=sum(1 for r in requests if r['model']==model and 'Write only Markdown' in r['messages'][-1]['content'])
                 if writes>1: return self.reply({'error':{'code':429,'message':'Rate limit exceeded: free-models-per-day'}},429)
-            if 'Read source evidence before planning' in instruction:
+            if data.get('phase')=='document_intent':
+                result=json.dumps({'requirements':[{'id':'r1','question':'무엇을 할 수 있는가?'},{'id':'r2','question':'어떤 입력이 유효한가?'},{'id':'r3','question':'결과를 어떻게 확인하는가?'}]},ensure_ascii=False)
+            elif data.get('phase')=='outline_review':
+                result=json.dumps({'issues':[]})
+                if model=='outline-quality-once' and data['outline']['revision']==1:
+                    result=json.dumps({'issues':[{'severity':'major','code':'overlap','message':'두 장의 담당 설명을 구분하세요','section_ids':[data['outline']['sections'][0]['id']],'requirement_ids':['r1'],'query':''}]},ensure_ascii=False)
+                if model=='outline-quality-stuck':
+                    result=json.dumps({'issues':[{'severity':'major','code':'scope','message':'필수 설명을 보완하세요','section_ids':[],'requirement_ids':['r1'],'query':''}]},ensure_ascii=False)
+            elif data.get('phase')=='understanding_reduce' and not data['evidence']:
+                assert data['summaries'] and data['source_anchors']
+                finding=data['summaries'][0]['findings'][0]
+                assert all(any(a['id']==eid for a in data['source_anchors']) for eid in finding['evidence_ids'])
+                result=json.dumps({'findings':[finding],'uncertainties':[],'followup_queries':[]},ensure_ascii=False)
+            elif 'Read source evidence before planning' in instruction:
                 evidence=data['evidence']
                 assert evidence and all(e['content'] and e['start']>=1 for e in evidence)
                 final_pass=data['final_pass']
-                result=json.dumps({'findings':[{'topic':'입력과 결과','observation':'구현에서 입력 이름을 검사하고 결과를 반환한다.','kind':'runtime','evidence_ids':[evidence[0]['id']]}], 'uncertainties':[] if final_pass else ['오류 처리와 반환 결과의 연결을 추가 확인한다.'], 'followup_queries':['service.py name_required handle_request'] if model in ['planning-followup','restart-discovery'] and not final_pass else []},ensure_ascii=False)
+                anchor=next((e for e in evidence if pathlib.Path(e['path']).suffix in ('.py','.rs','.js','.ts','.java','.go','.c','.cpp')),evidence[0])
+                kind='runtime' if pathlib.Path(anchor['path']).suffix in ('.py','.rs','.js','.ts','.java','.go','.c','.cpp') else 'context'
+                result=json.dumps({'findings':[{'topic':'입력과 결과','observation':'구현에서 입력 이름을 검사하고 결과를 반환한다.','kind':kind,'evidence_ids':[anchor['id']]}], 'uncertainties':[] if final_pass else ['오류 처리와 반환 결과의 연결을 추가 확인한다.'], 'followup_queries':['service.py name_required handle_request'] if model in ['planning-followup','restart-discovery'] and not final_pass else []},ensure_ascii=False)
                 if model=='planning-citation-once' and not getattr(self.server,'planning_citation_sent',False):
                     self.server.planning_citation_sent=True
                     invalid=json.loads(result);invalid['findings'][0]['evidence_ids']=['ffffffff'];result=json.dumps(invalid)
                 if model=='planning-invalid':
                     invalid=json.loads(result);invalid['findings'][0]['evidence_ids']=['ffffffff'];result=json.dumps(invalid)
-                if model=='restart-discovery' and final_pass and not getattr(self.server,'discovery_delayed',False):
+                if model=='restart-discovery' and not data.get('phase') and final_pass and not getattr(self.server,'discovery_delayed',False):
                     self.server.discovery_delayed=True;time.sleep(4)
             elif 'sections:[{title' in instruction:
                 result=json.dumps({'reader_goal':'입력을 보내고 결과와 오류를 이해한다','storyline':'입력 준비에서 실행, 결과 확인과 오류 대응으로 이어진다','terminology':['처리 결과: 검증을 마친 반환값'],'sections':[{'title':'기능 개요','query':'handle_request handleRequest validation','reader_question':'무엇을 할 수 있는가?','handoff':'검증 조건을 확인한다','diagrams':['입력과 검증 흐름']},{'title':'오류와 제약','query':'name_required errors','reader_question':'어떤 입력이 유효한가?','handoff':'검증을 통과한 입력을 처리한다','diagrams':['오류 분기']},{'title':'처리 흐름','query':'return handle_request','reader_question':'결과를 어떻게 확인하는가?','handoff':'','diagrams':['결과 반환 흐름']}]},ensure_ascii=False)
                 outline=json.loads(result)
                 for index,section in enumerate(outline['sections']):
                     section['depends_on']=[index-1] if index else []
+                    section['owns_requirement_ids']=[f'r{index+1}']
+                    section['key_points']=[section['reader_question']]
+                    section['out_of_scope']=[]
                     section['evidence_ids']=[data['source_brief']['findings'][0]['evidence_ids'][0]]
                 if model=='planning-dependency-once' and not data.get('previous_error'):
                     outline['sections'][0]['depends_on']=[2]
@@ -69,6 +87,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if model=='coherence-format-once' and not getattr(self.server,'coherence_format_sent',False):
                     self.server.coherence_format_sent=True
                     result=json.dumps({'issues':[{'section':4,'problem':'wrong review schema','suggestion':'fix'}]})
+                elif model=='draft-restructure' and not getattr(self.server,'restructured',False):
+                    self.server.restructured=True;result=json.dumps({'issues':[],'outline_issues':[{'severity':'major','code':'order','message':'독자의 결과 확인 질문을 더 명확하게 나누세요','section_ids':[data['document_plan']['sections'][0]['id']],'requirement_ids':['r1'],'query':''}]},ensure_ascii=False)
                 elif model=='coherence-once' and not getattr(self.server,'coherence_sent',False):
                     self.server.coherence_sent=True
                     result=json.dumps({'issues':[{'severity':'major','section':1,'message':'앞 절의 입력 준비가 다음 절의 실행으로 이어지도록 결과와 연결을 설명하세요.','query':''}]})
@@ -216,10 +236,10 @@ def main():
                     assert any(e['id']==anchor for e in writes[0]['evidence']), 'Planning source anchors did not reach the writer'
                     assert writes[1]['section_plan']['depends_on']==[0]
                     if model=='planning-followup':
-                        assert len(readings)==2 and not readings[0]['final_pass'] and readings[1]['final_pass']
-                        assert readings[1]['open_questions']
-                        assert any(e['path'].endswith('service.py') for e in readings[1]['evidence'])
-                    if model=='planning-citation-once':assert len(readings)==2 and 'Unknown or ambiguous evidence ID' in readings[1]['previous_error']
+                        assert any(x.get('phase')=='understanding_batch' for x in readings) and readings[-1]['final_pass']
+                        assert any('open_questions' in x for x in readings)
+                        assert any(e['path'].endswith('service.py') for e in readings[-1]['evidence'])
+                    if model=='planning-citation-once':assert any('Unknown or ambiguous evidence ID' in x.get('previous_error','') for x in readings)
                     if model=='planning-dependency-once':assert len(plans)==2 and 'earlier zero-based' in plans[1]['previous_error']
                 if model in ['invalid-once','truncate-once','mermaid-once']:
                     writes=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
@@ -280,8 +300,35 @@ def main():
             configure('tight-budget')
             t=api('/tasks','POST',{'name':'tight-budget','sources':[str(source)],'target':str(out/'tight-budget.md'),'direction':'개발자를 위한 기능 설명과 Mermaid 흐름 정리','max_iterations':2,'max_tokens':50000})
             rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
-            assert r['status']=='completed' and r['tokens']==1800,r
+            assert r['status']=='completed' and r['tokens']==2400,r
             print('PASS confirmed usage releases reservations within fixed task budget',flush=True)
+            configure('outline-quality-once');t=task('outline-quality-once');rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
+            assert r['status']=='completed',r
+            planned=api(f'/runs/{rid}/outline');assert planned['outline']['revision']==2
+            assert api(f'/runs/{rid}/understanding')['coverage']['complete']
+            print('PASS semantic outline repair before writing',flush=True)
+            configure('outline-quality-stuck');t=task('outline-quality-stuck');rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
+            assert r['status']=='awaiting_outline' and not (out/'outline-quality-stuck.md').exists(),r
+            assert api(f'/runs/{rid}/outline')['outline']['revision']==3
+            print('PASS bounded outline repairs retain unresolved plan without publication',flush=True)
+            configure('normal');t=task('outline-preview');t['preview_outline']=True;api('/tasks','POST',t)
+            rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid);assert r['status']=='awaiting_outline',r
+            plan=api(f'/runs/{rid}/outline')['outline'];base=plan['revision'];plan['sections'][0]['title']='시작과 입력'
+            edit={'base_revision':base,'request_id':'preview-edit','outline':plan}
+            api(f'/runs/{rid}/outline/revisions','POST',edit);r=poll(rid);assert r['status']=='awaiting_outline',r
+            assert api(f'/runs/{rid}/outline/revisions','POST',edit)['revision']==base+1
+            try:api(f'/runs/{rid}/outline/revisions','POST',{**edit,'request_id':'stale-edit'})
+            except RuntimeError as e:assert 'CONFLICT' in str(e)
+            else:raise AssertionError('Stale outline edit accepted')
+            api(f'/runs/{rid}/outline/continue','POST',{'revision':base+1});r=poll(rid);assert r['status']=='completed',r
+            assert '## 시작과 입력' in (out/'outline-preview.md').read_text()
+            print('PASS preview / edit / idempotency / stale version / continue',flush=True)
+            configure('draft-restructure');t=task('draft-restructure');t['max_iterations']=3;api('/tasks','POST',t)
+            rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid);assert r['status']=='completed',r
+            assert api(f'/runs/{rid}/outline')['outline']['revision']==2
+            global_reviews=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='draft-restructure' and 'Review the whole document' in x['messages'][-1]['content']]
+            assert len(global_reviews)<=3 and len(global_reviews)>=2
+            print('PASS draft restructuring stays within the shared three-iteration limit',flush=True)
             configure('quota-partial');t=task('quota-partial');rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
             assert r['status']=='completed_with_warnings',r
             text=(out/'quota-partial.md').read_text()
@@ -332,7 +379,7 @@ def main():
             end=time.monotonic()+30
             while time.monotonic()<end:
                 readings=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='restart-discovery']
-                if any(x.get('final_pass') for x in readings):break
+                if any(x.get('final_pass') and not x.get('phase') for x in readings):break
                 time.sleep(.05)
             else:raise AssertionError('Follow-up source reading not reached')
             process.kill();process.wait();process=subprocess.Popen([str(BINARY)],cwd=ROOT,env=env,stdout=log,stderr=log)
@@ -341,8 +388,8 @@ def main():
                 except Exception:time.sleep(.1)
             r=poll(rid);assert r['status']=='completed',r
             readings=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='restart-discovery' and 'Read source evidence before planning' in x['messages'][-1]['content']]
-            assert sum(not x['final_pass'] for x in readings)==1, 'Completed initial source reading repeated after restart'
-            assert sum(x['final_pass'] for x in readings)==2
+            assert sum(x.get('phase')=='understanding_batch' for x in readings)==1, 'Completed whole-source batch repeated after restart'
+            assert sum(not x.get('phase') for x in readings)==2
             print('PASS source-understanding restart retains initial reading and resumes missing-link research',flush=True)
             configure('restart-review');t=task('restart-review');rid=api(f"/tasks/{t['id']}/run",'POST')['id']
             end=time.monotonic()+30
@@ -381,6 +428,28 @@ def main():
                     benchmarks.append({'lines':lines,'cold_seconds':round(cold,3),'warm_seconds':round(warm,3),'warm_llm_tokens':r['tokens']})
                     shutil.rmtree(big)
                     print(f'PASS scale {lines}: cold={cold:.2f}s warm={warm:.2f}s',flush=True)
+            configure('unlimited-files')
+            many=source/'unlimited';many.mkdir()
+            expected=set()
+            for i in range(512):
+                name=f'module_{i:04d}_'+('x'*90)+'.py';expected.add(name)
+                (many/name).write_text(f'def entry_{i}():\n    return {i}\n')
+            cfg=api('/settings');cfg['max_files']=1;api('/settings','PUT',cfg)
+            t=task('unlimited-files');t['sources']=[str(many)];api('/tasks','POST',t)
+            rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid,120);assert r['status']=='completed',r
+            seen=set();after=0
+            while True:
+                page=api(f'/runs/{rid}/files?after={after}')
+                seen.update(pathlib.Path(f['path']).name for f in page['files'])
+                if not page['has_more']:break
+                after=page['files'][-1]['id']
+            assert seen==expected,(len(seen),len(expected))
+            coverage=api(f'/runs/{rid}/understanding')['coverage'];assert coverage['read_files']==512 and coverage['complete'],coverage
+            read_names={pathlib.Path(e['path']).name for x in requests if x['model']=='unlimited-files' for d in [json.loads(x['messages'][-1]['content'])] if d.get('phase')=='understanding_batch' for e in d['evidence']}
+            assert read_names==expected, 'Some files were indexed but never read by the model'
+            shutil.rmtree(many)
+            print('PASS 512 long-path files: complete listing and complete source reading despite legacy max_files=1',flush=True)
+            configure('normal')
             if os.environ.get('DOCCRAFT_UI_TEST')=='1':
                 ui_env={**os.environ,'DOCCRAFT_UI_URL':f'http://127.0.0.1:{PORT}','UI_SOURCE_ROOT':str(source),'UI_OUTPUT_ROOT':str(out)}
                 subprocess.run(['node','node_modules/@playwright/test/cli.js','test'],cwd=ROOT/'frontend',env=ui_env,check=True)

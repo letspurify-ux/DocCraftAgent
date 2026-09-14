@@ -133,7 +133,6 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
     let dir = ctx.state.vault.dir.join("snapshots").join(&ctx.id);
     tokio::fs::create_dir_all(&dir).await?;
     let roots = ctx.snapshot.task.sources.clone();
-    let max_files = ctx.snapshot.settings.max_files;
     let token = ctx.cancel.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PathBuf>(32);
     let scan = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -169,7 +168,6 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
     let mut indexed = 0usize;
     let mut excluded = 0usize;
     let mut skipped = 0usize;
-    let mut considered = 0usize;
     let mut cache_hits = 0usize;
     while let Some(path) = tokio::select! { _ = ctx.cancel.cancelled() => { bail!("CANCELLED"); }, value = rx.recv() => value }
     {
@@ -211,10 +209,6 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
             record_file_status(ctx, &path, "excluded", "excluded").await?;
             excluded += 1;
             continue;
-        }
-        considered += 1;
-        if considered > max_files {
-            bail!("Source file count exceeds configured limit after filtering");
         }
         let result = snapshot_file(ctx, &path, &dir).await;
         let (bytes, snapshot_path) = match result {
@@ -453,51 +447,6 @@ async fn worker(ctx: &RunContext, path: &Path, lang: &str) -> Result<parser::Par
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
-pub async fn inventory(ctx: &RunContext) -> Result<String> {
-    let rows = sqlx::query("SELECT path,language,LEFT(detail,150) detail,(SELECT LEFT(GROUP_CONCAT(COALESCE(b.symbols,c.symbols) ORDER BY c.start_line SEPARATOR ' '),600) FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.file_id=files.id) symbols FROM files WHERE run_id=? AND status='indexed' ORDER BY CASE WHEN path LIKE '%/src/%' THEN 0 WHEN path LIKE '%README%' OR path LIKE '%/context.md' OR path LIKE '%/package.json' OR path LIKE '%/Cargo.toml' THEN 1 WHEN path LIKE '%/test/%' OR path LIKE '%/tests/%' THEN 3 ELSE 2 END,path LIMIT 500")
-        .bind(&ctx.id).fetch_all(&ctx.pool).await?;
-    // Show file coverage before optional details so a verbose early file cannot
-    // hide the client or server entry points later in the inventory.
-    let mut entries = Vec::new();
-    for row in rows {
-        ctx.check()?;
-        let path: String = row.try_get("path")?;
-        let lang: String = row.try_get("language")?;
-        let detail: String = row.try_get("detail")?;
-        let symbols: Option<String> = row.try_get("symbols")?;
-        entries.push((path, lang, symbols.unwrap_or_default(), detail));
-    }
-    Ok(inventory_text(entries))
-}
-fn inventory_text(entries: Vec<(String, String, String, String)>) -> String {
-    let mut out = String::from("Indexed file sample:\n");
-    let mut details = Vec::new();
-    for (path, lang, symbols, detail) in entries {
-        if out.len() + path.len() + lang.len() + 8 > 24_000 {
-            break;
-        }
-        out.push_str(&format!("{path} ({lang})\n"));
-        if is_implementation(&path) {
-            details.push((path, symbols, detail));
-        }
-    }
-    out.push_str("\nSampled definition names and relationships (not execution proof):\n");
-    let per = (40_000usize.saturating_sub(out.len()) / details.len().max(1)).max(1);
-    for (path, symbols, detail) in details {
-        let name = Path::new(&path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&path);
-        let hint = format!("{name}: {symbols} · {detail}");
-        let line = crate::editorial::excerpt(&hint, per.saturating_sub(1));
-        if out.len() + line.len() + 1 > 40_000 {
-            break;
-        }
-        out.push_str(&line);
-        out.push('\n');
-    }
-    out
-}
 pub async fn retrieve(ctx: &RunContext, query: &str, max_bytes: usize) -> Result<Vec<Evidence>> {
     let fingerprint = db::load_checkpoint(&ctx.pool, &ctx.id, "index_fingerprint")
         .await?
@@ -704,6 +653,12 @@ pub fn is_implementation(path: &str) -> bool {
                         | "sql"
                         | "mjs"
                         | "cjs"
+                        | "sh"
+                        | "bash"
+                        | "zsh"
+                        | "bat"
+                        | "cmd"
+                        | "ps1"
                 )
             })
 }
@@ -997,39 +952,6 @@ mod tests {
     }
 
     #[test]
-    fn inventory_lists_all_entry_files_before_verbose_details() -> Result<()> {
-        let mut entries = vec![(
-            "/repo/backend/src/agent.js".into(),
-            "javascript".into(),
-            "helper ".repeat(3000),
-            "import ".repeat(5000),
-        )];
-        for i in 0..150 {
-            entries.push((
-                format!("/repo/backend/src/module_{i}.js"),
-                "javascript".into(),
-                "function ".repeat(200),
-                "detail".repeat(100),
-            ));
-        }
-        entries.push((
-            "/repo/frontend/src/App.jsx".into(),
-            "javascript".into(),
-            "App".into(),
-            String::new(),
-        ));
-        let text = inventory_text(entries);
-        assert!(text.len() <= 40_000);
-        assert!(
-            text.find("/repo/frontend/src/App.jsx")
-                .context("client file absent")?
-                < text
-                    .find("Sampled definition")
-                    .context("detail boundary absent")?
-        );
-        Ok(())
-    }
-    #[test]
     fn relevant_implementation_files_precede_repeated_chunks_and_readme() {
         let e = |path: &str| Evidence {
             id: path.into(),
@@ -1057,6 +979,9 @@ mod tests {
             ]
         );
         assert!(!is_implementation("/src/helper.test.ts"));
+        assert!(is_implementation("/project/start_backend.sh"));
+        assert!(is_implementation("/project/start_backend.bat"));
+        assert!(!is_implementation("/project/tests/start.sh"));
     }
     #[test]
     fn explicit_files_keep_relevant_followup_chunks_before_unrelated_files() {

@@ -175,11 +175,7 @@ pub fn validate(s: &Settings) -> Result<()> {
     {
         bail!("Invalid concurrency limits");
     }
-    if s.max_file_bytes == 0
-        || s.max_file_bytes > 100 * 1024 * 1024
-        || s.max_files == 0
-        || s.max_files > 1_000_000
-    {
+    if s.max_file_bytes == 0 || s.max_file_bytes > 100 * 1024 * 1024 {
         bail!("Invalid source size limits");
     }
     let l = &s.llm;

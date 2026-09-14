@@ -65,4 +65,5 @@ export const newTask = (): Task => ({
   max_seconds: 7200,
   max_tokens: 2000000,
   max_cost: 0,
+  preview_outline: false,
 });

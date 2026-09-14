@@ -194,6 +194,15 @@ async fn node(
     anyhow::bail!("SOURCE_UNDERSTANDING: {error}")
 }
 
+fn reduction_work(mut nodes: usize) -> usize {
+    let mut total = 0;
+    while nodes > 1 {
+        total += nodes / 4 + usize::from(nodes % 4 > 1);
+        nodes = nodes.div_ceil(4);
+    }
+    total
+}
+
 pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     if db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:version").await? == Some(json!(3))
         && let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:root").await?
@@ -205,6 +214,19 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
         limit >= 1024,
         "CONTEXT_BUDGET: insufficient input space for whole-source reading"
     );
+    let total_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE run_id=?")
+        .bind(&ctx.id)
+        .fetch_one(&ctx.pool)
+        .await?;
+    ensure!(
+        total_chunks > 0,
+        "No source passages available for whole-source understanding"
+    );
+    ctx.event(
+        "source_progress",
+        json!({"stage":"understanding","title":"전체 소스 구현 읽기","read_batches":0,"read_chunks":0,"total_chunks":total_chunks}),
+    )
+    .await?;
     let mut after = 0u64;
     let mut nodes = vec![];
     let mut group: Vec<Evidence> = vec![];
@@ -235,7 +257,7 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
                             .key,
                     );
                     size = 0;
-                    ctx.event("source_batch", json!({"stage":"understanding","title":"전체 소스 구현 읽기","read_batches":nodes.len(),"read_chunks":chunks_read})).await?;
+                    ctx.event("source_batch", json!({"stage":"understanding","title":"전체 소스 구현 읽기","read_batches":nodes.len(),"read_chunks":chunks_read,"total_chunks":total_chunks})).await?;
                 }
                 size += bytes;
                 group.push(part);
@@ -245,6 +267,7 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     }
     if !group.is_empty() {
         nodes.push(node(ctx, system, group, &[], false).await?.key);
+        ctx.event("source_batch", json!({"stage":"understanding","title":"전체 소스 구현 읽기","read_batches":nodes.len(),"read_chunks":chunks_read,"total_chunks":total_chunks})).await?;
     }
     ensure!(
         !nodes.is_empty(),
@@ -253,10 +276,20 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     let leaves = nodes.clone();
     let batch_count = leaves.len();
     db::checkpoint(&ctx.pool, &ctx.id, "understanding:leaves", &json!(leaves)).await?;
+    let total_summaries = reduction_work(batch_count);
+    let mut completed_summaries = 0usize;
+    if total_summaries > 0 {
+        ctx.event("source_connections", json!({"stage":"understanding","title":"모듈 역할과 흐름 종합","level":1,"completed":0,"total":nodes.len().div_ceil(4),"level_completed":0,"level_total":nodes.len().div_ceil(4),"completed_summaries":0,"total_summaries":total_summaries})).await?;
+    }
     let mut level = 0;
     while nodes.len() > 1 {
         level += 1;
         let mut next = vec![];
+        let level_total = nodes
+            .chunks(4)
+            .filter(|children| children.len() > 1)
+            .count();
+        let mut level_completed = 0usize;
         for children in nodes.chunks(4) {
             if children.len() == 1 {
                 next.push(children[0].clone());
@@ -281,7 +314,9 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
                     .await?
                     .key,
             );
-            ctx.event("source_connections", json!({"stage":"understanding","title":"모듈 역할과 흐름 종합","level":level,"completed":next.len(),"total":nodes.len().div_ceil(4)})).await?;
+            level_completed += 1;
+            completed_summaries += 1;
+            ctx.event("source_connections", json!({"stage":"understanding","title":"모듈 역할과 흐름 종합","level":level,"completed":next.len(),"total":nodes.len().div_ceil(4),"level_completed":level_completed,"level_total":level_total,"completed_summaries":completed_summaries,"total_summaries":total_summaries})).await?;
         }
         nodes = next;
     }
@@ -317,6 +352,15 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reduction_progress_counts_only_summaries_that_are_created() {
+        assert_eq!(reduction_work(1), 0);
+        assert_eq!(reduction_work(2), 1);
+        assert_eq!(reduction_work(5), 2);
+        assert_eq!(reduction_work(16), 5);
+        assert_eq!(reduction_work(900), 300);
+    }
+
     #[test]
     fn exhaustive_segments_preserve_unicode_and_long_lines() {
         let e = Evidence {

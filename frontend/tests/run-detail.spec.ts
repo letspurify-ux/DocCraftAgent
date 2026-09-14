@@ -273,3 +273,25 @@ test("malformed progress event is skipped without breaking later events", async 
   await expect(page.locator(".event-list")).toContainText("healthy");
   expect(errors).toEqual([]);
 });
+
+test("source understanding shows exact chunk progress", async ({ page }) => {
+  await mockWorkspace(
+    page,
+    [{ ...run("run-a", "소스 이해"), status: "running" }],
+    async (route) => route.fulfill({ json: { files: [], has_more: false } }),
+    [
+      "retry: 60000",
+      "event: progress",
+      'data: {"id":2,"kind":"source_batch","data":{"read_chunks":25,"total_chunks":100}}',
+      "",
+      "",
+    ].join("\n"),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "실행 모니터", exact: true }).click();
+  await expect(
+    page.getByRole("progressbar", { name: "전체 소스 읽기" }),
+  ).toHaveAttribute("aria-valuenow", "25");
+  await expect(page.locator(".source-progress")).toContainText("25.0%");
+  await expect(page.locator(".source-progress")).toContainText("25 / 100 청크");
+});

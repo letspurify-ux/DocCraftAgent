@@ -88,7 +88,7 @@ pub fn validate_task(
         || task.max_iterations == 0
         || task.max_iterations > 20
         || task.max_seconds < 30
-        || task.max_seconds > 86400
+        || task.max_seconds > 604_800
         || task.max_tokens < 1024
         || !task.max_cost.is_finite()
         || task.max_cost < 0.0

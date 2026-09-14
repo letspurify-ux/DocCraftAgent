@@ -59,6 +59,36 @@ const labels: Record<string, string> = {
   skipped: "분석 실패",
 };
 const fmt = (n: number) => new Intl.NumberFormat("ko-KR").format(n);
+type ExactProgress = {
+  label: string;
+  current: number;
+  total: number;
+  unit: string;
+};
+const progressValue = (value: unknown) =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+function sourceProgress(events: RunEvent[]): ExactProgress | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (!event.data || typeof event.data !== "object") continue;
+    const data = event.data as Record<string, unknown>;
+    if (event.kind === "source_connections") {
+      const current = progressValue(data.completed_summaries);
+      const total = progressValue(data.total_summaries);
+      if (current !== null && total !== null && total > 0)
+        return { label: "모듈 흐름 종합", current, total, unit: "요약" };
+    }
+    if (event.kind === "source_batch" || event.kind === "source_progress") {
+      const current = progressValue(data.read_chunks);
+      const total = progressValue(data.total_chunks);
+      if (current !== null && total !== null && total > 0)
+        return { label: "전체 소스 읽기", current, total, unit: "청크" };
+    }
+  }
+  return null;
+}
 const localTime = (value: string) => {
   const normalized = /(?:Z|[+-]\d{2}:\d{2})$/i.test(value.trim())
     ? value.trim()
@@ -678,7 +708,11 @@ function TaskEditor({
         className="modal"
         onSubmit={(e) => {
           e.preventDefault();
-          onSave(v);
+          onSave({
+            ...v,
+            include: v.include.filter(Boolean),
+            exclude: v.exclude.filter(Boolean),
+          });
         }}
       >
         <div className="modal-head">
@@ -795,10 +829,14 @@ function TaskEditor({
                 }
               />
             </Field>
-            <Field label="최대 실행 시간 (초)">
+            <Field
+              label="최대 실행 시간 (초)"
+              help="최대 604,800초(7일)까지 설정할 수 있습니다."
+            >
               <input
                 type="number"
                 min="30"
+                max="604800"
                 value={v.max_seconds}
                 onChange={(e) => change("max_seconds", +e.target.value)}
               />
@@ -826,18 +864,14 @@ function TaskEditor({
             <Field label="포함 패턴 (한 줄에 하나)">
               <textarea
                 value={v.include.join("\n")}
-                onChange={(e) =>
-                  change("include", e.target.value.split("\n").filter(Boolean))
-                }
+                onChange={(e) => change("include", e.target.value.split("\n"))}
                 placeholder="**/*.rs"
               />
             </Field>
             <Field label="제외 패턴 (한 줄에 하나)">
               <textarea
                 value={v.exclude.join("\n")}
-                onChange={(e) =>
-                  change("exclude", e.target.value.split("\n").filter(Boolean))
-                }
+                onChange={(e) => change("exclude", e.target.value.split("\n"))}
                 placeholder="**/generated/**"
               />
             </Field>
@@ -1029,6 +1063,10 @@ function RunDetail({
       </div>
     );
   const progress = run.progress;
+  const exactProgress = sourceProgress(events);
+  const progressPercent = exactProgress
+    ? Math.min(100, (exactProgress.current / exactProgress.total) * 100)
+    : null;
   return (
     <section className="panel run-detail">
       <div className="detail-heading">
@@ -1117,6 +1155,28 @@ function RunDetail({
           <strong>${run.cost.toFixed(4)}</strong>
         </div>
       </div>
+      {exactProgress && progressPercent !== null && (
+        <div className="source-progress">
+          <div>
+            <strong>{exactProgress.label}</strong>
+            <span>{progressPercent.toFixed(1)}%</span>
+          </div>
+          <div
+            className="progress-track"
+            role="progressbar"
+            aria-label={exactProgress.label}
+            aria-valuemin={0}
+            aria-valuemax={exactProgress.total}
+            aria-valuenow={exactProgress.current}
+          >
+            <span style={{ width: `${progressPercent}%` }} />
+          </div>
+          <small>
+            {fmt(exactProgress.current)} / {fmt(exactProgress.total)}{" "}
+            {exactProgress.unit}
+          </small>
+        </div>
+      )}
       {run.error && <div className="banner error">{run.error}</div>}
       <Composition run={run} />
       <div className="tabs">

@@ -742,6 +742,45 @@ footer {
   margin-top: 8px;
   font-weight: 500;
 }
+.source-progress {
+  border: 1px solid #e5e9f4;
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin: -12px 0 25px;
+  background: #fbfcff;
+}
+.source-progress > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+}
+.source-progress > div:first-child span {
+  color: #6573d1;
+  font-weight: 600;
+}
+.source-progress small {
+  display: block;
+  margin-top: 7px;
+  color: #8f9bad;
+  font-size: 9px;
+  text-align: right;
+}
+.progress-track {
+  height: 7px;
+  margin-top: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e9edf6;
+}
+.progress-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #7482da;
+  transition: width 180ms ease;
+}
 .tabs {
   display: flex;
   border-bottom: 1px solid #e7ebf3;

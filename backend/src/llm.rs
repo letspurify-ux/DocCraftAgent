@@ -76,6 +76,25 @@ async fn read_response(response: reqwest::Response) -> Result<Value> {
     }
     serde_json::from_slice(&bytes).context("API returned invalid JSON")
 }
+async fn count_tokens(ctx: &RunContext, request: &Value) -> Result<u64> {
+    let c = &ctx.snapshot.settings.llm;
+    tokio::select! {
+        biased;
+        _ = ctx.cancel.cancelled() => bail!("CANCELLED"),
+        _ = ctx.state.shutdown.cancelled() => bail!("CANCELLED"),
+        result = async {
+            let response = ctx.client.post(&c.token_count_url)
+                .bearer_auth(&c.api_key).json(request).send().await?;
+            if !response.status().is_success() {
+                bail!("Token counting endpoint failed");
+            }
+            read_response(response).await?.get("input_tokens")
+                .and_then(Value::as_u64)
+                .context("Counting endpoint must return input_tokens")
+        } => result,
+    }
+}
+
 fn retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
@@ -93,21 +112,7 @@ pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<St
         return Ok(row.try_get("data")?);
     }
     let estimated = if c.token_mode == "server" {
-        let response = ctx
-            .client
-            .post(&c.token_count_url)
-            .bearer_auth(&c.api_key)
-            .json(&request)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            bail!("Token counting endpoint failed");
-        }
-        read_response(response)
-            .await?
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .context("Counting endpoint must return input_tokens")?
+        count_tokens(ctx, &request).await?
     } else {
         budget::estimate(&request)?
     };
@@ -122,13 +127,12 @@ pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<St
     }
     for attempt in 0..=c.retries {
         ctx.check()?;
-        rate_limit(ctx, reservation).await?;
+        let permit = request_slot(ctx, reservation).await?;
         ctx.reserve(
             reservation,
             (b.input as f64 * c.input_price + b.output as f64 * c.output_price) / 1_000_000.0,
         )?;
         ctx.event("llm_request",json!({"stage":"llm","attempt":attempt+1,"budget":b,"reserved_total":ctx.reserved_tokens.load(std::sync::atomic::Ordering::Relaxed)})).await?;
-        let permit = tokio::select! { _ = ctx.cancel.cancelled() => { bail!("CANCELLED"); }, p=ctx.state.llm_slots.acquire() => p? };
         let start = Instant::now();
         let response = tokio::select! {
             _ = ctx.cancel.cancelled() => { bail!("CANCELLED"); },
@@ -330,8 +334,22 @@ pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<St
 async fn cancellable_delay(ctx: &RunContext, d: Duration) -> Result<()> {
     tokio::select! {_=ctx.cancel.cancelled()=>bail!("CANCELLED"),_=tokio::time::sleep(d)=>Ok(())}
 }
+async fn request_slot(ctx: &RunContext, tokens: u64) -> Result<tokio::sync::SemaphorePermit<'_>> {
+    // Time spent queued for concurrency must not age or consume the rate window.
+    // Keep the permit through rate limiting, accounting and the HTTP exchange.
+    let permit = tokio::select! {
+        biased;
+        _ = ctx.cancel.cancelled() => bail!("CANCELLED"),
+        _ = ctx.state.shutdown.cancelled() => bail!("CANCELLED"),
+        p = ctx.state.llm_slots.acquire() => p?,
+    };
+    rate_limit(ctx, tokens).await?;
+    Ok(permit)
+}
+
 async fn rate_limit(ctx: &RunContext, tokens: u64) -> Result<()> {
     loop {
+        ctx.check()?;
         let wait = {
             let mut q = ctx.state.rate.lock().await;
             let now = Instant::now();
@@ -469,6 +487,108 @@ fn extract_json_object(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod quota_tests {
     use super::*;
+    #[tokio::test]
+    async fn rate_wait_cancellation_releases_the_concurrency_slot() -> Result<()> {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://root@127.0.0.1/doccraft_agent_test")?;
+        let mut run = crate::test_support::TestRun::new(pool)?;
+        run.ctx.snapshot.settings.llm.rpm = 1;
+        let first = request_slot(&run.ctx, 1024).await?;
+        assert_eq!(run.ctx.state.rate.lock().await.len(), 1);
+        drop(first);
+        let slots = run.ctx.state.llm_slots.available_permits();
+        let pending = request_slot(&run.ctx, 1024);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut pending)
+                .await
+                .is_err()
+        );
+        assert_eq!(run.ctx.state.llm_slots.available_permits(), slots - 1);
+        run.ctx.cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await?
+                .is_err()
+        );
+        assert_eq!(run.ctx.state.llm_slots.available_permits(), slots);
+        assert_eq!(run.ctx.state.rate.lock().await.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn waiting_for_concurrency_does_not_consume_rate_quota() -> Result<()> {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://root@127.0.0.1/doccraft_agent_test")?;
+        let run = crate::test_support::TestRun::new(pool)?;
+        let held = run
+            .ctx
+            .state
+            .llm_slots
+            .acquire_many(run.ctx.snapshot.settings.llm.concurrency as u32)
+            .await?;
+        let pending = request_slot(&run.ctx, 1024);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut pending)
+                .await
+                .is_err()
+        );
+        assert!(
+            run.ctx.state.rate.lock().await.is_empty(),
+            "Unsent requests must not enter the rate window while waiting for concurrency"
+        );
+        run.ctx.cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await?
+            .err()
+            .context("Queued request should be cancelled")?;
+        assert_eq!(error.to_string(), "CANCELLED");
+        assert!(run.ctx.state.rate.lock().await.is_empty());
+        drop(held);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_counting_cancels_while_the_server_is_stalled() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for send_headers in [false, true] {
+            let pool = sqlx::mysql::MySqlPoolOptions::new()
+                .connect_lazy("mysql://root@127.0.0.1/doccraft_agent_test")?;
+            let mut run = crate::test_support::TestRun::new(pool)?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            run.ctx.snapshot.settings.llm.token_count_url =
+                format!("http://{}", listener.local_addr()?);
+            let cancel = run.ctx.cancel.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut request = [0; 4096];
+                anyhow::ensure!(socket.read(&mut request).await? > 0, "Missing request");
+                if send_headers {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                        .await?;
+                }
+                cancel.cancel();
+                let mut byte = [0];
+                let _ = socket.read(&mut byte).await;
+                Ok::<_, anyhow::Error>(())
+            });
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), count_tokens(&run.ctx, &json!({})))
+                    .await;
+            server.abort();
+            assert_eq!(
+                result?
+                    .err()
+                    .context("Counting must be cancelled")?
+                    .to_string(),
+                "CANCELLED"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn exhausted_quota_is_distinct_from_transient_rate_limits() {
         assert!(reasoning_dominated(8192, Some(7712)));

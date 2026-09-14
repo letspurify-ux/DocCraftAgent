@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const VERSION: &str = "parser-v1";
+pub const VERSION: &str = "parser-v2";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Parsed {
     pub language: String,
@@ -127,7 +127,11 @@ fn chunk_text(content: &str, boundaries: &[usize], names: &[(usize, String)]) ->
     let mut start = 0;
     let mut line = 1u32;
     while start < content.len() {
-        let max_end = start.saturating_add(12_000).min(content.len());
+        let mut max_end = start.saturating_add(12_000).min(content.len());
+        // Normalize the byte limit before searching the slice for a line boundary.
+        while !content.is_char_boundary(max_end) {
+            max_end -= 1;
+        }
         let mut end = max_end;
         if end < content.len() {
             if let Some(boundary) = boundaries
@@ -170,6 +174,22 @@ fn chunk_text(content: &str, boundaries: &[usize], names: &[(usize, String)]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unicode_byte_limit_preserves_available_line_boundary() {
+        let first_line = format!("{}\n", "a".repeat(11989));
+        let text = format!("{first_line}{}", "가".repeat(10));
+        let chunks = chunk_text(&text, &[0], &[]);
+        assert_eq!(chunks[0].content, first_line);
+        assert_eq!((chunks[0].start, chunks[0].end), (1, 1));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|c| c.content.as_str())
+                .collect::<String>(),
+            text
+        );
+    }
+
     #[test]
     fn long_unicode_line_is_lossless() {
         let text = "한글🦀".repeat(9000);

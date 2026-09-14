@@ -51,6 +51,29 @@ fn patterns(values: &[String]) -> Result<GlobSet> {
     }
     Ok(b.build()?)
 }
+fn matches_filters(
+    path: &Path,
+    roots: &[String],
+    includes: &GlobSet,
+    excludes: &GlobSet,
+    include_all: bool,
+) -> bool {
+    let mut names = vec![path.to_string_lossy().replace('\\', "/")];
+    for root in roots {
+        if let Ok(relative) = path.strip_prefix(root) {
+            // A source may be a single file, in which case stripping its root is empty.
+            let relative = if relative.as_os_str().is_empty() {
+                Path::new(path.file_name().unwrap_or_default())
+            } else {
+                relative
+            };
+            names.push(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    !names.iter().any(|name| excludes.is_match(name))
+        && (include_all || names.iter().any(|name| includes.is_match(name)))
+}
+
 pub fn validate_task(
     task: &crate::model::TaskConfig,
     settings: &crate::model::Settings,
@@ -176,21 +199,14 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
             || name == "settings.enc"
             || path == target
             || path.starts_with(&local);
-        let relative = ctx
-            .snapshot
-            .task
-            .sources
-            .iter()
-            .filter_map(|r| path.strip_prefix(r).ok())
-            .next()
-            .unwrap_or(&path);
-        let relative = relative.to_string_lossy().replace('\\', "/");
         if builtin
-            || excludes.is_match(&normalized)
-            || excludes.is_match(&relative)
-            || (!ctx.snapshot.task.include.is_empty()
-                && !includes.is_match(&relative)
-                && !includes.is_match(&normalized))
+            || !matches_filters(
+                &path,
+                &ctx.snapshot.task.sources,
+                &includes,
+                &excludes,
+                ctx.snapshot.task.include.is_empty(),
+            )
         {
             record_file_status(ctx, &path, "excluded", "excluded").await?;
             excluded += 1;
@@ -387,9 +403,9 @@ async fn snapshot_file(ctx: &RunContext, path: &Path, dir: &Path) -> Result<(Vec
             continue;
         }
         let snapshot = dir.join(hash(&bytes));
-        if !snapshot.exists() {
-            tokio::fs::write(&snapshot, &bytes).await?;
-        }
+        // A previous attempt may have stopped halfway through writing this hash path.
+        // Always replace it atomically so workers only receive the complete source.
+        crate::config::atomic_private(&snapshot, &bytes)?;
         return Ok((bytes, snapshot));
     }
     bail!("File changed during snapshot after three attempts")
@@ -943,6 +959,43 @@ mod tests {
         crate::test_support::close(pool).await?;
         result
     }
+    #[tokio::test]
+    async fn incomplete_snapshot_is_replaced_before_parsing() -> Result<()> {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://root@127.0.0.1/doccraft_agent_test")?;
+        let run = crate::test_support::TestRun::new(pool)?;
+        let path = Path::new(&run.ctx.snapshot.task.sources[0]);
+        let bytes = std::fs::read(path)?;
+        let dir = tempfile::tempdir()?;
+        let snapshot = dir.path().join(hash(&bytes));
+        std::fs::write(&snapshot, &bytes[..3])?;
+        let (_, actual) = snapshot_file(&run.ctx, path, dir.path()).await?;
+        assert_eq!(std::fs::read(actual)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn filters_match_single_files_and_all_overlapping_roots() -> Result<()> {
+        let path = Path::new("/project/src/main.rs");
+        let includes = patterns(&["main.rs".into()])?;
+        let empty = patterns(&[])?;
+        assert!(matches_filters(
+            path,
+            &["/project/src/main.rs".into()],
+            &includes,
+            &empty,
+            false
+        ));
+        for roots in [
+            vec!["/project".into(), "/project/src".into()],
+            vec!["/project/src".into(), "/project".into()],
+        ] {
+            assert!(matches_filters(path, &roots, &includes, &empty, false));
+            assert!(!matches_filters(path, &roots, &empty, &includes, true));
+        }
+        Ok(())
+    }
+
     #[test]
     fn inventory_lists_all_entry_files_before_verbose_details() -> Result<()> {
         let mut entries = vec![(

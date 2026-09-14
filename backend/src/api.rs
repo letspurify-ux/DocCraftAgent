@@ -706,15 +706,7 @@ async fn events(
     ApiError,
 > {
     let pool = s.db().await?;
-    let mut after = q
-        .after
-        .or_else(|| {
-            headers
-                .get("last-event-id")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(0);
+    let mut after = event_cursor(q.after, &headers);
     let stream = async_stream::stream! {
         let mut idle_polls = 0u8;
         loop{
@@ -735,8 +727,24 @@ async fn events(
                 idle_polls = 0;
                 match sqlx::query_scalar::<_,String>("SELECT status FROM runs WHERE id=?").bind(&id).fetch_optional(&pool).await {
                     Ok(Some(status)) if stream_terminal(&status) => {
-                        yield Ok(Event::default().event("stream-end").data("terminal"));
-                        break;
+                        // Completion may commit after the first event query. Drain its
+                        // events before closing; retry on DB failure without losing the cursor.
+                        match db::events(&pool, &id, after).await {
+                            Ok(tail) if tail.is_empty() => {
+                                yield Ok(Event::default().event("stream-end").data("terminal"));
+                                break;
+                            },
+                            Ok(tail) => {
+                                for e in tail {
+                                    after = e.id;
+                                    if let Ok(event) = Event::default().id(e.id.to_string()).event("progress").json_data(e) {
+                                        yield Ok(event);
+                                    }
+                                }
+                                continue;
+                            },
+                            Err(_) => { yield Ok(Event::default().event("connection").data("database temporarily unavailable")); }
+                        }
                     },
                     Ok(None) => {
                         yield Ok(Event::default().event("stream-end").data("not-found"));
@@ -753,6 +761,15 @@ async fn events(
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))))
 }
+fn event_cursor(after: Option<u64>, headers: &HeaderMap) -> u64 {
+    headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .or(after)
+        .unwrap_or(0)
+}
+
 fn stream_terminal(status: &str) -> bool {
     !["queued", "running", "cancelling", "interrupted"].contains(&status)
 }
@@ -1041,6 +1058,53 @@ mod origin_tests {
 
         let response = ApiError(anyhow::anyhow!("Invalid task configuration")).into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn reconnect_cursor_uses_last_received_event_before_initial_query() -> Result<()> {
+        let mut headers = HeaderMap::new();
+        assert_eq!(event_cursor(Some(10), &headers), 10);
+        headers.insert("last-event-id", "25".parse()?);
+        assert_eq!(event_cursor(Some(10), &headers), 25);
+        headers.insert("last-event-id", "invalid".parse()?);
+        assert_eq!(event_cursor(Some(10), &headers), 10);
+        assert_eq!(event_cursor(None, &headers), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DOCCRAFT_TEST_DB_PORT pointing to a disposable MariaDB"]
+    async fn event_stream_drains_events_committed_during_status_check() -> Result<()> {
+        use futures_util::StreamExt;
+        let pool = crate::test_support::pool(3).await?;
+        let run = crate::test_support::TestRun::new(pool.clone())?;
+        let result: Result<()> = async {
+            sqlx::query("INSERT INTO runs(id,task_id,status,snapshot,progress) VALUES(?,?,'running','{}','{}')")
+                .bind(&run.ctx.id).bind(&run.ctx.snapshot.task.id).execute(&pool).await?;
+            sqlx::query("INSERT INTO events(run_id,kind,data) VALUES(?,'started','{}')")
+                .bind(&run.ctx.id).execute(&pool).await?;
+            let response = events(State(run.ctx.state.clone()), Path(run.ctx.id.clone()),
+                Query(Cursor { after: None }), HeaderMap::new()).await.map_err(|e| e.0)?;
+            let mut body = response.into_response().into_body().into_data_stream();
+            let first = body.next().await.context("Missing initial event")??;
+            assert!(String::from_utf8_lossy(&first).contains("started"));
+            let mut tx = pool.begin().await?;
+            sqlx::query("INSERT INTO events(run_id,kind,data) VALUES(?,'terminal','{}')")
+                .bind(&run.ctx.id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE runs SET status='completed' WHERE id=?")
+                .bind(&run.ctx.id).execute(&mut *tx).await?;
+            tx.commit().await?;
+            let last = tokio::time::timeout(Duration::from_secs(2), body.next()).await?
+                .context("Missing final event")??;
+            let last = String::from_utf8_lossy(&last);
+            assert!(last.contains("event: progress") && last.contains("terminal"), "{last}");
+            let end = tokio::time::timeout(Duration::from_secs(2), body.next()).await?
+                .context("Missing stream end")??;
+            assert!(String::from_utf8_lossy(&end).contains("stream-end"));
+            Ok(())
+        }.await;
+        crate::test_support::close(pool).await?;
+        result
     }
 
     #[test]

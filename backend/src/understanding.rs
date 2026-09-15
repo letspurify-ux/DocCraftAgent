@@ -11,10 +11,16 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const READ: &str = "Read source evidence before planning, independently of any future documentation purpose. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Read ALL supplied passages. Explain module responsibilities, entry points, inputs, conditions, decisions, state/data changes, outputs, consumers and errors/cancellation/lifecycle. Preserve distinct public workflows, important branches, and producer/consumer contracts. Imports and call names are navigation candidates, not proof of execution. Mark unresolved connections. Runtime observations require implementation passages; tests/docs describe context only. Use at most 12 findings, observations under 1000 characters, at most 6 evidence IDs each, and 8 uncertainties. Do not design a table of contents or force unrelated flows into one sequence. Use the requested language.";
 const REDUCE: &str = "Read source evidence before planning. Integrate ALL supplied child summaries into a higher-level source overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve distinct workflows, module contracts, state changes, result consumers, conditional/error/cancel branches and unresolved cross-module links. Child findings have already been checked against their original passages. Preserve their important workflows and source anchors even when those passages are not repeated in this bounded request. previously_read anchors identify those originals; they support carrying the child observation, not inventing new facts. Use newly supplied original evidence to establish NEW connections; mark any other cross-module synthesis as uncertain. Never invent an execution order to join independent workflows. Do not assume a missing excerpt is absent from the project. Include at most 12 findings, each observation under 1000 characters and with 1-6 supplied evidence IDs, and at most 8 uncertainties. Do not produce a document outline. Use the requested language.";
+
+// Keep summaries compact for downstream planning while preserving distinct
+// workflows and their supporting observations.
+const SUMMARY_MAX_BYTES: usize = 48_000;
+// Leave room in the 200k-token model context for output, metadata and retries.
+const SOURCE_INPUT_MAX_BYTES: usize = 96_000;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -63,7 +69,7 @@ fn salvage(mut brief: SourceBrief, evidence: &[Evidence]) -> SourceBrief {
         .collect();
     brief.uncertainties.push("일부 소스 관찰은 근거 검증을 통과하지 못해 제외되었습니다. 해당 분석 묶음의 검증 오류와 원문을 재검토해야 합니다.".into());
     brief.followup_queries = vec![];
-    while serde_json::to_vec(&brief).map_or(true, |v| v.len() > 18_000)
+    while serde_json::to_vec(&brief).map_or(true, |v| v.len() > SUMMARY_MAX_BYTES)
         && !brief.findings.is_empty()
     {
         brief.findings.pop();
@@ -102,7 +108,7 @@ fn input_limit(ctx: &RunContext) -> usize {
         .saturating_mul(100usize.saturating_sub(l.safety_percent as usize))
         / 100)
         .saturating_sub(l.max_output_tokens as usize + 20_000)
-        .min(36_000)
+        .min(SOURCE_INPUT_MAX_BYTES)
 }
 
 /// Every byte belongs to one segment, including long lines and Unicode.
@@ -233,8 +239,8 @@ async fn node(
             };
             let validation = validate_brief(&mut brief, &available, true).and_then(|_| {
                 ensure!(
-                    serde_json::to_vec(&brief)?.len() <= 18_000,
-                    "Source summary exceeds 18000 bytes; compress observations"
+                    serde_json::to_vec(&brief)?.len() <= SUMMARY_MAX_BYTES,
+                    "Source summary exceeds 48000 bytes; compress observations"
                 );
                 if children.is_empty() {
                     ensure!(available.iter().all(|e| brief.findings.iter().any(|f|f.evidence_ids.contains(&e.id))),
@@ -364,26 +370,74 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     )
     .await?;
     let mut after = 0u64;
-    let mut nodes = vec![];
-    let mut group: Vec<Evidence> = vec![];
-    let mut size = 0;
-    let mut chunks_read = 0;
+    let mut source_chunks = Vec::<(u64, crate::graph::ChunkSpan)>::new();
     loop {
         ctx.check()?;
-        let rows = sqlx::query("SELECT c.id,c.path,c.start_line,c.end_line,COALESCE(b.content,c.content) content FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.run_id=? AND c.id>? ORDER BY c.id LIMIT 32")
+        let rows = sqlx::query("SELECT c.id,c.path,c.start_line,c.end_line FROM chunks c WHERE c.run_id=? AND c.id>? ORDER BY c.id LIMIT 64")
             .bind(&ctx.id).bind(after).fetch_all(&ctx.pool).await?;
         if rows.is_empty() {
             break;
         }
         for row in rows {
-            after = row.try_get("id")?;
-            let e = Evidence {
-                id: String::new(),
-                path: row.try_get("path")?,
-                start: row.try_get("start_line")?,
-                end: row.try_get("end_line")?,
-                content: row.try_get("content")?,
-            };
+            let id: u64 = row.try_get("id")?;
+            after = id;
+            source_chunks.push((
+                id,
+                crate::graph::ChunkSpan {
+                    path: row.try_get("path")?,
+                    start: row.try_get("start_line")?,
+                    end: row.try_get("end_line")?,
+                },
+            ));
+        }
+    }
+    let spans = source_chunks
+        .iter()
+        .map(|(_, span)| span.clone())
+        .collect::<Vec<_>>();
+    let order = crate::graph::order_chunks(ctx, &spans).await?;
+    ctx.event(
+        "source_order",
+        json!({"stage":"understanding","title":"코드 그래프 기반 읽기 순서 구성","chunks":source_chunks.len(),"graph_ordered":true}),
+    )
+    .await?;
+    let mut nodes = vec![];
+    let mut group: Vec<Evidence> = vec![];
+    let mut size = 0;
+    let mut chunks_read = 0;
+    for indices in order.chunks(64) {
+        ctx.check()?;
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "SELECT c.id,c.path,c.start_line,c.end_line,COALESCE(b.content,c.content) content FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.run_id=",
+        );
+        query.push_bind(&ctx.id).push(" AND c.id IN (");
+        for (position, index) in indices.iter().enumerate() {
+            if position > 0 {
+                query.push(", ");
+            }
+            query.push_bind(source_chunks[*index].0);
+        }
+        query.push(")");
+        let rows = query.build().fetch_all(&ctx.pool).await?;
+        let mut evidence_by_id = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id: u64 = row.try_get("id")?;
+            evidence_by_id.insert(
+                id,
+                Evidence {
+                    id: String::new(),
+                    path: row.try_get("path")?,
+                    start: row.try_get("start_line")?,
+                    end: row.try_get("end_line")?,
+                    content: row.try_get("content")?,
+                },
+            );
+        }
+        for index in indices {
+            let id = source_chunks[*index].0;
+            let e = evidence_by_id
+                .remove(&id)
+                .ok_or_else(|| anyhow::anyhow!("Missing source chunk {id}"))?;
             for part in segments(&e, limit.saturating_sub(e.path.len() + 512)) {
                 let bytes = part.content.len() + part.path.len() + 256;
                 if (size + bytes > limit || group.len() >= 72) && !group.is_empty() {

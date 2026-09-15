@@ -131,6 +131,15 @@ pub struct Target {
     pub score: i64,
 }
 
+/// The source-reading pass uses this small, immutable view to order chunks
+/// without exposing database rows or source contents to the graph module.
+#[derive(Clone)]
+pub struct ChunkSpan {
+    pub path: String,
+    pub start: u32,
+    pub end: u32,
+}
+
 pub fn neighborhood(files: &[FileGraph], query: &str) -> Vec<Target> {
     let terms: HashSet<_> = source::search_terms(query).into_iter().collect();
     let mut by_name: HashMap<&str, Vec<&Symbol>> = HashMap::new();
@@ -204,6 +213,156 @@ pub async fn targets(ctx: &RunContext, query: &str) -> Result<Vec<Target>> {
     Ok(neighborhood(&all(ctx).await?, query))
 }
 
+fn graph_order(adjacency: &[HashMap<usize, u32>]) -> Vec<usize> {
+    let mut seen = vec![false; adjacency.len()];
+    let mut order = Vec::with_capacity(adjacency.len());
+    for seed in 0..adjacency.len() {
+        if seen[seed] {
+            continue;
+        }
+        let mut pending = vec![seed];
+        seen[seed] = true;
+        while let Some(current) = pending.pop() {
+            order.push(current);
+            let mut neighbors: Vec<_> = adjacency[current].iter().collect();
+            neighbors.sort_by(|(left, left_weight), (right, right_weight)| {
+                left_weight
+                    .cmp(right_weight)
+                    .reverse()
+                    .then_with(|| left.cmp(right))
+            });
+            // `pending` is a stack; push the strongest neighbor last so it is
+            // visited first while preserving deterministic tie-breaking.
+            for (neighbor, _) in neighbors.into_iter().rev() {
+                if !seen[*neighbor] {
+                    seen[*neighbor] = true;
+                    pending.push(*neighbor);
+                }
+            }
+        }
+    }
+    order
+}
+
+fn link(adjacency: &mut [HashMap<usize, u32>], left: usize, right: usize, weight: u32) {
+    if left == right {
+        return;
+    }
+    *adjacency[left].entry(right).or_default() += weight;
+    *adjacency[right].entry(left).or_default() += weight;
+}
+
+/// Order whole-source chunks so graph-connected symbols are read together.
+///
+/// This is deliberately an ordering operation, not a filter: every supplied
+/// chunk is returned exactly once. The graph is syntax-only, so call targets
+/// are used as navigation hints and never as proof of runtime execution.
+pub async fn order_chunks(ctx: &RunContext, chunks: &[ChunkSpan]) -> Result<Vec<usize>> {
+    if chunks.len() < 2 {
+        return Ok((0..chunks.len()).collect());
+    }
+    let files = all(ctx).await?;
+    let mut by_path = HashMap::<String, Vec<usize>>::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        by_path.entry(chunk.path.clone()).or_default().push(index);
+    }
+    let mut adjacency = vec![HashMap::<usize, u32>::new(); chunks.len()];
+    let mut symbol_chunks = HashMap::<String, Vec<usize>>::new();
+    let mut symbols = HashMap::<String, (&str, &Symbol)>::new();
+    let mut names = HashMap::<String, Vec<String>>::new();
+
+    for file in &files {
+        let Some(file_chunks) = by_path.get(&file.path) else {
+            continue;
+        };
+        for symbol in file.graph.symbols.iter().filter(|s| s.kind != "file") {
+            symbols.insert(symbol.id.clone(), (file.path.as_str(), symbol));
+            names
+                .entry(symbol.name.to_lowercase())
+                .or_default()
+                .push(symbol.id.clone());
+            let covered: Vec<_> = file_chunks
+                .iter()
+                .copied()
+                .filter(|index| {
+                    symbol
+                        .span
+                        .overlaps(chunks[*index].start, chunks[*index].end)
+                })
+                .collect();
+            if !covered.is_empty() {
+                symbol_chunks.insert(symbol.id.clone(), covered.clone());
+                if let Some(parent) = &symbol.parent
+                    && let Some(parent_chunks) = symbol_chunks.get(parent).cloned()
+                {
+                    for left in &covered {
+                        for right in &parent_chunks {
+                            link(&mut adjacency, *left, *right, 3);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Parent symbols may have appeared after their children in a file's graph,
+    // so connect the remaining parent/child pairs in a second pass.
+    for (_, (_, symbol)) in &symbols {
+        let Some(parent) = &symbol.parent else {
+            continue;
+        };
+        let (Some(children), Some(parents)) =
+            (symbol_chunks.get(&symbol.id), symbol_chunks.get(parent))
+        else {
+            continue;
+        };
+        for left in children {
+            for right in parents {
+                link(&mut adjacency, *left, *right, 3);
+            }
+        }
+    }
+
+    for file in &files {
+        for edge in file.graph.edges.iter().filter(|e| e.kind == "calls") {
+            let source_chunks = symbol_chunks.get(&edge.source).cloned().unwrap_or_else(|| {
+                by_path
+                    .get(&file.path)
+                    .into_iter()
+                    .flat_map(|items| items.iter().copied())
+                    .filter(|index| edge.span.overlaps(chunks[*index].start, chunks[*index].end))
+                    .collect()
+            });
+            if source_chunks.is_empty() {
+                continue;
+            }
+            let target = edge
+                .target
+                .rsplit([':', '.'])
+                .next()
+                .unwrap_or(&edge.target)
+                .to_lowercase();
+            let Some(target_ids) = names.get(&target) else {
+                continue;
+            };
+            // Ambiguous syntax names remain useful as local grouping hints, but
+            // cap fan-out so one common name cannot join the entire repository.
+            for target_id in target_ids.iter().take(8) {
+                let Some(target_chunks) = symbol_chunks.get(target_id) else {
+                    continue;
+                };
+                for left in &source_chunks {
+                    for right in target_chunks {
+                        link(&mut adjacency, *left, *right, 5);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(graph_order(&adjacency))
+}
+
 /// Whole records only; omitted records remain in the persisted graph and audit.
 pub async fn context(ctx: &RunContext, evidence: &[Evidence], max: usize) -> Result<Value> {
     let mut paths: Vec<_> = evidence.iter().map(|e| &e.path).collect();
@@ -262,6 +421,31 @@ pub async fn context(ctx: &RunContext, evidence: &[Evidence], max: usize) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_order_keeps_connected_chunks_adjacent_and_preserves_isolates() {
+        let mut adjacency = vec![
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        ];
+        link(&mut adjacency, 0, 2, 5);
+        link(&mut adjacency, 2, 3, 3);
+        let order = graph_order(&adjacency);
+        let positions: HashMap<_, _> = order
+            .iter()
+            .enumerate()
+            .map(|(position, index)| (*index, position))
+            .collect();
+        assert!(positions[&2].abs_diff(positions[&0]) == 1);
+        assert!(positions[&3].abs_diff(positions[&2]) == 1);
+        assert_eq!(
+            order.iter().copied().collect::<HashSet<_>>(),
+            (0..4).collect()
+        );
+    }
+
     #[test]
     fn one_hop_retrieval_reaches_callers_and_callees_without_cycle_expansion() -> Result<()> {
         let a = crate::code_graph::parse_test(

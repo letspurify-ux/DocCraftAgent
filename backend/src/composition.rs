@@ -30,6 +30,7 @@ pub async fn understanding(
     let pool = s.db().await?;
     let coverage = db::load_checkpoint(&pool, &id, "understanding:coverage").await?;
     let root = db::load_checkpoint(&pool, &id, "understanding:root").await?;
+    let purpose = db::load_checkpoint(&pool, &id, "source_understanding").await?;
     let rows=sqlx::query("SELECT step,data FROM checkpoints WHERE run_id=? AND step LIKE 'understanding:node:%' AND step>? ORDER BY step LIMIT 21")
         .bind(&id).bind(page.after.unwrap_or_default()).fetch_all(&pool).await?;
     let has_more = rows.len() > 20;
@@ -45,7 +46,7 @@ pub async fn understanding(
     }
     let counts=sqlx::query("SELECT COUNT(*) total,SUM(status='indexed') indexed,SUM(status='excluded') excluded,SUM(status='skipped') skipped FROM files WHERE run_id=?").bind(&id).fetch_one(&pool).await?;
     Ok(Json(
-        json!({"coverage":coverage,"overview":root.and_then(|v|v.pointer("/discovery/brief").cloned()),"batches":nodes,"next_cursor":cursor,"has_more":has_more,"total_files":counts.try_get::<i64,_>("total")?}),
+        json!({"coverage":coverage,"questions":purpose.and_then(|v|v.get("questions").cloned()).unwrap_or(json!([])),"overview":root.and_then(|v|v.pointer("/discovery/brief").cloned()),"batches":nodes,"next_cursor":cursor,"has_more":has_more,"total_files":counts.try_get::<i64,_>("total")?}),
     ))
 }
 #[utoipa::path(get,path="/api/v1/runs/{id}/outline",params(("id"=String,Path)),responses((status=200,body=Value)))]

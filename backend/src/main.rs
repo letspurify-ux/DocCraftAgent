@@ -11,6 +11,7 @@ mod model;
 mod parser;
 mod planning;
 mod publish;
+mod purpose;
 mod runner;
 mod section_output;
 mod source;

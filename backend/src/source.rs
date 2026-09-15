@@ -662,7 +662,7 @@ pub fn is_implementation(path: &str) -> bool {
                 )
             })
 }
-fn search_terms(query: &str) -> Vec<String> {
+pub(crate) fn search_terms(query: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     query
         .split(|c: char| !c.is_alphanumeric() && c != '_')

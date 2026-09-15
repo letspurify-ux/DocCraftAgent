@@ -43,6 +43,12 @@ type Understanding = {
     read_batches: number;
   };
   overview?: Brief;
+  questions?: {
+    requirement_id: string;
+    question: string;
+    brief: Brief;
+    validation_unresolved: boolean;
+  }[];
   batches: {
     id: string;
     files: string[];
@@ -222,6 +228,22 @@ export function Composition({ run }: { run: Run }) {
             </p>
           )}
           {source.overview && <BriefView brief={source.overview} />}
+          {!!source.questions?.length && (
+            <div>
+              <h4>문서 목적별 질문과 근거</h4>
+              {source.questions.map((question) => (
+                <details key={question.requirement_id}>
+                  <summary>{question.question}</summary>
+                  {question.validation_unresolved && (
+                    <p className="banner">
+                      추가 분석을 검증하지 못해 보존한 소스 관찰로 진행했습니다.
+                    </p>
+                  )}
+                  <BriefView brief={question.brief} />
+                </details>
+              ))}
+            </div>
+          )}
           {source.batches.map((batch) => (
             <details key={batch.id}>
               <summary>

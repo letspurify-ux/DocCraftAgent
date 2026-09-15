@@ -260,6 +260,7 @@ async fn node(
                     files,
                     children: children.iter().map(|n| n.key.clone()).collect(),
                     discovery: Discovery {
+                        questions: vec![],
                         evidence: available
                             .into_iter()
                             .filter(|e| {
@@ -490,6 +491,7 @@ mod tests {
             files: vec![evidence.path.clone()],
             children: vec![],
             discovery: Discovery {
+                questions: vec![],
                 brief,
                 evidence: vec![evidence.clone()],
             },

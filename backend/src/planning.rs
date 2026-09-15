@@ -9,11 +9,11 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-const DISCOVERY: &str = "Read source evidence before planning the document. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[string]}. Do not produce a table of contents yet. Infer the intended reader and task from purpose, then read actual source passages to identify the relevant entry, prerequisites, actors, inputs, processing, persisted or returned results, consumer, and important alternative/error paths. Adapt to the supplied project; do not force a web request model onto unrelated code. Each finding must explain a concrete connection or behavior, including conditions and outputs, rather than list symbols. Use at most 12 findings, each with a short topic and observation (maximum 1200 characters), and 1-6 supplied evidence IDs. Runtime findings require implementation evidence; filenames, imports, README, comments and tests alone do not prove execution. Context findings can describe documented setup or intended usage, explicitly distinguished from observed implementation. Inventory is only a sampled navigation aid. Do not infer a call order from names or treat separate alternatives as consecutive steps. Mark missing links in uncertainties (at most 8). Request at most 3 focused followup_queries naming observed files/symbols or unresolved connections most important to the reader; prefer finding missing entry/result/branch evidence over more detail on already understood helpers. Do not invent identifiers. On the final pass, return no followup_queries and retain unresolved links in uncertainties. Carry relevant findings from verified_overview using its previously_read source anchors; those observations were checked against the originals in the exhaustive reading. Use passages in THIS request for new claims and connections. Do not treat omitted excerpts as missing project coverage; prior gaps are research questions, not facts. Use the requested language for observations and uncertainties. Empty findings are invalid; if only contextual evidence exists, say so without inventing runtime behavior.";
+const PLAN: &str = "Return JSON {sections:[{title:string,query:string,reader_question:string,handoff:string,diagrams:[string],prerequisite_titles:[string],evidence_ids:[string],key_points:[string],out_of_scope:[string]}],requirement_owners:[{requirement_id:string,section_title:string}],reader_goal:string,storyline:string,terminology:[string]}. Design one coherent document for the intended reader using the source_brief AND actual evidence read before this plan. Recorded uncertainties are research questions to resolve against newly supplied passages, not confirmed defects. question_analysis preserves findings and unresolved gaps separately for each required question; use it alongside the brief so a compressed overview does not erase a required branch or result contract. Excerpted question findings are navigation aids to the retained source anchors. The brief is an evidence-linked analysis, not independently verified truth: resolve contradictions against supplied implementation and respect its uncertainties. inventory_sample is only a navigation map: its paths may be named in section queries but are not evidence and must never appear in evidence_ids. Infer the audience and desired outcome from purpose. Choose 1-32 distinct sections in the order the reader needs to understand or perform the work. 32 is a hard ceiling, not a target. Choose the smallest section count that covers the requested scope clearly, based on reader goals, source-supported workflows, complexity and distinct reader questions. A narrow topic may need only 1-3 sections. Add a section only when it answers a substantial separate reader question; merge overlapping or thin topics and use subsections for supporting details. Do not create one section per file or module, pad the outline, or split a coherent workflow just to increase the count. Explain briefly in storyline why the chosen scope and grouping suit this document. Start with orientation and the relevant end-to-end picture, then introduce prerequisites before the actions that need them, show one normal path through to an observable result, and place alternatives/troubleshooting where they help the reader. Adapt the order to the actual source and purpose, not a fixed template or catalog of files/classes/subsystems. Separate reading order from runtime order: conditional branches and independent workflows must not become a fictional single execution trace. reader_goal states what the reader should achieve. storyline explains how the questions connect and why this order helps that goal. Each reader_question is one non-duplicated question this section resolves; handoff identifies the concrete result or decision the next section builds on (empty only for the final section). prerequisite_titles lists the exact titles of earlier sections needed to understand this section; use [] when none, always [] for the first section. These are reading prerequisites, not function calls. Use title strings, never section numbers, requirement IDs or evidence IDs. Do not return numeric depends_on; the caller resolves titles to indices. Finish the section order and unique titles before assigning prerequisites. If a required prerequisite appears later, move it before use and update storyline and handoffs consistently; do not discard a real prerequisite just to satisfy ordering. Do not list the current section or repeat a title. Every section must carry 1-8 supplied evidence_ids that anchor its topic. previously_read source_anchors are originals checked during earlier reading and can anchor an existing source_brief finding even if the passage is not repeated in this bounded request; they do not justify inventing new behavior. query names concrete implementation files, symbols and actions needed to deepen those anchors during writing. For cross-layer or end-to-end documentation, distribute queries across the relevant entry, orchestration, persistence, maintenance and result-consumer modules visible in inventory_sample instead of repeatedly relying on the same few files. For an end-to-end guide, include the evidenced entry, orchestration and result consumer in the opening section's anchors/query where available. Do not invent missing links to make the story smooth; explain limits or separate paths. Assign each explanation to one section to avoid repeated overviews. terminology contains at most 12 short, consistent definitions supported by evidence. Allocate diagrams across the WHOLE document, at most 4 per section: each diagrams entry is one plain-language objective, NEVER diagram code or an assumed call sequence. An empty array means no diagram. Name diagram types explicitly when purpose requests them. Respect max_diagrams (null means no numeric cap) and the requested global number/types; do not repeat an overall flow diagram in every section. Keep titles under 300 bytes, query under 2000 bytes, reader_question and handoff under 1500 bytes, reader_goal under 2000 bytes, storyline under 4000 bytes and each terminology entry under 500 bytes. Use the requested document language. Coverage is selective; never claim all code was understood.";
 
-const PLAN: &str = "Return JSON {sections:[{title:string,query:string,reader_question:string,handoff:string,diagrams:[string],prerequisite_titles:[string],evidence_ids:[string]}],reader_goal:string,storyline:string,terminology:[string]}. Design one coherent document for the intended reader using the source_brief AND actual evidence read before this plan. The brief is an evidence-linked analysis, not independently verified truth: resolve contradictions against supplied implementation and respect its uncertainties. inventory_sample is only a navigation map: its paths may be named in section queries but are not evidence and must never appear in evidence_ids. Infer the audience and desired outcome from purpose. Choose 1-32 distinct sections in the order the reader needs to understand or perform the work. 32 is a hard ceiling, not a target. Choose the smallest section count that covers the requested scope clearly, based on reader goals, source-supported workflows, complexity and distinct reader questions. A narrow topic may need only 1-3 sections. Add a section only when it answers a substantial separate reader question; merge overlapping or thin topics and use subsections for supporting details. Do not create one section per file or module, pad the outline, or split a coherent workflow just to increase the count. Explain briefly in storyline why the chosen scope and grouping suit this document. Start with orientation and the relevant end-to-end picture, then introduce prerequisites before the actions that need them, show one normal path through to an observable result, and place alternatives/troubleshooting where they help the reader. Adapt the order to the actual source and purpose, not a fixed template or catalog of files/classes/subsystems. Separate reading order from runtime order: conditional branches and independent workflows must not become a fictional single execution trace. reader_goal states what the reader should achieve. storyline explains how the questions connect and why this order helps that goal. Each reader_question is one non-duplicated question this section resolves; handoff identifies the concrete result or decision the next section builds on (empty only for the final section). prerequisite_titles lists the exact titles of earlier sections needed to understand this section; use [] when none, always [] for the first section. These are reading prerequisites, not function calls. Use title strings, never section numbers, requirement IDs or evidence IDs. Do not return numeric depends_on; the caller resolves titles to indices. Finish the section order and unique titles before assigning prerequisites. If a required prerequisite appears later, move it before use and update storyline and handoffs consistently; do not discard a real prerequisite just to satisfy ordering. Do not list the current section or repeat a title. Every section must carry 1-8 supplied evidence_ids that anchor its topic. previously_read source_anchors are originals checked during earlier reading and can anchor an existing source_brief finding even if the passage is not repeated in this bounded request; they do not justify inventing new behavior. query names concrete implementation files, symbols and actions needed to deepen those anchors during writing. For cross-layer or end-to-end documentation, distribute queries across the relevant entry, orchestration, persistence, maintenance and result-consumer modules visible in inventory_sample instead of repeatedly relying on the same few files. For an end-to-end guide, include the evidenced entry, orchestration and result consumer in the opening section's anchors/query where available. Do not invent missing links to make the story smooth; explain limits or separate paths. Assign each explanation to one section to avoid repeated overviews. terminology contains at most 12 short, consistent definitions supported by evidence. Allocate diagrams across the WHOLE document, at most 4 per section: each diagrams entry is one plain-language objective, NEVER diagram code or an assumed call sequence. An empty array means no diagram. Name diagram types explicitly when purpose requests them. Respect max_diagrams (null means no numeric cap) and the requested global number/types; do not repeat an overall flow diagram in every section. Keep titles under 300 bytes, query under 2000 bytes, reader_question and handoff under 1500 bytes, reader_goal under 2000 bytes, storyline under 4000 bytes and each terminology entry under 500 bytes. Use the requested document language. Coverage is selective; never claim all code was understood.";
+const OWNERSHIP_POLICY: &str = "Assign ownership once per REQUIRED QUESTION, not once per section. Return top-level requirement_owners:[{requirement_id:string,section_title:string}] with exactly one entry for each supplied requirement. Copy requirement_id exactly from requirements; section_title must exactly match one unique title in your final sections array. Choose the section whose reader_question and key_points provide the primary complete answer. Other sections may introduce, reference or expand that topic without also owning it. A section may own zero, one or several requirements: 32 sections do NOT need 32 requirements. Do not repeat an ID to give every section an owner, invent IDs, or delete required questions. Do not return per-section owns_requirement_ids; the caller derives it from requirement_owners. Include key_points (1-12 concrete explanations) and out_of_scope in each section. Both fields must be arrays of strings; use [] for out_of_scope when empty, never a scalar string or null. Align the owner's key_points with its required questions and preserve supported content and user feedback.";
 
 pub(crate) const FINDING_KIND_POLICY: &str = "For each finding, kind must be exactly the JSON string \"runtime\" or \"context\". The word implementation describes source evidence, never a third finding kind. runtime_allowed is a boolean describing whether an evidence anchor can support a runtime finding; it is not the finding kind. Use runtime only with at least one supplied implementation anchor. Use context for declarations, documentation or test intent without asserting execution. Always include findings, uncertainties and followup_queries as arrays; use [] for empty lists, never null. Return one JSON object without Markdown fences.";
 
@@ -46,6 +46,8 @@ pub(crate) struct SourceBrief {
 pub(crate) struct Discovery {
     pub brief: SourceBrief,
     pub evidence: Vec<Evidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<crate::purpose::QuestionAnalysis>,
 }
 
 fn bounded_text(value: &str, max: usize) -> bool {
@@ -159,7 +161,7 @@ pub(crate) fn validate_outline(
     let mut titles = HashSet::new();
     let mut questions = HashSet::new();
     let mut ids = HashSet::new();
-    let mut ownership = HashSet::new();
+    let mut ownership: HashMap<String, (usize, String)> = HashMap::new();
     let count = outline.sections.len();
     for (index, section) in outline.sections.iter_mut().enumerate() {
         if section.id.is_empty() {
@@ -189,10 +191,27 @@ pub(crate) fn validate_outline(
             );
             for requirement in &section.owns_requirement_ids {
                 ensure!(
-                    outline.requirements.iter().any(|r| &r.id == requirement)
-                        && ownership.insert(requirement.clone()),
-                    "Each requirement must have exactly one owning section"
+                    outline.requirements.iter().any(|r| &r.id == requirement),
+                    "sections[{index}] ({:?}).owns_requirement_ids contains unknown requirement {:?}; allowed IDs: {:?}. Requirement IDs are not section indices or evidence IDs",
+                    section.title,
+                    requirement,
+                    outline
+                        .requirements
+                        .iter()
+                        .map(|r| &r.id)
+                        .collect::<Vec<_>>()
                 );
+                if let Some((owner_index, owner_title)) = ownership.get(requirement) {
+                    bail!(
+                        "Requirement {:?} is already owned by sections[{}] ({:?}) and repeated in sections[{}] ({:?}). Choose exactly one primary owner; other sections may discuss the topic with no ownership. Use requirement_owners once per required question",
+                        requirement,
+                        owner_index,
+                        owner_title,
+                        index,
+                        section.title
+                    );
+                }
+                ownership.insert(requirement.clone(), (index, section.title.clone()));
             }
         }
         ensure!(
@@ -248,12 +267,16 @@ pub(crate) fn validate_outline(
         );
         resolve_ids(&mut section.evidence_ids, evidence, 8)?;
     }
+    let missing: Vec<_> = outline
+        .requirements
+        .iter()
+        .filter(|r| !ownership.contains_key(&r.id))
+        .map(|r| &r.id)
+        .collect();
     ensure!(
-        outline
-            .requirements
-            .iter()
-            .all(|r| ownership.contains(&r.id)),
-        "Missing required topic ownership"
+        missing.is_empty(),
+        "Missing required topic ownership for {:?}; assign each to one section that answers the supplied question. Other sections may have no owned requirements",
+        missing
     );
     if let Some(error) = outline_diagram_error(outline, maximum) {
         bail!("{error}");
@@ -263,7 +286,11 @@ pub(crate) fn validate_outline(
 
 /// Resolve generated title references locally. Numeric dependencies remain supported
 /// for old providers/checkpoints; never guess whether their numbering is one-based.
-fn decode_generated_outline(response: &str, repair: &mut llm::JsonRepair) -> Result<Outline> {
+fn decode_generated_outline(
+    response: &str,
+    repair: &mut llm::JsonRepair,
+    requirements: &[Requirement],
+) -> Result<Outline> {
     let mut value: serde_json::Value = repair.decode(response)?;
     if let Some(sections) = value.get_mut("sections").and_then(|v| v.as_array_mut()) {
         let titles: Vec<Option<String>> = sections
@@ -313,13 +340,108 @@ fn decode_generated_outline(response: &str, repair: &mut llm::JsonRepair) -> Res
             }
         }
     }
+    resolve_generated_ownership(&mut value, requirements)?;
     let mut plan: Outline = llm::decode(&serde_json::to_string(&value)?)?;
     // Repetition carries no additional meaning; keep the first occurrence.
     for section in &mut plan.sections {
         let mut seen = HashSet::new();
         section.depends_on.retain(|d| seen.insert(*d));
+        let mut owned = HashSet::new();
+        section
+            .owns_requirement_ids
+            .retain(|id| owned.insert(id.clone()));
     }
     Ok(plan)
+}
+
+/// A single owner table avoids asking the model to coordinate duplicate ID lists
+/// across up to 32 independently described sections. Resolve only explicit choices.
+fn resolve_generated_ownership(
+    value: &mut serde_json::Value,
+    requirements: &[Requirement],
+) -> Result<()> {
+    value
+        .as_object_mut()
+        .context("Outline response must be a JSON object")?
+        .insert("requirements".into(), json!(requirements));
+    let Some(raw) = value.get("requirement_owners") else {
+        return Ok(());
+    };
+    #[derive(Deserialize)]
+    struct Owner {
+        requirement_id: String,
+        section_title: String,
+    }
+    let owners: Vec<Owner> = llm::decode(&raw.to_string()).context(
+        "requirement_owners must be an array of {requirement_id:string,section_title:string}",
+    )?;
+    let sections = value
+        .get_mut("sections")
+        .and_then(|v| v.as_array_mut())
+        .context("sections must be an array before assigning requirement_owners")?;
+    let mut assignments: HashMap<String, usize> = HashMap::new();
+    for owner in owners {
+        ensure!(
+            requirements.iter().any(|r| r.id == owner.requirement_id),
+            "requirement_owners contains unknown requirement {:?}; allowed IDs: {:?}",
+            owner.requirement_id,
+            requirements.iter().map(|r| &r.id).collect::<Vec<_>>()
+        );
+        let matches: Vec<_> = sections
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                (s.get("title").and_then(|v| v.as_str()) == Some(owner.section_title.as_str()))
+                    .then_some(i)
+            })
+            .collect();
+        ensure!(
+            matches.len() == 1,
+            "requirement_owners for {:?}: section title {:?} matches {} sections; use an exact unique title from sections",
+            owner.requirement_id,
+            owner.section_title,
+            matches.len()
+        );
+        let target = matches[0];
+        if let Some(prior) = assignments.insert(owner.requirement_id.clone(), target) {
+            ensure!(
+                prior == target,
+                "requirement_owners assigns {:?} to both sections[{}] ({}) and sections[{}] ({}); choose exactly one primary owner. Other sections may reference the topic without owning it",
+                owner.requirement_id,
+                prior,
+                sections[prior]["title"],
+                target,
+                sections[target]["title"]
+            );
+        }
+    }
+    let missing: Vec<_> = requirements
+        .iter()
+        .filter(|r| !assignments.contains_key(&r.id))
+        .map(|r| &r.id)
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "requirement_owners is missing {:?}; assign each supplied question to one primary section without removing requirements",
+        missing
+    );
+    for (index, section) in sections.iter_mut().enumerate() {
+        // Use canonical requirement order so equivalent tables have stable checkpoints.
+        section
+            .as_object_mut()
+            .with_context(|| format!("sections[{index}] must be a JSON object"))?
+            .insert(
+                "owns_requirement_ids".into(),
+                json!(
+                    requirements
+                        .iter()
+                        .filter(|r| assignments.get(&r.id) == Some(&index))
+                        .map(|r| &r.id)
+                        .collect::<Vec<_>>()
+                ),
+            );
+    }
+    Ok(())
 }
 
 /// Include every section in repair context even when the full response is excerpted.
@@ -336,7 +458,7 @@ fn dependency_repair_context(response: &str) -> serde_json::Value {
             .take(32)
             .enumerate()
             .map(|(index, s)| json!({"index":index,"title":s.get("title"),
-            "prerequisite_titles":s.get("prerequisite_titles"),"depends_on":s.get("depends_on")}))
+            "prerequisite_titles":s.get("prerequisite_titles"),"depends_on":s.get("depends_on"),"owns_requirement_ids":s.get("owns_requirement_ids")}))
             .collect::<Vec<_>>()
     )
 }
@@ -361,7 +483,7 @@ pub(crate) fn pack_evidence(groups: &[Vec<Evidence>], limit: usize) -> Vec<Evide
     selected
 }
 
-fn evidence_budget(ctx: &RunContext) -> usize {
+pub(crate) fn evidence_budget(ctx: &RunContext) -> usize {
     let l = &ctx.snapshot.settings.llm;
     let available = (l.context_limit.min(l.model_context_limit).min(200_000) as usize)
         .saturating_mul(100usize.saturating_sub(l.safety_percent as usize))
@@ -371,193 +493,17 @@ fn evidence_budget(ctx: &RunContext) -> usize {
         .min(48_000)
 }
 
-async fn read_sources(
-    ctx: &RunContext,
-    system: &str,
-    inventory: &str,
-    previous: Option<&Discovery>,
-) -> Result<Discovery> {
-    let final_pass = previous.is_some();
-    let mut queries = previous.map(|p| p.brief.followup_queries.clone()).unwrap_or_else(|| vec![format!(
-        "{} main entry route handler request input process execute return result response output startup configuration error",
-        ctx.snapshot.task.direction
-    )]);
-    queries.dedup();
-    let mut previous_error = String::new();
-    let mut repair = llm::JsonRepair::default();
-    let mut limit = evidence_budget(ctx);
-    let mut response_received = false;
-    for attempt in 0..3 {
-        ctx.check()?;
-        ensure!(
-            limit >= 1024,
-            "CONTEXT_BUDGET: insufficient room for source understanding"
-        );
-        ctx.event("source_reading", json!({"stage":"understanding","title":if final_pass {"누락된 연결을 추가 확인"} else {"구현을 읽고 동작 흐름 파악"},"pass":if final_pass {2} else {1},"attempt":attempt+1})).await?;
-        let mut groups = Vec::new();
-        if let Some(p) = previous {
-            let anchors: Vec<_> = p
-                .evidence
-                .iter()
-                .filter(|e| {
-                    p.brief
-                        .findings
-                        .iter()
-                        .any(|f| f.evidence_ids.contains(&e.id))
-                })
-                .cloned()
-                .collect();
-            groups.push(pack_evidence(&[anchors], limit / 2));
-        }
-        let per_query = if final_pass {
-            limit / 2 / queries.len().max(1)
-        } else {
-            limit
-        };
-        for query in &queries {
-            groups.push(source::retrieve(ctx, query, per_query.max(512)).await?);
-        }
-        let evidence = pack_evidence(&groups, limit);
-        ensure!(
-            !evidence.is_empty(),
-            "No source evidence available before planning"
-        );
-        let mut available = evidence.clone();
-        if let Some(prior) = previous {
-            for e in &prior.evidence {
-                if !available.iter().any(|a| a.id == e.id) {
-                    available.push(e.clone());
-                }
-            }
-        }
-        let mut input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
-            "verified_overview":previous.map(|p| &p.brief),
-            "source_anchors":previous.map(|p| p.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>()),
-            "inventory_sample":editorial::excerpt(inventory, 16000 >> attempt),"evidence":evidence,
-            "open_questions":previous.map(|p| &p.brief.uncertainties),"final_pass":final_pass,
-            "previous_error":previous_error,"attempt":attempt+1,"finding_kind_policy":FINDING_KIND_POLICY,"instruction":DISCOVERY});
-        response_received = false;
-        repair.apply(&mut input);
-        let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
-            response_received = true;
-            let mut brief: SourceBrief = repair.decode(&s)?;
-            validate_brief(&mut brief, &available, final_pass)?;
-            Ok(brief)
-        });
-        match result {
-            Ok(brief) => {
-                return Ok(Discovery {
-                    evidence: available
-                        .into_iter()
-                        .filter(|e| {
-                            brief
-                                .findings
-                                .iter()
-                                .any(|f| f.evidence_ids.contains(&e.id))
-                        })
-                        .collect(),
-                    brief,
-                });
-            }
-            Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
-            Err(e) => {
-                llm::forget(ctx, system, input).await?;
-                previous_error = editorial::excerpt(&format!("{e:#}"), 1500);
-                if previous_error.contains("CONTEXT_BUDGET") {
-                    limit /= 2;
-                }
-                ctx.event(
-                    "source_reading_retry",
-                    json!({"stage":"understanding","attempt":attempt+1,"error":previous_error}),
-                )
-                .await?;
-            }
-        }
-    }
-    if response_received && let Some(prior) = previous {
-        let mut recovered = prior.clone();
-        recovered.brief.followup_queries.clear();
-        recovered.brief.uncertainties.truncate(7);
-        recovered.brief.uncertainties.push("추가 소스 분석 응답을 검증하지 못했습니다. 이전에 검증된 관찰을 유지하며 추가 연결은 미확인입니다.".into());
-        let key = format!(
-            "source_reading:unresolved:{}",
-            if final_pass { 2 } else { 1 }
-        );
-        db::checkpoint(
-            &ctx.pool,
-            &ctx.id,
-            &key,
-            &json!({"error":previous_error,"response":repair.response}),
-        )
-        .await?;
-        if let Some(mut coverage) =
-            db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:coverage").await?
-        {
-            coverage["complete"] = json!(false);
-            coverage["additional_reading_unresolved"] = json!(true);
-            db::checkpoint(&ctx.pool, &ctx.id, "understanding:coverage", &coverage).await?;
-        }
-        ctx.event("source_validation_warning", json!({"title":"추가 분석 미해결 · 이전 검증 결과로 계속합니다","error":previous_error})).await?;
-        return Ok(recovered);
-    }
-    bail!("Unable to understand source before planning: {previous_error}")
-}
-
-async fn discover(ctx: &RunContext, system: &str) -> Result<Discovery> {
-    if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "source_understanding").await? {
-        return Ok(serde_json::from_value(saved)?);
-    }
-    let mut whole = crate::understanding::analyze(ctx, system).await?;
-    whole.brief.followup_queries = vec![format!(
-        "{} entry result errors",
-        ctx.snapshot.task.direction
-    )];
-    let first: Discovery =
-        if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "source_reading:0").await? {
-            serde_json::from_value(saved)?
-        } else {
-            let overview = serde_json::to_string(&whole.brief)?;
-            let read = read_sources(ctx, system, &overview, Some(&whole)).await?;
-            db::checkpoint(
-                &ctx.pool,
-                &ctx.id,
-                "source_reading:0",
-                &serde_json::to_value(&read)?,
-            )
-            .await?;
-            read
-        };
-    let complete = if first.brief.followup_queries.is_empty() {
-        first
-    } else {
-        read_sources(
-            ctx,
-            system,
-            &serde_json::to_string(&whole.brief)?,
-            Some(&first),
-        )
-        .await?
-    };
-    db::checkpoint(
-        &ctx.pool,
-        &ctx.id,
-        "source_understanding",
-        &serde_json::to_value(&complete)?,
-    )
-    .await?;
-    ctx.event("source_understood", json!({"stage":"understood","findings":complete.brief.findings.len(),"uncertainties":complete.brief.uncertainties,"evidence_files":complete.evidence.iter().map(|e| &e.path).collect::<HashSet<_>>().len(),"selective_analysis":true})).await?;
-    Ok(complete)
-}
-
 pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
+    crate::purpose::prepare(ctx).await?;
     // Old runs retain their outline and numbered drafts. New runs always discover
     // first; no file-name-only fallback is allowed after discovery failures.
     if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "outline").await? {
         return Ok(serde_json::from_value(saved)?);
     }
-    let discovery = discover(ctx, system).await?;
-    let inventory = serde_json::to_string(&discovery.brief)?;
+    let whole = crate::understanding::analyze(ctx, system).await?;
     let requirements = requirements(ctx, system).await?;
+    let discovery = crate::purpose::analyze(ctx, system, &whole, &requirements).await?;
+    let inventory = editorial::excerpt(&serde_json::to_string(&whole.brief)?, 8000);
     let state = db::load_checkpoint(&ctx.pool, &ctx.id, "outline_state")
         .await?
         .unwrap_or(json!({"revision":0,"round":0}));
@@ -581,7 +527,7 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
             if candidate.is_some() {
                 break;
             }
-            let evidence = pack_evidence(std::slice::from_ref(&discovery.evidence), limit);
+            let evidence = crate::purpose::pack(&discovery, limit);
             ensure!(
                 !evidence.is_empty(),
                 "CONTEXT_BUDGET: insufficient room for grounded outline"
@@ -589,9 +535,9 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
             let brief = &discovery.brief;
             ctx.event("outline_planning", json!({"stage":"planning","title":"구현 근거에 맞춰 설명 순서 구성","attempt":attempt+1,"evidence_chunks":evidence.len()})).await?;
             let mut input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
-            "source_brief":brief,"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"project_overview":inventory,"requirements":requirements,"feedback":feedback,"revision":revision,
+            "source_brief":brief,"question_analysis":crate::purpose::context(&discovery),"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"project_overview":inventory,"requirements":requirements,"feedback":feedback,"revision":revision,
             "evidence":evidence,"max_diagrams":ctx.snapshot.task.max_diagrams,
-            "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{PLAN} Additionally each section must include owns_requirement_ids (each supplied requirement has exactly ONE owner across the document), key_points (1-12 concrete explanations), and out_of_scope (topics owned elsewhere). Respect user feedback and preserve valid existing section IDs when supplied. Do not remove requirements to hide missing coverage.")});
+            "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{PLAN} {OWNERSHIP_POLICY} Respect user feedback and preserve valid existing section IDs when supplied. Do not remove requirements to hide missing coverage.")});
             input["dependency_example"] = json!({"description":"Shape example only; choose titles and prerequisites from the actual document",
                 "sections":[{"title":"Prepare input","prerequisite_titles":[]},
                     {"title":"Process input","prerequisite_titles":["Prepare input"]},
@@ -599,9 +545,15 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
             repair.apply(&mut input);
             if let Some(response) = &repair.response {
                 input["previous_section_dependencies"] = dependency_repair_context(response);
+                if let Ok(value) = llm::decode::<serde_json::Value>(response) {
+                    input["previous_requirement_owners"] = value
+                        .get("requirement_owners")
+                        .cloned()
+                        .unwrap_or(json!([]));
+                }
             }
             let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
-                let mut plan = decode_generated_outline(&s, &mut repair)?;
+                let mut plan = decode_generated_outline(&s, &mut repair, &requirements)?;
                 plan.requirements = requirements.clone();
                 plan.revision = revision;
                 validate_outline(
@@ -686,12 +638,7 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
             extra.push(source::retrieve(ctx, &query.query, evidence_budget(ctx) / 3).await?);
             extra_queries += 1;
         }
-        discovery.evidence = pack_evidence(&extra, evidence_budget(ctx));
-        discovery.brief.findings.retain(|f| {
-            f.evidence_ids
-                .iter()
-                .all(|id| discovery.evidence.iter().any(|e| &e.id == id))
-        });
+        discovery.evidence = crate::purpose::merge_evidence(&extra);
         round += 1;
         feedback = json!({"previous_plan":plan,"issues":review.issues});
         let mut tx = ctx.pool.begin().await?;
@@ -714,7 +661,11 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
 }
 
 async fn requirements(ctx: &RunContext, system: &str) -> Result<Vec<Requirement>> {
-    if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "document_requirements").await? {
+    let key = format!(
+        "document_requirements:{}",
+        crate::purpose::intent_key(&ctx.snapshot.task)
+    );
+    if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? {
         return Ok(serde_json::from_value(saved)?);
     }
     let mut error = String::new();
@@ -743,6 +694,7 @@ async fn requirements(ctx: &RunContext, system: &str) -> Result<Vec<Requirement>
             });
         match parsed {
             Ok(r) => {
+                db::checkpoint(&ctx.pool, &ctx.id, &key, &serde_json::to_value(&r)?).await?;
                 db::checkpoint(
                     &ctx.pool,
                     &ctx.id,
@@ -775,7 +727,7 @@ async fn review_outline(
     let mut error = String::new();
     let mut repair = llm::JsonRepair::default();
     for attempt in 0..3 {
-        let mut input = json!({"phase":"outline_review","purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"outline":plan,"source_brief":discovery.brief,"evidence":pack_evidence(std::slice::from_ref(&discovery.evidence),evidence_budget(ctx)),"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"attempt":attempt,"previous_error":error,"instruction":"Review this outline BEFORE writing. Return JSON {issues:[{severity:'major'|'minor',code:string,message:string,section_ids:[string],requirement_ids:[string],query:string}]}. Check missing reader requirements, semantic overlap, prerequisites after use, oversized or empty sections, audience mismatch, unsupported runtime ordering and missing important source branches. A short orientation referencing a detailed section is valid. Sharing evidence is not duplication. Every issue must identify concrete affected IDs and a necessary correction, grounded in the supplied outline or source. For missing evidence query names observed files/symbols. Previously_read anchors support observations already checked in the source_brief. Do not invent defects or infer absence from an excerpt. Empty issues means no concrete defect supported. Use the requested language. At most 12 issues."});
+        let mut input = json!({"phase":"outline_review","purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"outline":plan,"source_brief":discovery.brief,"question_analysis":crate::purpose::context(discovery),"evidence":crate::purpose::pack(discovery,evidence_budget(ctx)),"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"attempt":attempt,"previous_error":error,"instruction":"Review this outline BEFORE writing. Return JSON {issues:[{severity:'major'|'minor',code:string,message:string,section_ids:[string],requirement_ids:[string],query:string}]}. Recorded uncertainties are research questions; newly supplied implementation may resolve them. Use question_analysis to check each required question and its unresolved gaps; an omitted excerpt is not proof that the implementation is missing. Check missing reader requirements, semantic overlap, prerequisites after use, oversized or empty sections, audience mismatch, unsupported runtime ordering and missing important source branches. A short orientation referencing a detailed section is valid. Sharing evidence is not duplication. Supporting sections may discuss a required question without owning it; a section with no owned requirements is valid. Check the primary owner against its reader_question and key_points. Every issue must identify concrete affected IDs and a necessary correction, grounded in the supplied outline or source. For missing evidence query names observed files/symbols. Previously_read anchors support observations already checked in the source_brief. Do not invent defects or infer absence from an excerpt. Empty issues means no concrete defect supported. Use the requested language. At most 12 issues."});
         repair.apply(&mut input);
         let parsed = llm::call(ctx, system, input.clone()).await.and_then(|s| {
             let r: OutlineReview = repair.decode(&s)?;
@@ -820,15 +772,29 @@ pub async fn section_evidence(ctx: &RunContext, plan: &SectionPlan) -> Result<Ve
         .await?
         .context("Missing source understanding for grounded section plan")?;
     let discovery: Discovery = serde_json::from_value(saved)?;
-    let evidence: Vec<_> = discovery
+    let mut evidence: Vec<_> = discovery
         .evidence
-        .into_iter()
+        .iter()
         .filter(|e| plan.evidence_ids.contains(&e.id))
+        .cloned()
         .collect();
     ensure!(
         evidence.len() == plan.evidence_ids.len(),
         "Missing planned source evidence"
     );
+    let question_ids: HashSet<_> = discovery
+        .questions
+        .iter()
+        .filter(|q| plan.owns_requirement_ids.contains(&q.requirement_id))
+        .flat_map(|q| q.brief.findings.iter().flat_map(|f| &f.evidence_ids))
+        .collect();
+    let extra = discovery
+        .evidence
+        .iter()
+        .filter(|e| question_ids.contains(&e.id))
+        .cloned()
+        .collect();
+    evidence = crate::purpose::merge_evidence(&[evidence, extra]);
     Ok(evidence)
 }
 
@@ -930,7 +896,7 @@ mod tests {
         }
         value["sections"][31]["prerequisite_titles"] = json!(["단계 1", "단계 31", "단계 1"]);
         let mut repair = llm::JsonRepair::default();
-        let mut plan = decode_generated_outline(&value.to_string(), &mut repair)?;
+        let mut plan = decode_generated_outline(&value.to_string(), &mut repair, &[])?;
         assert!(plan.sections[0].depends_on.is_empty());
         assert_eq!(plan.sections[1].depends_on, vec![0]);
         assert_eq!(plan.sections[30].depends_on, vec![29]);
@@ -954,7 +920,7 @@ mod tests {
             let mut value = generated_plan(3);
             value["sections"][index]["prerequisite_titles"] = titles;
             let result =
-                decode_generated_outline(&value.to_string(), &mut llm::JsonRepair::default());
+                decode_generated_outline(&value.to_string(), &mut llm::JsonRepair::default(), &[]);
             let error = result
                 .err()
                 .context("Invalid dependency unexpectedly accepted")?
@@ -967,7 +933,7 @@ mod tests {
         duplicate["sections"][1]["prerequisite_titles"] = json!([]);
         duplicate["sections"][2]["prerequisite_titles"] = json!(["단계 1"]);
         let error =
-            decode_generated_outline(&duplicate.to_string(), &mut llm::JsonRepair::default())
+            decode_generated_outline(&duplicate.to_string(), &mut llm::JsonRepair::default(), &[])
                 .err()
                 .context("Ambiguous titles unexpectedly accepted")?;
         assert!(error.to_string().contains("matches 2 sections"));
@@ -987,7 +953,7 @@ mod tests {
         }
         value["sections"][1]["depends_on"] = json!([0, 0]);
         let mut plan =
-            decode_generated_outline(&value.to_string(), &mut llm::JsonRepair::default())?;
+            decode_generated_outline(&value.to_string(), &mut llm::JsonRepair::default(), &[])?;
         assert_eq!(plan.sections[1].depends_on, vec![0]);
         validate_outline(&mut plan, std::slice::from_ref(&source), Some(0))?;
         for (reference, reason) in [
@@ -1070,6 +1036,150 @@ mod tests {
                 "section count {count}: {result:?}"
             );
         }
+        Ok(())
+    }
+
+    fn ownership_requirements() -> Vec<Requirement> {
+        vec![
+            Requirement {
+                id: "r1".into(),
+                question: "How is input validated?".into(),
+            },
+            Requirement {
+                id: "r2".into(),
+                question: "How is the result returned?".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn generated_ownership_supports_many_sections_and_multiple_questions_per_owner() -> Result<()> {
+        let source = evidence("/project/a.py", "def process(): return 1");
+        let requirements = ownership_requirements();
+        for count in [1, 32] {
+            let mut value = generated_plan(count);
+            for section in value["sections"].as_array_mut().unwrap() {
+                section["evidence_ids"] = json!([source.id]);
+                section["key_points"] = json!(["Validate input and return the result"]);
+                // A named owner table is authoritative over stale per-section lists.
+                section["owns_requirement_ids"] = json!(["r1", "r2"]);
+            }
+            value["requirements"] = json!([]); // The response cannot remove supplied questions.
+            let owner = format!("단계 {count}");
+            value["requirement_owners"] = json!([
+                {"requirement_id":"r2","section_title":owner},
+                {"requirement_id":"r1","section_title":owner},
+                {"requirement_id":"r1","section_title":owner}
+            ]);
+            let mut plan = decode_generated_outline(
+                &value.to_string(),
+                &mut llm::JsonRepair::default(),
+                &requirements,
+            )?;
+            assert_eq!(plan.requirements.len(), 2);
+            assert_eq!(
+                plan.sections[count - 1].owns_requirement_ids,
+                vec!["r1", "r2"]
+            );
+            assert!(
+                plan.sections[..count - 1]
+                    .iter()
+                    .all(|s| s.owns_requirement_ids.is_empty())
+            );
+            validate_outline(&mut plan, std::slice::from_ref(&source), Some(0))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generated_owner_conflicts_unknown_ids_missing_questions_and_titles_are_explicit()
+    -> Result<()> {
+        let requirements = ownership_requirements();
+        for (owners, expected) in [
+            (
+                json!([
+                    {"requirement_id":"r1","section_title":"단계 1"},
+                    {"requirement_id":"r1","section_title":"단계 2"},
+                    {"requirement_id":"r2","section_title":"단계 2"}
+                ]),
+                "assigns \"r1\" to both sections[0]",
+            ),
+            (
+                json!([{"requirement_id":"r9","section_title":"단계 1"}]),
+                "unknown requirement \"r9\"",
+            ),
+            (
+                json!([{"requirement_id":"r1","section_title":"단계 1"}]),
+                "missing [\"r2\"]",
+            ),
+            (
+                json!([{"requirement_id":"r1","section_title":"unknown"}]),
+                "matches 0 sections",
+            ),
+            (json!(null), "requirement_owners must be an array"),
+        ] {
+            let mut value = generated_plan(2);
+            value["requirement_owners"] = owners;
+            let error = decode_generated_outline(
+                &value.to_string(),
+                &mut llm::JsonRepair::default(),
+                &requirements,
+            )
+            .err()
+            .context("Invalid ownership unexpectedly accepted")?
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        for malformed in [
+            json!([]),
+            json!(null),
+            json!({"sections":[null],"requirement_owners":[]}),
+        ] {
+            assert!(
+                decode_generated_outline(
+                    &malformed.to_string(),
+                    &mut llm::JsonRepair::default(),
+                    &[]
+                )
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_owner_repetition_is_normalized_only_within_a_section() -> Result<()> {
+        let source = evidence("/project/a.py", "def process(): return 1");
+        let requirements = ownership_requirements();
+        let mut value = generated_plan(2);
+        for section in value["sections"].as_array_mut().unwrap() {
+            section["evidence_ids"] = json!([source.id]);
+            section["key_points"] = json!(["Explain the required question"]);
+        }
+        value["sections"][0]["owns_requirement_ids"] = json!(["r1", "r1"]);
+        value["sections"][1]["owns_requirement_ids"] = json!(["r2"]);
+        let mut plan = decode_generated_outline(
+            &value.to_string(),
+            &mut llm::JsonRepair::default(),
+            &requirements,
+        )?;
+        validate_outline(&mut plan, std::slice::from_ref(&source), Some(0))?;
+        plan.sections[1].owns_requirement_ids.push("r1".into());
+        let error = validate_outline(&mut plan, std::slice::from_ref(&source), Some(0))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("r1") && error.contains("sections[0]") && error.contains("sections[1]"),
+            "{error}"
+        );
+        plan.sections[1].owns_requirement_ids = vec!["unknown".into()];
+        let error = validate_outline(&mut plan, &[source], Some(0))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown requirement") && error.contains("sections[1]"),
+            "{error}"
+        );
         Ok(())
     }
 

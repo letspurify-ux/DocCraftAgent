@@ -113,6 +113,8 @@ pub struct Cursor {
         cancel_run,
         resume_run,
         crate::composition::understanding,
+        crate::composition::graph,
+        crate::composition::coverage,
         crate::composition::outline,
         crate::composition::revise,
         crate::composition::continue_outline
@@ -157,6 +159,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(crate::composition::understanding),
         )
         .route("/runs/{id}/understanding/continue", post(resume_run))
+        .route("/runs/{id}/graph", get(crate::composition::graph))
+        .route("/runs/{id}/coverage", get(crate::composition::coverage))
         .route("/runs/{id}/outline", get(crate::composition::outline))
         .route(
             "/runs/{id}/outline/revisions",

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, send, type Run } from "./api";
 import type { components } from "./api.generated";
+import { SourceGraph } from "./source-graph";
 
 type Section = Required<components["schemas"]["SectionPlan"]>;
 type Outline = Omit<Required<components["schemas"]["Outline"]>, "sections"> & {
@@ -33,6 +34,20 @@ type Brief = {
   uncertainties: string[];
 };
 type Understanding = {
+  graph?: {
+    symbols: number;
+    edges: number;
+    unsupported_files: number;
+    parse_error_files: number;
+  };
+  document_coverage?: {
+    scope?: string;
+    complete: boolean;
+    checked: number;
+    covered: number;
+    out_of_scope: number;
+    missing: number;
+  };
   coverage?: {
     reading_complete?: boolean;
     unresolved_nodes?: number;
@@ -217,6 +232,14 @@ export function Composition({ run }: { run: Run }) {
             읽기 범위는 이해 정확도를 의미하지 않습니다. 미확인 연결은 아래에
             표시합니다.
           </small>
+          {source.graph && (
+            <SourceGraph
+              key={run.id}
+              runId={run.id}
+              graph={source.graph}
+              coverage={source.document_coverage}
+            />
+          )}
           {source.coverage?.additional_reading_unresolved && (
             <p className="banner">
               추가 분석을 검증하지 못해 이전 검증 결과로 진행했습니다.

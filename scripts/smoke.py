@@ -42,7 +42,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if model=='quota-partial' and 'Write only Markdown' in instruction:
                 writes=sum(1 for r in requests if r['model']==model and 'Write only Markdown' in r['messages'][-1]['content'])
                 if writes>1: return self.reply({'error':{'code':429,'message':'Rate limit exceeded: free-models-per-day'}},429)
-            if data.get('phase')=='outline_review':
+            if data.get('phase')=='coverage_audit':
+                # This mock checks protocol and checkpoint flow only, not semantic quality.
+                quote=next((line.strip() for line in data['document']['content'].splitlines() if len(line.strip())>=12 and not line.lstrip().startswith(('#','```'))),'')
+                result=json.dumps({'assessments':[{'id':item['id'],'status':'covered','section':data['document']['section'],'quote':quote,'reason':'모의 응답의 설명 인용 및 원장 처리 계약을 확인합니다.'} for item in data['obligations']]},ensure_ascii=False)
+            elif data.get('phase')=='outline_review':
                 result=json.dumps({'issues':[]})
                 if model=='outline-quality-once' and data['outline']['revision']==1:
                     result=json.dumps({'issues':[{'severity':'major','code':'overlap','message':'두 장의 담당 설명을 구분하세요','section_ids':[data['outline']['sections'][0]['id']],'requirement_ids':[],'query':''}]},ensure_ascii=False)
@@ -60,6 +64,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 anchor=next((e for e in evidence if pathlib.Path(e['path']).suffix in ('.py','.rs','.js','.ts','.java','.go','.c','.cpp')),evidence[0])
                 kind='runtime' if pathlib.Path(anchor['path']).suffix in ('.py','.rs','.js','.ts','.java','.go','.c','.cpp') else 'context'
                 result=json.dumps({'findings':[{'topic':'입력과 결과','observation':'구현에서 입력 이름을 검사하고 결과를 반환한다.','kind':kind,'evidence_ids':[anchor['id']]}], 'uncertainties':[] if final_pass or model not in ['planning-followup','restart-discovery'] else ['오류 처리와 반환 결과의 연결을 추가 확인한다.'], 'followup_queries':['service.py name_required handle_request'] if model in ['planning-followup','restart-discovery'] and not final_pass else []},ensure_ascii=False)
+                if data.get('phase')=='understanding_batch':
+                    batch=json.loads(result)
+                    batch['findings']=[{'topic':f'입력과 결과 {i//6+1}','observation':'제공된 구현 또는 선언의 입력 검증과 결과를 읽었습니다.','kind':'runtime' if any(pathlib.Path(e['path']).suffix in ('.py','.rs','.js','.ts','.java','.go','.c','.cpp') for e in evidence[i:i+6]) else 'context','evidence_ids':[e['id'] for e in evidence[i:i+6]]} for i in range(0,len(evidence),6)]
+                    result=json.dumps(batch,ensure_ascii=False)
                 if model=='planning-citation-once' and not getattr(self.server,'planning_citation_sent',False):
                     self.server.planning_citation_sent=True
                     invalid=json.loads(result);invalid['findings'][0]['evidence_ids']=['ffffffff'];result=json.dumps(invalid)

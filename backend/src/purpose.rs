@@ -75,7 +75,7 @@ struct Detail {
 }
 
 fn select_details(best: &mut Vec<Detail>, discovery: &Discovery, terms: &[String]) {
-    for finding in &discovery.brief.findings {
+    for finding in discovery.brief.findings.iter().chain(&discovery.details) {
         let evidence: Vec<_> = discovery
             .evidence
             .iter()
@@ -355,6 +355,63 @@ pub(crate) fn context(discovery: &Discovery) -> Vec<Value> {
         result.push(view);
     }
     result
+}
+
+/// Rehydrate relevant leaf observations, including those absent from the root
+/// overview and purpose's selected 24 details. The budget limits this VIEW only.
+pub(crate) async fn section_memory(
+    ctx: &RunContext,
+    evidence: &[Evidence],
+    limit: usize,
+) -> Result<Value> {
+    let leaves: Vec<String> = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:leaves")
+        .await?
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    let (mut used, mut deferred) = (0usize, 0usize);
+    let mut findings = vec![];
+    let mut seen = HashSet::new();
+    for key in leaves {
+        ctx.check()?;
+        let Some(value) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? else {
+            continue;
+        };
+        let node: Node = serde_json::from_value(value)?;
+        for finding in node
+            .discovery
+            .brief
+            .findings
+            .iter()
+            .chain(&node.discovery.details)
+        {
+            let matches = node.discovery.evidence.iter().any(|original| {
+                finding.evidence_ids.contains(&original.id)
+                    && evidence.iter().any(|e| {
+                        e.path == original.path
+                            && e.start <= original.end
+                            && e.end >= original.start
+                    })
+            });
+            if !matches {
+                continue;
+            }
+            let value = json!(finding);
+            let encoded = serde_json::to_vec(&value)?;
+            if !seen.insert(source::hash(&encoded)) {
+                continue;
+            }
+            if used + encoded.len() <= limit {
+                used += encoded.len();
+                findings.push(value);
+            } else {
+                deferred += 1;
+            }
+        }
+    }
+    Ok(
+        json!({"findings":findings,"deferred_findings":deferred,"policy":"Preserved observations for navigation. Cite only original evidence supplied to this writing request after verifying each claim."}),
+    )
 }
 
 #[cfg(test)]

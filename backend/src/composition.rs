@@ -31,6 +31,8 @@ pub async fn understanding(
     let coverage = db::load_checkpoint(&pool, &id, "understanding:coverage").await?;
     let root = db::load_checkpoint(&pool, &id, "understanding:root").await?;
     let purpose = db::load_checkpoint(&pool, &id, "source_understanding").await?;
+    let graph = db::load_checkpoint(&pool, &id, "graph:coverage").await?;
+    let document_coverage = db::load_checkpoint(&pool, &id, "coverage:document").await?;
     let rows=sqlx::query("SELECT step,data FROM checkpoints WHERE run_id=? AND step LIKE 'understanding:node:%' AND step>? ORDER BY step LIMIT 21")
         .bind(&id).bind(page.after.unwrap_or_default()).fetch_all(&pool).await?;
     let has_more = rows.len() > 20;
@@ -46,7 +48,80 @@ pub async fn understanding(
     }
     let counts=sqlx::query("SELECT COUNT(*) total,SUM(status='indexed') indexed,SUM(status='excluded') excluded,SUM(status='skipped') skipped FROM files WHERE run_id=?").bind(&id).fetch_one(&pool).await?;
     Ok(Json(
-        json!({"coverage":coverage,"purpose":purpose.map(|v|json!({"brief":v.get("brief"),"validation_unresolved":v.get("validation_unresolved").and_then(Value::as_bool).unwrap_or(false)})),"overview":root.and_then(|v|v.pointer("/discovery/brief").cloned()),"batches":nodes,"next_cursor":cursor,"has_more":has_more,"total_files":counts.try_get::<i64,_>("total")?}),
+        json!({"coverage":coverage,"graph":graph,"document_coverage":document_coverage,"purpose":purpose.map(|v|json!({"brief":v.get("brief"),"validation_unresolved":v.get("validation_unresolved").and_then(Value::as_bool).unwrap_or(false)})),"overview":root.and_then(|v|v.pointer("/discovery/brief").cloned()),"batches":nodes,"next_cursor":cursor,"has_more":has_more,"total_files":counts.try_get::<i64,_>("total")?}),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct GraphPage {
+    file_id: Option<u64>,
+    after: Option<u64>,
+}
+#[utoipa::path(get,path="/api/v1/runs/{id}/graph",params(("id"=String,Path),("file_id"=Option<u64>,Query),("after"=Option<u64>,Query)),responses((status=200,body=Value)))]
+pub async fn graph(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(page): Query<GraphPage>,
+) -> Result<Json<Value>, ApiError> {
+    let pool = s.db().await?;
+    if let Some(file_id) = page.file_id {
+        let saved = db::load_checkpoint(&pool, &id, &format!("graph:file:{file_id}"))
+            .await?
+            .context("Source graph not available")?;
+        let file: crate::graph::FileGraph = serde_json::from_value(saved)?;
+        let offset = usize::try_from(page.after.unwrap_or(0)).unwrap_or(usize::MAX);
+        let next = offset.saturating_add(50);
+        let names: std::collections::HashMap<_, _> = file
+            .graph
+            .symbols
+            .iter()
+            .map(|s| (&s.id, &s.qualified_name))
+            .collect();
+        return Ok(Json(
+            json!({"path":file.path,"supported":file.graph.supported,"parse_errors":file.graph.parse_errors,
+            "symbols":file.graph.symbols.iter().skip(offset).take(50).collect::<Vec<_>>(),
+            "edges":file.graph.edges.iter().skip(offset).take(50).map(|e|json!({"source_name":names.get(&e.source),"edge":e})).collect::<Vec<_>>(),
+            "next_cursor":next,"has_more":next < file.graph.symbols.len().max(file.graph.edges.len())}),
+        ));
+    }
+    let rows = sqlx::query("SELECT id,path FROM files WHERE run_id=? AND status='indexed' AND id>? ORDER BY id LIMIT 21")
+        .bind(&id).bind(page.after.unwrap_or(0)).fetch_all(&pool).await?;
+    let more = rows.len() > 20;
+    let mut cursor = page.after.unwrap_or(0);
+    let mut files = vec![];
+    for row in rows.into_iter().take(20) {
+        cursor = row.try_get("id")?;
+        files.push(json!({"id":cursor,"path":row.try_get::<String,_>("path")?}));
+    }
+    Ok(Json(
+        json!({"files":files,"has_more":more,"next_cursor":cursor}),
+    ))
+}
+
+#[utoipa::path(get,path="/api/v1/runs/{id}/coverage",params(("id"=String,Path),("after"=Option<String>,Query)),responses((status=200,body=Value)))]
+pub async fn coverage(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(page): Query<Page>,
+) -> Result<Json<Value>, ApiError> {
+    let pool = s.db().await?;
+    let summary = db::load_checkpoint(&pool, &id, "coverage:document")
+        .await?
+        .unwrap_or(json!({}));
+    let scope = summary["scope"].as_str().unwrap_or_default();
+    let rows = sqlx::query("SELECT step,data FROM checkpoints WHERE run_id=? AND step LIKE 'coverage:item:%' AND step>? AND JSON_UNQUOTE(JSON_EXTRACT(data,'$.scope'))=? ORDER BY step LIMIT 21")
+        .bind(&id).bind(page.after.unwrap_or_default()).bind(scope).fetch_all(&pool).await?;
+    let more = rows.len() > 20;
+    let mut cursor = String::new();
+    let mut items = vec![];
+    for row in rows.into_iter().take(20) {
+        cursor = row.try_get("step")?;
+        items.push(serde_json::from_str::<Value>(
+            &row.try_get::<String, _>("data")?,
+        )?);
+    }
+    Ok(Json(
+        json!({"summary":summary,"items":items,"next_cursor":cursor,"has_more":more}),
     ))
 }
 #[utoipa::path(get,path="/api/v1/runs/{id}/outline",params(("id"=String,Path)),responses((status=200,body=Value)))]

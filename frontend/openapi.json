@@ -51,6 +51,90 @@
         }
       }
     },
+    "/api/v1/runs/{id}/coverage": {
+      "get": {
+        "tags": [
+          "crate::composition"
+        ],
+        "operationId": "coverage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{id}/graph": {
+      "get": {
+        "tags": [
+          "crate::composition"
+        ],
+        "operationId": "graph",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "file_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/runs/{id}/outline": {
       "get": {
         "tags": [
@@ -816,13 +900,15 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Retained for old outlines; new plans do not validate ownership."
           },
           "query": {
             "type": "string"
           },
           "reader_question": {
-            "type": "string"
+            "type": "string",
+            "description": "Legacy metadata; new outlines organize sections through key_points."
           },
           "title": {
             "type": "string"

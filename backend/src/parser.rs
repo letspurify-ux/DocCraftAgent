@@ -2,13 +2,15 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const VERSION: &str = "parser-v2";
+pub const VERSION: &str = "parser-v3-graph";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Parsed {
     pub language: String,
     pub has_errors: bool,
     pub chunks: Vec<Chunk>,
     pub relations: Vec<String>,
+    #[serde(default)]
+    pub graph: crate::code_graph::CodeGraph,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Chunk {
@@ -65,6 +67,7 @@ pub fn parse_file(path: &Path, lang: &str) -> Result<Parsed> {
             .parse(&content, None)
             .context("Parser returned no tree")?;
         has_errors = tree.root_node().has_error();
+        let graph = crate::code_graph::extract(tree.root_node(), &content);
         let mut cursor = tree.walk();
         loop {
             let node = cursor.node();
@@ -110,6 +113,7 @@ pub fn parse_file(path: &Path, lang: &str) -> Result<Parsed> {
                         has_errors,
                         chunks: chunk_text(&content, &boundaries, &names),
                         relations,
+                        graph,
                     });
                 }
             }
@@ -120,6 +124,7 @@ pub fn parse_file(path: &Path, lang: &str) -> Result<Parsed> {
         has_errors,
         chunks: chunk_text(&content, &boundaries, &names),
         relations,
+        graph: crate::code_graph::CodeGraph::default(),
     })
 }
 fn chunk_text(content: &str, boundaries: &[usize], names: &[(usize, String)]) -> Vec<Chunk> {
@@ -161,7 +166,6 @@ fn chunk_text(content: &str, boundaries: &[usize], names: &[(usize, String)]) ->
                     .iter()
                     .filter(|(b, _)| *b >= start && *b < end)
                     .map(|(_, n)| n.clone())
-                    .take(100)
                     .collect(),
                 content: slice.into(),
             });

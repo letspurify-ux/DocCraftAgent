@@ -33,10 +33,11 @@ pub struct Node {
 }
 
 /// Salvage independently validated observations; never relabel unsupported runtime claims.
-fn salvage(mut brief: SourceBrief, evidence: &[Evidence]) -> SourceBrief {
-    brief.findings = brief
+fn validated_findings(brief: &SourceBrief, evidence: &[Evidence]) -> Vec<crate::planning::Finding> {
+    brief
         .findings
-        .into_iter()
+        .iter()
+        .cloned()
         .filter_map(|finding| {
             let mut one = SourceBrief {
                 findings: vec![finding],
@@ -46,6 +47,11 @@ fn salvage(mut brief: SourceBrief, evidence: &[Evidence]) -> SourceBrief {
             validate_brief(&mut one, evidence, true).ok()?;
             one.findings.pop()
         })
+        .collect()
+}
+fn salvage(mut brief: SourceBrief, evidence: &[Evidence]) -> SourceBrief {
+    brief.findings = validated_findings(&brief, evidence)
+        .into_iter()
         .take(12)
         .collect();
     brief.uncertainties = brief
@@ -100,7 +106,7 @@ fn input_limit(ctx: &RunContext) -> usize {
 }
 
 /// Every byte belongs to one segment, including long lines and Unicode.
-fn segments(e: &Evidence, maximum: usize) -> Vec<Evidence> {
+pub(crate) fn segments(e: &Evidence, maximum: usize) -> Vec<Evidence> {
     let mut result = vec![];
     let mut offset = 0;
     let mut line = e.start;
@@ -185,6 +191,12 @@ async fn node(
     {
         object.remove("source_anchors");
     }
+    if children.is_empty() {
+        input["source_graph"] = crate::graph::context(ctx, &evidence, 4000).await?;
+        input["preservation_policy"] = json!(
+            "This is an overview of preserved originals. Use graph symbols and branches to check important contracts. Every supplied evidence passage must be cited by at least one finding; do not silently leave a passage unread. The final document is independently checked against originals even when a fact does not fit this overview."
+        );
+    }
     if final_overview {
         input["evidence"] = json!([]);
         input["instruction"] = json!(
@@ -195,7 +207,7 @@ async fn node(
     // same contract when resuming with explicitly changed model settings.
     let config = &ctx.snapshot.settings.llm;
     let key = format!("understanding:node:{}", source::hash(serde_json::to_string(&json!({
-        "version":5,"input":input,"children":children.iter().map(|n| &n.key).collect::<Vec<_>>(),"model":config.model,"endpoint":config.base_url,
+        "version":6,"input":input,"children":children.iter().map(|n| &n.key).collect::<Vec<_>>(),"model":config.model,"endpoint":config.base_url,
         "reasoning":config.reasoning,"effort":config.effort,"output":config.max_output_tokens
     }))?.as_bytes()));
     if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? {
@@ -224,6 +236,10 @@ async fn node(
                     serde_json::to_vec(&brief)?.len() <= 18_000,
                     "Source summary exceeds 18000 bytes; compress observations"
                 );
+                if children.is_empty() {
+                    ensure!(available.iter().all(|e| brief.findings.iter().any(|f|f.evidence_ids.contains(&e.id))),
+                        "Source overview left supplied passages unaccounted for; include a supported observation for every evidence ID");
+                }
                 Ok(())
             });
             if let Err(error) = validation {
@@ -246,6 +262,19 @@ async fn node(
                     .collect();
                 let mut files = files;
                 files.sort();
+                let details = unverified_brief
+                    .as_ref()
+                    .map(|original| validated_findings(original, &available))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|f| {
+                        !brief.findings.iter().any(|kept| {
+                            kept.topic == f.topic
+                                && kept.observation == f.observation
+                                && kept.evidence_ids == f.evidence_ids
+                        })
+                    })
+                    .collect();
                 let result = Node {
                     unresolved_nodes: children.iter().map(|n| n.unresolved_nodes).sum::<usize>()
                         + usize::from(!validation_issues.is_empty()),
@@ -260,17 +289,23 @@ async fn node(
                     files,
                     children: children.iter().map(|n| n.key.clone()).collect(),
                     discovery: Discovery {
-                        details: vec![],
+                        details,
                         validation_unresolved: false,
-                        evidence: available
-                            .into_iter()
-                            .filter(|e| {
-                                brief
-                                    .findings
-                                    .iter()
-                                    .any(|f| f.evidence_ids.contains(&e.id))
-                            })
-                            .collect(),
+                        // Leaves are the authoritative source memory. A summary
+                        // may not delete originals that it failed to mention.
+                        evidence: if children.is_empty() {
+                            available
+                        } else {
+                            available
+                                .into_iter()
+                                .filter(|e| {
+                                    brief
+                                        .findings
+                                        .iter()
+                                        .any(|f| f.evidence_ids.contains(&e.id))
+                                })
+                                .collect()
+                        },
                         brief,
                     },
                 };
@@ -305,7 +340,7 @@ fn reduction_work(mut nodes: usize) -> usize {
 }
 
 pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
-    if db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:version").await? == Some(json!(5))
+    if db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:version").await? == Some(json!(6))
         && let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:root").await?
     {
         return Ok(serde_json::from_value::<Node>(saved)?.discovery);
@@ -351,7 +386,7 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
             };
             for part in segments(&e, limit.saturating_sub(e.path.len() + 512)) {
                 let bytes = part.content.len() + part.path.len() + 256;
-                if size + bytes > limit && !group.is_empty() {
+                if (size + bytes > limit || group.len() >= 72) && !group.is_empty() {
                     nodes.push(
                         node(ctx, system, std::mem::take(&mut group), &[], false)
                             .await?
@@ -437,7 +472,7 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     for (step, value) in [
         ("understanding:root", serde_json::to_value(&root)?),
         ("understanding:coverage", coverage.clone()),
-        ("understanding:version", json!(5)),
+        ("understanding:version", json!(6)),
     ] {
         sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)").bind(&ctx.id).bind(step).bind(value.to_string()).execute(&mut *tx).await?;
     }

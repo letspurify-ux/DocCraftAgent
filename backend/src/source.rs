@@ -118,9 +118,13 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
         .await?
         .is_some()
     {
-        return Ok(());
+        return crate::graph::ensure(ctx).await;
     }
     sqlx::query("DELETE FROM chunks WHERE run_id=?")
+        .bind(&ctx.id)
+        .execute(&ctx.pool)
+        .await?;
+    sqlx::query("DELETE FROM checkpoints WHERE run_id=? AND step LIKE 'graph:%'")
         .bind(&ctx.id)
         .execute(&ctx.pool)
         .await?;
@@ -252,6 +256,7 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
             .bind(json!({"parse_errors":parsed.has_errors,"limited":lang=="text","relations":parsed.relations}).to_string()).execute(&ctx.pool).await?;
         let file_id = result.last_insert_id();
         persist_chunks(ctx, file_id, &normalized, &parsed.chunks).await?;
+        crate::graph::save(ctx, file_id, &normalized, parsed.graph).await?;
         indexed += 1;
         if indexed.is_multiple_of(10) || indexed == 1 {
             ctx.event("index", json!({"stage":"indexing","indexed":indexed,"excluded":excluded,"skipped":skipped,"parse_cache_hits":cache_hits,"current_file":normalized})).await?;
@@ -276,7 +281,7 @@ pub async fn index(ctx: &RunContext) -> Result<()> {
     )
     .await?;
     ctx.event("index",json!({"stage":"indexed","indexed":indexed,"excluded":excluded,"skipped":skipped,"parse_cache_hits":cache_hits})).await?;
-    Ok(())
+    crate::graph::ensure(ctx).await
 }
 
 /// A conflicting statement may leave earlier batches in the transaction alive
@@ -419,7 +424,7 @@ async fn record_file_status(
         .await?;
     Ok(())
 }
-async fn worker(ctx: &RunContext, path: &Path, lang: &str) -> Result<parser::Parsed> {
+pub(crate) async fn worker(ctx: &RunContext, path: &Path, lang: &str) -> Result<parser::Parsed> {
     let mut child = tokio::process::Command::new(std::env::current_exe()?)
         .arg("--parse-worker")
         .arg(path)
@@ -451,7 +456,7 @@ pub async fn retrieve(ctx: &RunContext, query: &str, max_bytes: usize) -> Result
     let fingerprint = db::load_checkpoint(&ctx.pool, &ctx.id, "index_fingerprint")
         .await?
         .unwrap_or(json!(ctx.id));
-    let key = hash(format!("retrieval-v7:{fingerprint}:{query}:{max_bytes}").as_bytes());
+    let key = hash(format!("retrieval-v8-graph:{fingerprint}:{query}:{max_bytes}").as_bytes());
     if let Some(row) = sqlx::query("SELECT data FROM retrieval_cache WHERE hash=?")
         .bind(&key)
         .fetch_optional(&ctx.pool)
@@ -460,6 +465,7 @@ pub async fn retrieve(ctx: &RunContext, query: &str, max_bytes: usize) -> Result
         return Ok(serde_json::from_str(&row.try_get::<String, _>("data")?)?);
     }
     let terms = search_terms(query);
+    let targets = crate::graph::targets(ctx, query).await?;
     let mut after = 0u64;
     let mut best: Vec<(i64, Evidence)> = vec![];
     loop {
@@ -474,7 +480,15 @@ pub async fn retrieve(ctx: &RunContext, query: &str, max_bytes: usize) -> Result
             let path: String = row.try_get("path")?;
             let content: String = row.try_get("content")?;
             let symbols: String = row.try_get("symbols")?;
-            let score = evidence_score(query, &terms, &path, &symbols, &content);
+            let start: u32 = row.try_get("start_line")?;
+            let end: u32 = row.try_get("end_line")?;
+            let graph_score = targets
+                .iter()
+                .filter(|t| t.path == path && t.span.overlaps(start, end))
+                .map(|t| t.score)
+                .max()
+                .unwrap_or(0);
+            let score = evidence_score(query, &terms, &path, &symbols, &content) + graph_score;
             best.push((
                 score,
                 Evidence {

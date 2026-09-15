@@ -34,13 +34,20 @@ type Brief = {
 };
 type Understanding = {
   coverage?: {
+    reading_complete?: boolean;
+    unresolved_nodes?: number;
     complete: boolean;
     read_files: number;
     read_chunks: number;
     read_batches: number;
   };
   overview?: Brief;
-  batches: { id: string; files: string[]; brief: Brief }[];
+  batches: {
+    id: string;
+    files: string[];
+    brief: Brief;
+    validation_issues?: string[];
+  }[];
   next_cursor: string;
   has_more: boolean;
   total_files: number;
@@ -198,9 +205,11 @@ export function Composition({ run }: { run: Run }) {
         <div className="composition-body">
           <p>
             전체 목록 {source.total_files.toLocaleString()}개 ·{" "}
-            {source.coverage?.complete
-              ? `원문 읽기 ${source.coverage.read_files}개 파일 / ${source.coverage.read_chunks}개 코드 묶음 완료`
-              : "전체 소스를 나누어 읽는 중입니다."}
+            {source.coverage?.reading_complete && !source.coverage.complete
+              ? `원문 읽기 완료 · ${source.coverage.unresolved_nodes ?? 0}개 분석 묶음에 검증 미해결 항목이 있습니다`
+              : source.coverage?.complete
+                ? `원문 읽기 ${source.coverage.read_files}개 파일 / ${source.coverage.read_chunks}개 코드 묶음 완료`
+                : "전체 소스를 나누어 읽는 중입니다."}
           </p>
           <small>
             읽기 범위는 이해 정확도를 의미하지 않습니다. 미확인 연결은 아래에
@@ -212,6 +221,11 @@ export function Composition({ run }: { run: Run }) {
               <summary>
                 {batch.files.map((p) => p.split(/[\\/]/).pop()).join(", ")}
               </summary>
+              {batch.validation_issues?.map((issue, index) => (
+                <p className="banner" key={index}>
+                  근거 검증 미해결: {issue}
+                </p>
+              ))}
               <BriefView brief={batch.brief} />
             </details>
           ))}

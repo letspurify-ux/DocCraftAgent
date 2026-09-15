@@ -22,6 +22,45 @@ pub struct Node {
     pub files: Vec<String>,
     pub children: Vec<String>,
     pub discovery: Discovery,
+    #[serde(default)]
+    pub unresolved_nodes: usize,
+    #[serde(default)]
+    pub validation_issues: Vec<String>,
+    #[serde(default)]
+    pub unverified_brief: Option<SourceBrief>,
+}
+
+/// Salvage independently validated observations; never relabel unsupported runtime claims.
+fn salvage(mut brief: SourceBrief, evidence: &[Evidence]) -> SourceBrief {
+    brief.findings = brief
+        .findings
+        .into_iter()
+        .filter_map(|finding| {
+            let mut one = SourceBrief {
+                findings: vec![finding],
+                uncertainties: vec![],
+                followup_queries: vec![],
+            };
+            validate_brief(&mut one, evidence, true).ok()?;
+            one.findings.pop()
+        })
+        .take(12)
+        .collect();
+    brief.uncertainties = brief
+        .uncertainties
+        .into_iter()
+        .chain(brief.followup_queries)
+        .filter(|s| !s.trim().is_empty() && s.len() <= 1500)
+        .take(7)
+        .collect();
+    brief.uncertainties.push("일부 소스 관찰은 근거 검증을 통과하지 못해 제외되었습니다. 해당 분석 묶음의 검증 오류와 원문을 재검토해야 합니다.".into());
+    brief.followup_queries = vec![];
+    while serde_json::to_vec(&brief).map_or(true, |v| v.len() > 18_000)
+        && !brief.findings.is_empty()
+    {
+        brief.findings.pop();
+    }
+    brief
 }
 
 fn input_limit(ctx: &RunContext) -> usize {
@@ -110,7 +149,9 @@ async fn node(
         .collect::<Vec<_>>();
     let mut input = json!({"phase":if children.is_empty(){"understanding_batch"}else{"understanding_reduce"},
         "language":ctx.snapshot.task.language,"final_pass":true,"evidence":evidence,
-        "summaries":summaries,"source_anchors":anchors,"instruction":if children.is_empty(){READ}else{REDUCE}});
+        "summaries":summaries,"source_anchors":anchors,
+        "evidence_classes":available.iter().map(|e| json!({"id":e.id,"path":e.path,"class":if source::is_implementation(&e.path){"implementation"}else{"context"}})).collect::<Vec<_>>(),
+        "classification_policy":"Use evidence_classes from the first attempt, including previously_read anchors. XML/configuration declarations are context: describe what is declared, not whether it is loaded or executed. Runtime observations must cite supplied implementation. If a batch has no implementation, return context observations only. On repair, preserve valid observations and rewrite only invalid ones; never merely relabel an unsupported execution claim.","instruction":if children.is_empty(){READ}else{REDUCE}});
     if children.is_empty()
         && let Some(object) = input.as_object_mut()
     {
@@ -126,7 +167,7 @@ async fn node(
     // same contract when resuming with explicitly changed model settings.
     let config = &ctx.snapshot.settings.llm;
     let key = format!("understanding:node:{}", source::hash(serde_json::to_string(&json!({
-        "version":if final_overview{3}else if children.is_empty(){1}else{2},"input":input,"model":config.model,"endpoint":config.base_url,
+        "version":4,"input":input,"children":children.iter().map(|n| &n.key).collect::<Vec<_>>(),"model":config.model,"endpoint":config.base_url,
         "reasoning":config.reasoning,"effort":config.effort,"output":config.max_output_tokens
     }))?.as_bytes()));
     if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? {
@@ -134,19 +175,28 @@ async fn node(
     }
     let mut error = String::new();
     for attempt in 0..3 {
+        let mut validation_issues = vec![];
+        let mut unverified_brief = None;
         let mut request = input.clone();
         request["attempt"] = json!(attempt);
         request["previous_error"] = json!(error);
-        if attempt > 0 {
-            request["evidence_classes"] = json!(evidence.iter().map(|e| json!({"path":e.path,"class":if source::is_implementation(&e.path){"implementation"}else{"context only"}})).collect::<Vec<_>>());
-        }
         let result = llm::call(ctx, system, request.clone()).await.and_then(|s| {
             let mut brief: SourceBrief = llm::decode(&s)?;
-            validate_brief(&mut brief, &available, true)?;
-            ensure!(
-                serde_json::to_vec(&brief)?.len() <= 18_000,
-                "Source summary exceeds 18000 bytes; compress observations"
-            );
+            let validation = validate_brief(&mut brief, &available, true).and_then(|_| {
+                ensure!(
+                    serde_json::to_vec(&brief)?.len() <= 18_000,
+                    "Source summary exceeds 18000 bytes; compress observations"
+                );
+                Ok(())
+            });
+            if let Err(error) = validation {
+                if attempt < 2 {
+                    return Err(error);
+                }
+                validation_issues.push(error.to_string());
+                unverified_brief = Some(brief.clone());
+                brief = salvage(brief, &available);
+            }
             Ok(brief)
         });
         match result {
@@ -160,6 +210,10 @@ async fn node(
                 let mut files = files;
                 files.sort();
                 let result = Node {
+                    unresolved_nodes: children.iter().map(|n| n.unresolved_nodes).sum::<usize>()
+                        + usize::from(!validation_issues.is_empty()),
+                    validation_issues,
+                    unverified_brief,
                     key: key.clone(),
                     files,
                     children: children.iter().map(|n| n.key.clone()).collect(),
@@ -176,6 +230,9 @@ async fn node(
                         brief,
                     },
                 };
+                if !result.validation_issues.is_empty() {
+                    ctx.event("source_validation_warning", json!({"node":key,"files":result.files,"issues":result.validation_issues,"retained_findings":result.discovery.brief.findings.len(),"title":"검증 미해결 항목을 보존하고 소스 읽기를 계속합니다"})).await?;
+                }
                 db::checkpoint(&ctx.pool, &ctx.id, &key, &serde_json::to_value(&result)?).await?;
                 return Ok(result);
             }
@@ -204,7 +261,7 @@ fn reduction_work(mut nodes: usize) -> usize {
 }
 
 pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
-    if db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:version").await? == Some(json!(3))
+    if db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:version").await? == Some(json!(4))
         && let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:root").await?
     {
         return Ok(serde_json::from_value::<Node>(saved)?.discovery);
@@ -331,19 +388,19 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
             .bind(&ctx.id)
             .fetch_one(&ctx.pool)
             .await?;
-    let coverage = json!({"complete":true,"read_files":files,"read_chunks":chunks_read,"read_batches":batch_count,"levels":level,"root":root.key});
+    let coverage = json!({"complete":root.unresolved_nodes == 0,"reading_complete":true,"unresolved_nodes":root.unresolved_nodes,"read_files":files,"read_chunks":chunks_read,"read_batches":batch_count,"levels":level,"root":root.key});
     let mut tx = ctx.pool.begin().await?;
     for (step, value) in [
         ("understanding:root", serde_json::to_value(&root)?),
         ("understanding:coverage", coverage.clone()),
-        ("understanding:version", json!(3)),
+        ("understanding:version", json!(4)),
     ] {
         sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)").bind(&ctx.id).bind(step).bind(value.to_string()).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     ctx.event(
         "source_understanding_complete",
-        json!({"stage":"understood","title":"전체 소스 읽기와 흐름 종합 완료","coverage":coverage}),
+        json!({"stage":"understood","title":if root.unresolved_nodes == 0 {"전체 소스 읽기와 흐름 종합 완료"} else {"전체 소스 읽기 완료 · 검증 미해결 항목 있음"},"coverage":coverage}),
     )
     .await?;
     Ok(root.discovery)
@@ -352,6 +409,48 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn salvage_keeps_valid_observations_without_relabeling_xml_runtime() {
+        let xml = Evidence {
+            id: source::hash(b"xml"),
+            path: "/project/mapper.xml".into(),
+            start: 1,
+            end: 1,
+            content: "<select id=\"load\">SELECT 1</select>".into(),
+        };
+        let code = Evidence {
+            id: source::hash(b"code"),
+            path: "/project/main.rs".into(),
+            start: 1,
+            end: 1,
+            content: "fn main() {}".into(),
+        };
+        let brief: SourceBrief = serde_json::from_value(json!({
+            "findings":[
+                {"topic":"unsupported execution","observation":"The mapper executes on startup", "kind":"runtime","evidence_ids":[xml.id]},
+                {"topic":"declaration","observation":"XML declares a select statement", "kind":"context","evidence_ids":[xml.id]},
+                {"topic":"entry","observation":"An empty main is defined", "kind":"runtime","evidence_ids":[&code.id[..8]]},
+                {"topic":"unknown anchor","observation":"Unverified", "kind":"context","evidence_ids":["ffffffff"]}
+            ],"uncertainties":[],"followup_queries":[]
+        })).unwrap();
+        let recovered = salvage(brief, &[xml, code.clone()]);
+        assert_eq!(recovered.findings.len(), 2);
+        assert_eq!(recovered.findings[0].topic, "declaration");
+        assert_eq!(recovered.findings[1].evidence_ids, vec![code.id]);
+        assert!(!recovered.uncertainties.is_empty());
+    }
+
+    #[test]
+    fn salvage_does_not_invent_findings_when_all_evidence_is_invalid() {
+        let brief: SourceBrief = serde_json::from_value(json!({
+            "findings":[{"topic":"invalid","observation":"Unsupported execution", "kind":"runtime","evidence_ids":["ffffffff"]}],
+            "uncertainties":[],"followup_queries":[]
+        })).unwrap();
+        let recovered = salvage(brief, &[]);
+        assert!(recovered.findings.is_empty());
+        assert_eq!(recovered.uncertainties.len(), 1);
+    }
+
     #[test]
     fn reduction_progress_counts_only_summaries_that_are_created() {
         assert_eq!(reduction_work(1), 0);

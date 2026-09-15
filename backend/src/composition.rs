@@ -40,7 +40,7 @@ pub async fn understanding(
         let n: crate::understanding::Node =
             serde_json::from_str(&row.try_get::<String, _>("data")?)?;
         if n.children.is_empty() {
-            nodes.push(json!({"id":n.key,"files":n.files,"brief":n.discovery.brief}));
+            nodes.push(json!({"id":n.key,"files":n.files,"brief":n.discovery.brief,"validation_issues":n.validation_issues}));
         }
     }
     let counts=sqlx::query("SELECT COUNT(*) total,SUM(status='indexed') indexed,SUM(status='excluded') excluded,SUM(status='skipped') skipped FROM files WHERE run_id=?").bind(&id).fetch_one(&pool).await?;

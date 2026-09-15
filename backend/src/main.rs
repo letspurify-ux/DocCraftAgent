@@ -12,6 +12,7 @@ mod parser;
 mod planning;
 mod publish;
 mod runner;
+mod section_output;
 mod source;
 #[cfg(test)]
 mod test_support;

@@ -73,13 +73,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result=json.dumps({'reader_goal':'입력을 보내고 결과와 오류를 이해한다','storyline':'입력 준비에서 실행, 결과 확인과 오류 대응으로 이어진다','terminology':['처리 결과: 검증을 마친 반환값'],'sections':[{'title':'기능 개요','query':'handle_request handleRequest validation','reader_question':'무엇을 할 수 있는가?','handoff':'검증 조건을 확인한다','diagrams':['입력과 검증 흐름']},{'title':'오류와 제약','query':'name_required errors','reader_question':'어떤 입력이 유효한가?','handoff':'검증을 통과한 입력을 처리한다','diagrams':['오류 분기']},{'title':'처리 흐름','query':'return handle_request','reader_question':'결과를 어떻게 확인하는가?','handoff':'','diagrams':['결과 반환 흐름']}]},ensure_ascii=False)
                 outline=json.loads(result)
                 for index,section in enumerate(outline['sections']):
-                    section['depends_on']=[index-1] if index else []
+                    section['prerequisite_titles']=[outline['sections'][index-1]['title']] if index else []
                     section['owns_requirement_ids']=[f'r{index+1}']
                     section['key_points']=[section['reader_question']]
                     section['out_of_scope']=[]
                     section['evidence_ids']=[data['source_brief']['findings'][0]['evidence_ids'][0]]
                 if model=='planning-dependency-once' and not data.get('previous_error'):
-                    outline['sections'][0]['depends_on']=[2]
+                    outline['sections'][0]['prerequisite_titles']=[outline['sections'][2]['title']]
                 result=json.dumps(outline,ensure_ascii=False)
                 if model=='outline-overflow-once' and data.get('previous_error'):
                     outline=json.loads(result);outline['sections'][-1]['diagrams']=[];result=json.dumps(outline,ensure_ascii=False)
@@ -129,6 +129,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finish='stop'
         if model=='truncate-once' and content!='Reply with OK only.' and 'Write only Markdown' in instruction and not getattr(self.server,'truncated',False):
             self.server.truncated=True;finish='length'
+            split=result.index('[E:')+5
+            self.server.truncate_remainder=result[split:]
+            result=result[:split]
+        elif model=='truncate-once' and content!='Reply with OK only.' and data.get('continuation'):
+            assert data['continuation']['resume_exactly']
+            result=self.server.truncate_remainder
+        if model=='section-parts' and content!='Reply with OK only.' and 'Write only Markdown' in instruction:
+            if not data.get('continuation'):
+                result=f'### 입력 확인\n입력 이름의 검증 조건을 확인합니다. [E:{eid}]\n\n<!-- DOCCRAFT_SECTION_MORE -->'
+            else:
+                assert not data['continuation']['resume_exactly']
+                result='### 결과 확인\n'+result
         body={'choices':[{'message':{'content':result},'finish_reason':finish}],'usage':{'prompt_tokens':100,'completion_tokens':100,'completion_tokens_details':{'reasoning_tokens':0}}}
         self.reply(body)
     def reply(self,body,status=200):
@@ -219,7 +231,7 @@ def main():
             probe['llm']['proxy_mode']='custom';probe['llm']['proxy_url']=f'http://127.0.0.1:{MOCK}';probe['llm']['base_url']='http://upstream.invalid/v1'
             assert api('/settings/test-llm','POST',probe)['ok']
             print('PASS reasoning mappings and explicit HTTP proxy',flush=True)
-            for model in ['normal','context-once','retry-once','invalid-once','review-once','truncate-once','headings','wrapped-markdown','duplicate-once','section-review-format-once','mermaid-once','body-disconnect-once','provider-error-once','coherence-once','diagram-overflow-once','coherence-format-once','planning-followup','planning-citation-once','planning-dependency-once']:
+            for model in ['normal','context-once','retry-once','invalid-once','review-once','truncate-once','section-parts','headings','wrapped-markdown','duplicate-once','section-review-format-once','mermaid-once','body-disconnect-once','provider-error-once','coherence-once','diagram-overflow-once','coherence-format-once','planning-followup','planning-citation-once','planning-dependency-once']:
                 configure(model);t=task(model);rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
                 assert r['status']=='completed',r
                 if model=='review-once':assert r['tokens']>=1800,r
@@ -240,19 +252,27 @@ def main():
                         assert any('open_questions' in x for x in readings)
                         assert any(e['path'].endswith('service.py') for e in readings[-1]['evidence'])
                     if model=='planning-citation-once':assert any('Unknown or ambiguous evidence ID' in x.get('previous_error','') for x in readings)
-                    if model=='planning-dependency-once':assert len(plans)==2 and 'earlier zero-based' in plans[1]['previous_error']
+                    if model=='planning-dependency-once':assert len(plans)==2 and 'a later section' in plans[1]['previous_error'] and len(plans[1]['previous_section_dependencies'])==3
+                if model=='section-parts':
+                    writes=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
+                    assert len(writes)==6 and sum(bool(x.get('continuation')) for x in writes)==3
+                    assert '<!-- DOCCRAFT_SECTION_MORE -->' not in text
+                    assert '### 입력 확인' in text and '### 결과 확인' in text
                 if model in ['invalid-once','truncate-once','mermaid-once']:
                     writes=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
                     assert writes[0]['evidence']==writes[1]['evidence'], 'Repair discarded evidence'
                     assert len(writes[0]['other_sections'])==2
                     if model=='invalid-once':
                         assert writes[1]['correction']['previous']=='Unsupported claim [E:999999999]'
-                        assert 'Maximum 1200 words' in writes[1]['instruction']
+                        assert 'There is no fixed word-count ceiling' in writes[1]['instruction']
                     elif model=='mermaid-once':
                         assert 'Keep this fact' in writes[1]['correction']['previous']
                         assert 'Parse error' in writes[1]['correction']['issues'][0]['message']
-                        assert 'Maximum 1200 words' in writes[1]['instruction']
-                    else: assert 'Maximum 600 words' in writes[1]['instruction']
+                        assert 'There is no fixed word-count ceiling' in writes[1]['instruction']
+                    else:
+                        assert writes[1]['continuation']['resume_exactly']
+                        assert writes[1]['instruction']==writes[0]['instruction']
+                        assert 'There is no fixed word-count ceiling' in writes[1]['instruction']
                 if model=='coherence-once':
                     data=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model]
                     reviews=[x for x in data if 'Review the whole document' in x.get('instruction','')]

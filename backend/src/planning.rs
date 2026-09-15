@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 const DISCOVERY: &str = "Read source evidence before planning the document. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[string]}. Do not produce a table of contents yet. Infer the intended reader and task from purpose, then read actual source passages to identify the relevant entry, prerequisites, actors, inputs, processing, persisted or returned results, consumer, and important alternative/error paths. Adapt to the supplied project; do not force a web request model onto unrelated code. Each finding must explain a concrete connection or behavior, including conditions and outputs, rather than list symbols. Use at most 12 findings, each with a short topic and observation (maximum 1200 characters), and 1-6 supplied evidence IDs. Runtime findings require implementation evidence; filenames, imports, README, comments and tests alone do not prove execution. Context findings can describe documented setup or intended usage, explicitly distinguished from observed implementation. Inventory is only a sampled navigation aid. Do not infer a call order from names or treat separate alternatives as consecutive steps. Mark missing links in uncertainties (at most 8). Request at most 3 focused followup_queries naming observed files/symbols or unresolved connections most important to the reader; prefer finding missing entry/result/branch evidence over more detail on already understood helpers. Do not invent identifiers. On the final pass, return no followup_queries and retain unresolved links in uncertainties. Carry relevant findings from verified_overview using its previously_read source anchors; those observations were checked against the originals in the exhaustive reading. Use passages in THIS request for new claims and connections. Do not treat omitted excerpts as missing project coverage; prior gaps are research questions, not facts. Use the requested language for observations and uncertainties. Empty findings are invalid; if only contextual evidence exists, say so without inventing runtime behavior.";
 
-const PLAN: &str = "Return JSON {sections:[{title:string,query:string,reader_question:string,handoff:string,diagrams:[string],depends_on:[number],evidence_ids:[string]}],reader_goal:string,storyline:string,terminology:[string]}. Design one coherent document for the intended reader using the source_brief AND actual evidence read before this plan. The brief is an evidence-linked analysis, not independently verified truth: resolve contradictions against supplied implementation and respect its uncertainties. inventory_sample is only a navigation map: its paths may be named in section queries but are not evidence and must never appear in evidence_ids. Infer the audience and desired outcome from purpose. Choose 1-32 distinct sections in the order the reader needs to understand or perform the work. 32 is a hard ceiling, not a target. Choose the smallest section count that covers the requested scope clearly, based on reader goals, source-supported workflows, complexity and distinct reader questions. A narrow topic may need only 1-3 sections. Add a section only when it answers a substantial separate reader question; merge overlapping or thin topics and use subsections for supporting details. Do not create one section per file or module, pad the outline, or split a coherent workflow just to increase the count. Explain briefly in storyline why the chosen scope and grouping suit this document. Start with orientation and the relevant end-to-end picture, then introduce prerequisites before the actions that need them, show one normal path through to an observable result, and place alternatives/troubleshooting where they help the reader. Adapt the order to the actual source and purpose, not a fixed template or catalog of files/classes/subsystems. Separate reading order from runtime order: conditional branches and independent workflows must not become a fictional single execution trace. reader_goal states what the reader should achieve. storyline explains how the questions connect and why this order helps that goal. Each reader_question is one non-duplicated question this section resolves; handoff identifies the concrete result or decision the next section builds on (empty only for the final section). depends_on lists only earlier zero-based SECTION indices needed to understand this section; it is a reading prerequisite, not a function call graph. Every section must carry 1-8 supplied evidence_ids that anchor its topic. previously_read source_anchors are originals checked during earlier reading and can anchor an existing source_brief finding even if the passage is not repeated in this bounded request; they do not justify inventing new behavior. query names concrete implementation files, symbols and actions needed to deepen those anchors during writing. For cross-layer or end-to-end documentation, distribute queries across the relevant entry, orchestration, persistence, maintenance and result-consumer modules visible in inventory_sample instead of repeatedly relying on the same few files. For an end-to-end guide, include the evidenced entry, orchestration and result consumer in the opening section's anchors/query where available. Do not invent missing links to make the story smooth; explain limits or separate paths. Assign each explanation to one section to avoid repeated overviews. terminology contains at most 12 short, consistent definitions supported by evidence. Allocate diagrams across the WHOLE document, at most 4 per section: each diagrams entry is one plain-language objective, NEVER diagram code or an assumed call sequence. An empty array means no diagram. Name diagram types explicitly when purpose requests them. Respect max_diagrams (null means no numeric cap) and the requested global number/types; do not repeat an overall flow diagram in every section. Keep titles under 300 bytes, query under 2000 bytes, reader_question and handoff under 1500 bytes, reader_goal under 2000 bytes, storyline under 4000 bytes and each terminology entry under 500 bytes. Use the requested document language. Coverage is selective; never claim all code was understood.";
+const PLAN: &str = "Return JSON {sections:[{title:string,query:string,reader_question:string,handoff:string,diagrams:[string],prerequisite_titles:[string],evidence_ids:[string]}],reader_goal:string,storyline:string,terminology:[string]}. Design one coherent document for the intended reader using the source_brief AND actual evidence read before this plan. The brief is an evidence-linked analysis, not independently verified truth: resolve contradictions against supplied implementation and respect its uncertainties. inventory_sample is only a navigation map: its paths may be named in section queries but are not evidence and must never appear in evidence_ids. Infer the audience and desired outcome from purpose. Choose 1-32 distinct sections in the order the reader needs to understand or perform the work. 32 is a hard ceiling, not a target. Choose the smallest section count that covers the requested scope clearly, based on reader goals, source-supported workflows, complexity and distinct reader questions. A narrow topic may need only 1-3 sections. Add a section only when it answers a substantial separate reader question; merge overlapping or thin topics and use subsections for supporting details. Do not create one section per file or module, pad the outline, or split a coherent workflow just to increase the count. Explain briefly in storyline why the chosen scope and grouping suit this document. Start with orientation and the relevant end-to-end picture, then introduce prerequisites before the actions that need them, show one normal path through to an observable result, and place alternatives/troubleshooting where they help the reader. Adapt the order to the actual source and purpose, not a fixed template or catalog of files/classes/subsystems. Separate reading order from runtime order: conditional branches and independent workflows must not become a fictional single execution trace. reader_goal states what the reader should achieve. storyline explains how the questions connect and why this order helps that goal. Each reader_question is one non-duplicated question this section resolves; handoff identifies the concrete result or decision the next section builds on (empty only for the final section). prerequisite_titles lists the exact titles of earlier sections needed to understand this section; use [] when none, always [] for the first section. These are reading prerequisites, not function calls. Use title strings, never section numbers, requirement IDs or evidence IDs. Do not return numeric depends_on; the caller resolves titles to indices. Finish the section order and unique titles before assigning prerequisites. If a required prerequisite appears later, move it before use and update storyline and handoffs consistently; do not discard a real prerequisite just to satisfy ordering. Do not list the current section or repeat a title. Every section must carry 1-8 supplied evidence_ids that anchor its topic. previously_read source_anchors are originals checked during earlier reading and can anchor an existing source_brief finding even if the passage is not repeated in this bounded request; they do not justify inventing new behavior. query names concrete implementation files, symbols and actions needed to deepen those anchors during writing. For cross-layer or end-to-end documentation, distribute queries across the relevant entry, orchestration, persistence, maintenance and result-consumer modules visible in inventory_sample instead of repeatedly relying on the same few files. For an end-to-end guide, include the evidenced entry, orchestration and result consumer in the opening section's anchors/query where available. Do not invent missing links to make the story smooth; explain limits or separate paths. Assign each explanation to one section to avoid repeated overviews. terminology contains at most 12 short, consistent definitions supported by evidence. Allocate diagrams across the WHOLE document, at most 4 per section: each diagrams entry is one plain-language objective, NEVER diagram code or an assumed call sequence. An empty array means no diagram. Name diagram types explicitly when purpose requests them. Respect max_diagrams (null means no numeric cap) and the requested global number/types; do not repeat an overall flow diagram in every section. Keep titles under 300 bytes, query under 2000 bytes, reader_question and handoff under 1500 bytes, reader_goal under 2000 bytes, storyline under 4000 bytes and each terminology entry under 500 bytes. Use the requested document language. Coverage is selective; never claim all code was understood.";
 
 pub(crate) const FINDING_KIND_POLICY: &str = "For each finding, kind must be exactly the JSON string \"runtime\" or \"context\". The word implementation describes source evidence, never a third finding kind. runtime_allowed is a boolean describing whether an evidence anchor can support a runtime finding; it is not the finding kind. Use runtime only with at least one supplied implementation anchor. Use context for declarations, documentation or test intent without asserting execution. Always include findings, uncertainties and followup_queries as arrays; use [] for empty lists, never null. Return one JSON object without Markdown fences.";
 
@@ -218,13 +218,27 @@ pub(crate) fn validate_outline(
             "Sections must have distinct titles and reader questions"
         );
         let mut dependencies = HashSet::new();
-        ensure!(
-            section
-                .depends_on
-                .iter()
-                .all(|d| *d < index && dependencies.insert(*d)),
-            "depends_on must contain distinct earlier zero-based section indices; place prerequisites before use"
-        );
+        for dependency in &section.depends_on {
+            ensure!(
+                *dependency < index,
+                "sections[{index}] ({:?}).depends_on={:?}: index {dependency} is {}; only indices below {index} are allowed (the first section must use []). Use prerequisite_titles with exact earlier titles when generating an outline. Move a real prerequisite before use and update handoffs/storyline; do not guess a different index",
+                section.title,
+                section.depends_on,
+                if *dependency >= count {
+                    "outside the section array"
+                } else if *dependency == index {
+                    "a self-reference"
+                } else {
+                    "a forward reference"
+                }
+            );
+            ensure!(
+                dependencies.insert(*dependency),
+                "sections[{index}] ({:?}).depends_on={:?}: repeated index {dependency}; include each prerequisite only once",
+                section.title,
+                section.depends_on
+            );
+        }
         ensure!(
             section
                 .diagrams
@@ -245,6 +259,86 @@ pub(crate) fn validate_outline(
         bail!("{error}");
     }
     Ok(())
+}
+
+/// Resolve generated title references locally. Numeric dependencies remain supported
+/// for old providers/checkpoints; never guess whether their numbering is one-based.
+fn decode_generated_outline(response: &str, repair: &mut llm::JsonRepair) -> Result<Outline> {
+    let mut value: serde_json::Value = repair.decode(response)?;
+    if let Some(sections) = value.get_mut("sections").and_then(|v| v.as_array_mut()) {
+        let titles: Vec<Option<String>> = sections
+            .iter()
+            .map(|s| s.get("title").and_then(|v| v.as_str()).map(str::to_owned))
+            .collect();
+        for (index, section) in sections.iter_mut().enumerate() {
+            if let Some(raw) = section.get("prerequisite_titles") {
+                let references: Vec<String> = serde_json::from_value(raw.clone())
+                    .with_context(|| format!("sections[{index}].prerequisite_titles must be an array of exact title strings; use [] when empty"))?;
+                let mut dependencies = vec![];
+                for title in references {
+                    let matches: Vec<_> = titles
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, candidate)| {
+                            (candidate.as_deref() == Some(title.as_str())).then_some(i)
+                        })
+                        .collect();
+                    ensure!(
+                        matches.len() == 1,
+                        "sections[{index}] ({:?}).prerequisite_titles: {:?} matches {} sections; use an exact unique section title. Available earlier titles: {:?}",
+                        titles[index],
+                        title,
+                        matches.len(),
+                        &titles[..index]
+                    );
+                    let dependency = matches[0];
+                    ensure!(
+                        dependency < index,
+                        "sections[{index}] ({:?}).prerequisite_titles: {:?} refers to sections[{dependency}], {}; available earlier titles: {:?}. Move a real prerequisite before use and update storyline and handoffs; do not drop it or guess another title",
+                        titles[index],
+                        title,
+                        if dependency == index {
+                            "the current section"
+                        } else {
+                            "a later section"
+                        },
+                        &titles[..index]
+                    );
+                    if !dependencies.contains(&dependency) {
+                        dependencies.push(dependency);
+                    }
+                }
+                // Explicit named references are authoritative in the generation contract.
+                section["depends_on"] = json!(dependencies);
+            }
+        }
+    }
+    let mut plan: Outline = llm::decode(&serde_json::to_string(&value)?)?;
+    // Repetition carries no additional meaning; keep the first occurrence.
+    for section in &mut plan.sections {
+        let mut seen = HashSet::new();
+        section.depends_on.retain(|d| seen.insert(*d));
+    }
+    Ok(plan)
+}
+
+/// Include every section in repair context even when the full response is excerpted.
+fn dependency_repair_context(response: &str) -> serde_json::Value {
+    let Ok(value) = llm::decode::<serde_json::Value>(response) else {
+        return json!([]);
+    };
+    json!(
+        value
+            .get("sections")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .take(32)
+            .enumerate()
+            .map(|(index, s)| json!({"index":index,"title":s.get("title"),
+            "prerequisite_titles":s.get("prerequisite_titles"),"depends_on":s.get("depends_on")}))
+            .collect::<Vec<_>>()
+    )
 }
 
 /// Keep real passages intact (and their hashes valid), distributing space across
@@ -498,9 +592,16 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
             "source_brief":brief,"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"project_overview":inventory,"requirements":requirements,"feedback":feedback,"revision":revision,
             "evidence":evidence,"max_diagrams":ctx.snapshot.task.max_diagrams,
             "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{PLAN} Additionally each section must include owns_requirement_ids (each supplied requirement has exactly ONE owner across the document), key_points (1-12 concrete explanations), and out_of_scope (topics owned elsewhere). Respect user feedback and preserve valid existing section IDs when supplied. Do not remove requirements to hide missing coverage.")});
+            input["dependency_example"] = json!({"description":"Shape example only; choose titles and prerequisites from the actual document",
+                "sections":[{"title":"Prepare input","prerequisite_titles":[]},
+                    {"title":"Process input","prerequisite_titles":["Prepare input"]},
+                    {"title":"Read results","prerequisite_titles":["Process input"]}]});
             repair.apply(&mut input);
+            if let Some(response) = &repair.response {
+                input["previous_section_dependencies"] = dependency_repair_context(response);
+            }
             let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
-                let mut plan: Outline = repair.decode(&s)?;
+                let mut plan = decode_generated_outline(&s, &mut repair)?;
                 plan.requirements = requirements.clone();
                 plan.revision = revision;
                 validate_outline(
@@ -807,6 +908,114 @@ mod tests {
         brief.findings[0].evidence_ids = vec![implementation.id[..8].into()];
         assert!(validate_brief(&mut brief, &[implementation, collision], true).is_err());
         Ok(())
+    }
+
+    fn generated_plan(count: usize) -> serde_json::Value {
+        json!({"reader_goal":"Understand the workflow","storyline":"Prepare, process, inspect",
+            "terminology":[],"sections":(0..count).map(|index| json!({
+                "title":format!("단계 {}", index + 1),"query":"process",
+                "reader_question":format!("What does step {} do?",index + 1),
+                "handoff":if index + 1 < count {"Use the result in the next step"} else {""},
+                "prerequisite_titles":if index > 0 {vec![format!("단계 {index}")]} else {vec![]},
+                "diagrams":[],"evidence_ids":[]
+            })).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn generated_title_prerequisites_resolve_through_32_sections() -> Result<()> {
+        let source = evidence("/project/main.py", "def process(): return 1");
+        let mut value = generated_plan(32);
+        for section in value["sections"].as_array_mut().unwrap() {
+            section["evidence_ids"] = json!([source.id]);
+        }
+        value["sections"][31]["prerequisite_titles"] = json!(["단계 1", "단계 31", "단계 1"]);
+        let mut repair = llm::JsonRepair::default();
+        let mut plan = decode_generated_outline(&value.to_string(), &mut repair)?;
+        assert!(plan.sections[0].depends_on.is_empty());
+        assert_eq!(plan.sections[1].depends_on, vec![0]);
+        assert_eq!(plan.sections[30].depends_on, vec![29]);
+        assert_eq!(plan.sections[31].depends_on, vec![0, 30]);
+        validate_outline(&mut plan, &[source], Some(0))?;
+        let stored = serde_json::to_value(&plan)?;
+        assert!(stored["sections"][31].get("prerequisite_titles").is_none());
+        assert_eq!(stored["sections"][31]["depends_on"], json!([0, 30]));
+        Ok(())
+    }
+
+    #[test]
+    fn generated_dependencies_report_bad_references_without_guessing() -> Result<()> {
+        for (index, titles, expected) in [
+            (0, json!(["단계 1"]), "the current section"),
+            (0, json!(["단계 2"]), "a later section"),
+            (1, json!(["missing"]), "matches 0 sections"),
+            (1, json!([0]), "array of exact title strings"),
+            (1, json!(null), "array of exact title strings"),
+        ] {
+            let mut value = generated_plan(3);
+            value["sections"][index]["prerequisite_titles"] = titles;
+            let result =
+                decode_generated_outline(&value.to_string(), &mut llm::JsonRepair::default());
+            let error = result
+                .err()
+                .context("Invalid dependency unexpectedly accepted")?
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(error.contains(&format!("sections[{index}]")), "{error}");
+        }
+        let mut duplicate = generated_plan(3);
+        duplicate["sections"][1]["title"] = json!("단계 1");
+        duplicate["sections"][1]["prerequisite_titles"] = json!([]);
+        duplicate["sections"][2]["prerequisite_titles"] = json!(["단계 1"]);
+        let error =
+            decode_generated_outline(&duplicate.to_string(), &mut llm::JsonRepair::default())
+                .err()
+                .context("Ambiguous titles unexpectedly accepted")?;
+        assert!(error.to_string().contains("matches 2 sections"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_generated_dependencies_deduplicate_but_do_not_shift_numbering() -> Result<()> {
+        let source = evidence("/project/main.py", "def process(): return 1");
+        let mut value = generated_plan(3);
+        for section in value["sections"].as_array_mut().unwrap() {
+            section
+                .as_object_mut()
+                .unwrap()
+                .remove("prerequisite_titles");
+            section["evidence_ids"] = json!([source.id]);
+        }
+        value["sections"][1]["depends_on"] = json!([0, 0]);
+        let mut plan =
+            decode_generated_outline(&value.to_string(), &mut llm::JsonRepair::default())?;
+        assert_eq!(plan.sections[1].depends_on, vec![0]);
+        validate_outline(&mut plan, std::slice::from_ref(&source), Some(0))?;
+        for (reference, reason) in [
+            (1, "a self-reference"),
+            (2, "a forward reference"),
+            (3, "outside the section array"),
+        ] {
+            plan.sections[1].depends_on = vec![reference];
+            let error = validate_outline(&mut plan, std::slice::from_ref(&source), Some(0))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("sections[1]"), "{error}");
+            assert!(error.contains(reason), "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_repair_includes_middle_sections_of_long_responses() {
+        let mut value = generated_plan(32);
+        for section in value["sections"].as_array_mut().unwrap() {
+            section["key_points"] = json!(["detail".repeat(1000)]);
+        }
+        let context = dependency_repair_context(&value.to_string());
+        assert_eq!(context.as_array().unwrap().len(), 32);
+        assert_eq!(context[16]["title"], "단계 17");
+        assert_eq!(context[16]["prerequisite_titles"], json!(["단계 16"]));
+        assert!(context[16].get("key_points").is_none());
     }
 
     #[test]

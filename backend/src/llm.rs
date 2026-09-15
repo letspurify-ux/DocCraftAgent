@@ -5,6 +5,21 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use std::time::{Duration, Instant};
 
+/// Preserve visible text from length-limited responses without caching it as complete.
+#[derive(Debug)]
+pub struct TruncatedOutput {
+    pub content: String,
+}
+impl std::fmt::Display for TruncatedOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OUTPUT_TRUNCATED: response reached its output token limit"
+        )
+    }
+}
+impl std::error::Error for TruncatedOutput {}
+
 pub fn client(c: &LlmConfig) -> Result<reqwest::Client> {
     let mut b = reqwest::Client::builder()
         .timeout(Duration::from_secs(c.timeout_seconds))
@@ -255,8 +270,15 @@ pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<St
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     if finish == "length" {
-                        ctx.event("output_limit",json!({"stage":"repairing","output_tokens":output_tokens,"reasoning_tokens":reasoning,"reasoning_dominated":reasoning_dominated(output_tokens,reasoning),"message":if reasoning_dominated(output_tokens,reasoning) { "출력 한도의 대부분을 추론에 사용했습니다. Reasoning 설정 또는 출력 한도를 확인하세요." } else { "출력이 잘려 더 짧은 초안을 생성합니다." }})).await?;
-                        bail!("OUTPUT_TRUNCATED: retry a smaller section");
+                        ctx.event("output_limit",json!({"stage":"repairing","output_tokens":output_tokens,"reasoning_tokens":reasoning,"reasoning_dominated":reasoning_dominated(output_tokens,reasoning),"message":if reasoning_dominated(output_tokens,reasoning) { "출력 한도의 대부분을 추론에 사용했습니다. Reasoning 설정 또는 출력 한도를 확인하세요." } else { "출력이 한도에 도달했습니다. 본문 작성은 생성된 내용을 보존하고 이어 씁니다." }})).await?;
+                        return Err(TruncatedOutput {
+                            content: body
+                                .pointer("/choices/0/message/content")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        }
+                        .into());
                     }
                     if finish != "stop" {
                         bail!("API response did not finish normally");

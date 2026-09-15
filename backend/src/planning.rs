@@ -15,9 +15,14 @@ const DISCOVERY: &str = "Read source evidence before planning the document. Retu
 
 const PLAN: &str = "Return JSON {sections:[{title:string,query:string,reader_question:string,handoff:string,diagrams:[string],depends_on:[number],evidence_ids:[string]}],reader_goal:string,storyline:string,terminology:[string]}. Design one coherent document for the intended reader using the source_brief AND actual evidence read before this plan. The brief is an evidence-linked analysis, not independently verified truth: resolve contradictions against supplied implementation and respect its uncertainties. inventory_sample is only a navigation map: its paths may be named in section queries but are not evidence and must never appear in evidence_ids. Infer the audience and desired outcome from purpose. Choose 1-32 distinct sections in the order the reader needs to understand or perform the work. 32 is a hard ceiling, not a target. Choose the smallest section count that covers the requested scope clearly, based on reader goals, source-supported workflows, complexity and distinct reader questions. A narrow topic may need only 1-3 sections. Add a section only when it answers a substantial separate reader question; merge overlapping or thin topics and use subsections for supporting details. Do not create one section per file or module, pad the outline, or split a coherent workflow just to increase the count. Explain briefly in storyline why the chosen scope and grouping suit this document. Start with orientation and the relevant end-to-end picture, then introduce prerequisites before the actions that need them, show one normal path through to an observable result, and place alternatives/troubleshooting where they help the reader. Adapt the order to the actual source and purpose, not a fixed template or catalog of files/classes/subsystems. Separate reading order from runtime order: conditional branches and independent workflows must not become a fictional single execution trace. reader_goal states what the reader should achieve. storyline explains how the questions connect and why this order helps that goal. Each reader_question is one non-duplicated question this section resolves; handoff identifies the concrete result or decision the next section builds on (empty only for the final section). depends_on lists only earlier zero-based SECTION indices needed to understand this section; it is a reading prerequisite, not a function call graph. Every section must carry 1-8 supplied evidence_ids that anchor its topic. previously_read source_anchors are originals checked during earlier reading and can anchor an existing source_brief finding even if the passage is not repeated in this bounded request; they do not justify inventing new behavior. query names concrete implementation files, symbols and actions needed to deepen those anchors during writing. For cross-layer or end-to-end documentation, distribute queries across the relevant entry, orchestration, persistence, maintenance and result-consumer modules visible in inventory_sample instead of repeatedly relying on the same few files. For an end-to-end guide, include the evidenced entry, orchestration and result consumer in the opening section's anchors/query where available. Do not invent missing links to make the story smooth; explain limits or separate paths. Assign each explanation to one section to avoid repeated overviews. terminology contains at most 12 short, consistent definitions supported by evidence. Allocate diagrams across the WHOLE document, at most 4 per section: each diagrams entry is one plain-language objective, NEVER diagram code or an assumed call sequence. An empty array means no diagram. Name diagram types explicitly when purpose requests them. Respect max_diagrams (null means no numeric cap) and the requested global number/types; do not repeat an overall flow diagram in every section. Keep titles under 300 bytes, query under 2000 bytes, reader_question and handoff under 1500 bytes, reader_goal under 2000 bytes, storyline under 4000 bytes and each terminology entry under 500 bytes. Use the requested document language. Coverage is selective; never claim all code was understood.";
 
+pub(crate) const FINDING_KIND_POLICY: &str = "For each finding, kind must be exactly the JSON string \"runtime\" or \"context\". The word implementation describes source evidence, never a third finding kind. runtime_allowed is a boolean describing whether an evidence anchor can support a runtime finding; it is not the finding kind. Use runtime only with at least one supplied implementation anchor. Use context for declarations, documentation or test intent without asserting execution. Always include findings, uncertainties and followup_queries as arrays; use [] for empty lists, never null. Return one JSON object without Markdown fences.";
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FindingKind {
+    // Accept this common source-class label only as a runtime claim.
+    // validate_brief must still require actual implementation evidence.
+    #[serde(alias = "implementation")]
     Runtime,
     Context,
 }
@@ -336,7 +341,7 @@ async fn read_sources(
             "source_anchors":previous.map(|p| p.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>()),
             "inventory_sample":editorial::excerpt(inventory, 16000 >> attempt),"evidence":evidence,
             "open_questions":previous.map(|p| &p.brief.uncertainties),"final_pass":final_pass,
-            "previous_error":previous_error,"attempt":attempt+1,"instruction":DISCOVERY});
+            "previous_error":previous_error,"attempt":attempt+1,"finding_kind_policy":FINDING_KIND_POLICY,"instruction":DISCOVERY});
         response_received = false;
         repair.apply(&mut input);
         let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
@@ -738,6 +743,30 @@ mod tests {
             end: 1,
             content: content.into(),
         }
+    }
+
+    #[test]
+    fn implementation_alias_is_runtime_and_still_requires_implementation_evidence() -> Result<()> {
+        let implementation = evidence("/project/main.rs", "fn main() {}");
+        let xml = evidence("/project/mapper.xml", "<mapper />");
+        for (source, valid) in [(implementation, true), (xml, false)] {
+            let mut brief: SourceBrief = llm::decode(
+                &json!({
+                    "findings":[{"topic":"entry","observation":"A runtime claim",
+                        "kind":"implementation","evidence_ids":[source.id]}],
+                    "uncertainties":[],"followup_queries":[]
+                })
+                .to_string(),
+            )?;
+            assert!(matches!(brief.findings[0].kind, FindingKind::Runtime));
+            assert_eq!(
+                serde_json::to_value(&brief)?["findings"][0]["kind"],
+                "runtime"
+            );
+            assert_eq!(validate_brief(&mut brief, &[source], true).is_ok(), valid);
+        }
+        assert!(llm::decode::<FindingKind>(r#""unknown""#).is_err());
+        Ok(())
     }
 
     #[test]

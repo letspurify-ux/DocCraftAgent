@@ -177,7 +177,8 @@ async fn node(
     let mut input = json!({"phase":if children.is_empty(){"understanding_batch"}else{"understanding_reduce"},
         "language":ctx.snapshot.task.language,"final_pass":true,"evidence":evidence,
         "summaries":summaries,"source_anchors":anchors,
-        "evidence_classes":available.iter().map(|e| json!({"id":e.id,"path":e.path,"class":if source::is_implementation(&e.path){"implementation"}else{"context"}})).collect::<Vec<_>>(),
+        "evidence_classes":available.iter().map(|e| json!({"id":e.id,"path":e.path,"runtime_allowed":source::is_implementation(&e.path)})).collect::<Vec<_>>(),
+        "finding_kind_policy":crate::planning::FINDING_KIND_POLICY,
         "classification_policy":"Use evidence_classes from the first attempt, including previously_read anchors. XML/configuration declarations are context: describe what is declared, not whether it is loaded or executed. Runtime observations must cite supplied implementation. If a batch has no implementation, return context observations only. On repair, preserve valid observations and rewrite only invalid ones; never merely relabel an unsupported execution claim.","instruction":if children.is_empty(){READ}else{REDUCE}});
     if children.is_empty()
         && let Some(object) = input.as_object_mut()
@@ -187,7 +188,7 @@ async fn node(
     if final_overview {
         input["evidence"] = json!([]);
         input["instruction"] = json!(
-            "Read source evidence before planning through verified child findings. Synthesize ALL verified child findings into a balanced project overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:runtime|context,evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve the main product workflows, public entry points, processing, persisted/returned results, consumers and error/cancel paths across ALL children. Dependencies and test harness details together need at most two findings; do not let them displace product behavior. Use at most 12 findings, each under 1000 characters and with 1-6 source_anchors from its child findings, and at most 8 uncertainties. Previously-read originals are retained and validated by the caller; do not treat their omission from this synthesis request as an unknown project behavior. Carry only observations already in children and distinguish their runtime/context kinds. Do not add new facts or invent cross-module execution order; retain genuinely unresolved connections. Use the requested language."
+            "Read source evidence before planning through verified child findings. Synthesize ALL verified child findings into a balanced project overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve the main product workflows, public entry points, processing, persisted/returned results, consumers and error/cancel paths across ALL children. Dependencies and test harness details together need at most two findings; do not let them displace product behavior. Use at most 12 findings, each under 1000 characters and with 1-6 source_anchors from its child findings, and at most 8 uncertainties. Previously-read originals are retained and validated by the caller; do not treat their omission from this synthesis request as an unknown project behavior. Carry only observations already in children and distinguish their runtime/context kinds. Do not add new facts or invent cross-module execution order; retain genuinely unresolved connections. Use the requested language."
         );
     }
     // LLM cache also includes model/endpoint/settings. Checkpoints must obey the

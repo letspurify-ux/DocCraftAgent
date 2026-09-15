@@ -42,14 +42,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if model=='quota-partial' and 'Write only Markdown' in instruction:
                 writes=sum(1 for r in requests if r['model']==model and 'Write only Markdown' in r['messages'][-1]['content'])
                 if writes>1: return self.reply({'error':{'code':429,'message':'Rate limit exceeded: free-models-per-day'}},429)
-            if data.get('phase')=='document_intent':
-                result=json.dumps({'requirements':[{'id':'r1','question':'무엇을 할 수 있는가?'},{'id':'r2','question':'어떤 입력이 유효한가?'},{'id':'r3','question':'결과를 어떻게 확인하는가?'}]},ensure_ascii=False)
-            elif data.get('phase')=='outline_review':
+            if data.get('phase')=='outline_review':
                 result=json.dumps({'issues':[]})
                 if model=='outline-quality-once' and data['outline']['revision']==1:
-                    result=json.dumps({'issues':[{'severity':'major','code':'overlap','message':'두 장의 담당 설명을 구분하세요','section_ids':[data['outline']['sections'][0]['id']],'requirement_ids':['r1'],'query':''}]},ensure_ascii=False)
+                    result=json.dumps({'issues':[{'severity':'major','code':'overlap','message':'두 장의 담당 설명을 구분하세요','section_ids':[data['outline']['sections'][0]['id']],'requirement_ids':[],'query':''}]},ensure_ascii=False)
                 if model=='outline-quality-stuck':
-                    result=json.dumps({'issues':[{'severity':'major','code':'scope','message':'필수 설명을 보완하세요','section_ids':[],'requirement_ids':['r1'],'query':''}]},ensure_ascii=False)
+                    result=json.dumps({'issues':[{'severity':'major','code':'scope','message':'필수 설명을 보완하세요','section_ids':[],'requirement_ids':[],'query':''}]},ensure_ascii=False)
             elif data.get('phase')=='understanding_reduce' and not data['evidence']:
                 assert data['summaries'] and data['source_anchors']
                 finding=data['summaries'][0]['findings'][0]
@@ -73,13 +71,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result=json.dumps({'reader_goal':'입력을 보내고 결과와 오류를 이해한다','storyline':'입력 준비에서 실행, 결과 확인과 오류 대응으로 이어진다','terminology':['처리 결과: 검증을 마친 반환값'],'sections':[{'title':'기능 개요','query':'handle_request handleRequest validation','reader_question':'무엇을 할 수 있는가?','handoff':'검증 조건을 확인한다','diagrams':['입력과 검증 흐름']},{'title':'오류와 제약','query':'name_required errors','reader_question':'어떤 입력이 유효한가?','handoff':'검증을 통과한 입력을 처리한다','diagrams':['오류 분기']},{'title':'처리 흐름','query':'return handle_request','reader_question':'결과를 어떻게 확인하는가?','handoff':'','diagrams':['결과 반환 흐름']}]},ensure_ascii=False)
                 outline=json.loads(result)
                 for index,section in enumerate(outline['sections']):
-                    section['prerequisite_titles']=[outline['sections'][index-1]['title']] if index else []
-                    section['key_points']=[section['reader_question']]
+                    if model=='planning-dependency-once':section['prerequisite_titles']=[outline['sections'][index-1]['title']] if index else []
+                    section['key_points']=[['기능과 입력','검증 조건과 오류','처리 결과 반환'][index]]
+                    section.pop('reader_question',None);section.pop('handoff',None)
                     section['out_of_scope']=[]
                     section['evidence_ids']=[data['source_brief']['findings'][0]['evidence_ids'][0]]
-                outline['requirement_owners']=[{'requirement_id':r['id'],'section_title':outline['sections'][index]['title']} for index,r in enumerate(data['requirements'])]
-                if model=='planning-ownership-once' and not data.get('previous_error'):
-                    outline['requirement_owners'].append({'requirement_id':'r1','section_title':outline['sections'][1]['title']})
                 if model=='planning-dependency-once' and not data.get('previous_error'):
                     outline['sections'][0]['prerequisite_titles']=[outline['sections'][2]['title']]
                 result=json.dumps(outline,ensure_ascii=False)
@@ -90,7 +86,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.server.coherence_format_sent=True
                     result=json.dumps({'issues':[{'section':4,'problem':'wrong review schema','suggestion':'fix'}]})
                 elif model=='draft-restructure' and not getattr(self.server,'restructured',False):
-                    self.server.restructured=True;result=json.dumps({'issues':[],'outline_issues':[{'severity':'major','code':'order','message':'독자의 결과 확인 질문을 더 명확하게 나누세요','section_ids':[data['document_plan']['sections'][0]['id']],'requirement_ids':['r1'],'query':''}]},ensure_ascii=False)
+                    self.server.restructured=True;result=json.dumps({'issues':[],'outline_issues':[{'severity':'major','code':'order','message':'독자의 결과 확인 질문을 더 명확하게 나누세요','section_ids':[data['document_plan']['sections'][0]['id']],'requirement_ids':[],'query':''}]},ensure_ascii=False)
                 elif model=='coherence-once' and not getattr(self.server,'coherence_sent',False):
                     self.server.coherence_sent=True
                     result=json.dumps({'issues':[{'severity':'major','section':1,'message':'앞 절의 입력 준비가 다음 절의 실행으로 이어지도록 결과와 연결을 설명하세요.','query':''}]})
@@ -233,12 +229,12 @@ def main():
             probe['llm']['proxy_mode']='custom';probe['llm']['proxy_url']=f'http://127.0.0.1:{MOCK}';probe['llm']['base_url']='http://upstream.invalid/v1'
             assert api('/settings/test-llm','POST',probe)['ok']
             print('PASS reasoning mappings and explicit HTTP proxy',flush=True)
-            for model in ['normal','context-once','retry-once','invalid-once','review-once','truncate-once','section-parts','headings','wrapped-markdown','duplicate-once','section-review-format-once','mermaid-once','body-disconnect-once','provider-error-once','coherence-once','diagram-overflow-once','coherence-format-once','planning-followup','planning-citation-once','planning-dependency-once','planning-ownership-once']:
+            for model in ['normal','context-once','retry-once','invalid-once','review-once','truncate-once','section-parts','headings','wrapped-markdown','duplicate-once','section-review-format-once','mermaid-once','body-disconnect-once','provider-error-once','coherence-once','diagram-overflow-once','coherence-format-once','planning-followup','planning-citation-once','planning-dependency-once','simple-outline']:
                 configure(model);t=task(model);rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
                 assert r['status']=='completed',r
                 if model=='review-once':assert r['tokens']>=1800,r
                 text=(out/(model+'.md')).read_text();assert 'Source references' in text and '```mermaid' in text
-                if model in ['normal','planning-followup','planning-citation-once','planning-dependency-once','planning-ownership-once']:
+                if model in ['normal','planning-followup','planning-citation-once','planning-dependency-once','simple-outline']:
                     data=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and x['messages'][-1]['content']!='Reply with OK only.']
                     readings=[x for x in data if 'Read source evidence before planning' in x.get('instruction','')]
                     plans=[x for x in data if 'sections:[{title' in x.get('instruction','')]
@@ -248,20 +244,18 @@ def main():
                     anchor=plans[-1]['source_brief']['findings'][0]['evidence_ids'][0]
                     assert any(e['id']==anchor for e in plans[-1]['evidence'])
                     assert any(e['id']==anchor for e in writes[0]['evidence']), 'Planning source anchors did not reach the writer'
-                    assert writes[1]['section_plan']['depends_on']==[0]
+                    assert writes[1]['section_plan']['depends_on']==([0] if model=='planning-dependency-once' else [])
                     if model=='planning-followup':
                         assert any(x.get('phase')=='understanding_batch' for x in readings) and readings[-1]['final_pass']
                         assert any('open_questions' in x for x in readings)
                         purpose_reads=[x for x in readings if x.get('phase')=='purpose_reading']
-                        assert len(purpose_reads)==6 and all(x.get('required_question') for x in purpose_reads)
+                        assert len(purpose_reads)==2 and all('required_question' not in x for x in purpose_reads)
                         assert any(e['path'].endswith('service.py') for e in readings[-1]['evidence'])
                     if model=='planning-citation-once':assert any('Unknown or ambiguous evidence ID' in x.get('previous_error','') for x in readings)
                     if model=='planning-dependency-once':assert len(plans)==2 and 'a later section' in plans[1]['previous_error'] and len(plans[1]['previous_section_dependencies'])==3
-                    if model=='planning-ownership-once':
-                        assert len(plans)==2 and 'r1' in plans[1]['previous_error'] and 'to both sections' in plans[1]['previous_error']
-                        assert len(plans[1]['previous_requirement_owners'])==4
-                        assert writes[0]['section_plan']['owns_requirement_ids']==['r1']
-                        assert writes[1]['section_plan']['owns_requirement_ids']==['r2']
+                    if model=='simple-outline':
+                        assert len(plans)==1 and all(x.get('phase')!='document_intent' for x in data)
+                        assert all(not w['section_plan']['owns_requirement_ids'] and not w['section_plan']['reader_question'] for w in writes)
                 if model=='section-parts':
                     writes=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
                     assert len(writes)==6 and sum(bool(x.get('continuation')) for x in writes)==3
@@ -330,7 +324,7 @@ def main():
             configure('tight-budget')
             t=api('/tasks','POST',{'name':'tight-budget','sources':[str(source)],'target':str(out/'tight-budget.md'),'direction':'개발자를 위한 기능 설명과 Mermaid 흐름 정리','max_iterations':2,'max_tokens':50000})
             rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
-            assert r['status']=='completed' and r['tokens']==2800,r
+            assert r['status']=='completed' and r['tokens']==2200,r
             print('PASS confirmed usage releases reservations within fixed task budget',flush=True)
             configure('outline-quality-once');t=task('outline-quality-once');rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
             assert r['status']=='completed',r
@@ -419,7 +413,7 @@ def main():
             r=poll(rid);assert r['status']=='completed',r
             readings=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='restart-discovery' and 'Read source evidence before planning' in x['messages'][-1]['content']]
             assert sum(x.get('phase')=='understanding_batch' for x in readings)==1, 'Completed whole-source batch repeated after restart'
-            assert sum(x.get('phase')=='purpose_reading' and not x['final_pass'] for x in readings)==3
+            assert sum(x.get('phase')=='purpose_reading' and not x['final_pass'] for x in readings)==1
             print('PASS source-understanding restart retains initial reading and resumes missing-link research',flush=True)
             configure('restart-review');t=task('restart-review');rid=api(f"/tasks/{t['id']}/run",'POST')['id']
             end=time.monotonic()+30

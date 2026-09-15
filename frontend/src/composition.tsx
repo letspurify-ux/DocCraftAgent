@@ -43,12 +43,7 @@ type Understanding = {
     read_batches: number;
   };
   overview?: Brief;
-  questions?: {
-    requirement_id: string;
-    question: string;
-    brief: Brief;
-    validation_unresolved: boolean;
-  }[];
+  purpose?: { brief: Brief; validation_unresolved: boolean };
   batches: {
     id: string;
     files: string[];
@@ -228,21 +223,16 @@ export function Composition({ run }: { run: Run }) {
             </p>
           )}
           {source.overview && <BriefView brief={source.overview} />}
-          {!!source.questions?.length && (
-            <div>
-              <h4>문서 목적별 질문과 근거</h4>
-              {source.questions.map((question) => (
-                <details key={question.requirement_id}>
-                  <summary>{question.question}</summary>
-                  {question.validation_unresolved && (
-                    <p className="banner">
-                      추가 분석을 검증하지 못해 보존한 소스 관찰로 진행했습니다.
-                    </p>
-                  )}
-                  <BriefView brief={question.brief} />
-                </details>
-              ))}
-            </div>
+          {source.purpose && (
+            <details>
+              <summary>요청 방향에 맞춘 코드 요약</summary>
+              {source.purpose.validation_unresolved && (
+                <p className="banner">
+                  추가 요약을 검증하지 못해 보존한 소스 관찰로 진행했습니다.
+                </p>
+              )}
+              <BriefView brief={source.purpose.brief} />
+            </details>
           )}
           {source.batches.map((batch) => (
             <details key={batch.id}>
@@ -309,15 +299,6 @@ export function Composition({ run }: { run: Run }) {
                 />
               </label>
               <label>
-                독자가 해결할 질문
-                <input
-                  value={section.reader_question}
-                  onChange={(e) =>
-                    change(index, { reader_question: e.target.value })
-                  }
-                />
-              </label>
-              <label>
                 핵심 설명 · 한 줄에 하나
                 <textarea
                   value={section.key_points.join("\n")}
@@ -329,7 +310,7 @@ export function Composition({ run }: { run: Run }) {
                 />
               </label>
               <details>
-                <summary>담당 주제와 선행 설명</summary>
+                <summary>추가 설정</summary>
                 <label>
                   근거를 확인할 파일·기능
                   <input
@@ -337,26 +318,8 @@ export function Composition({ run }: { run: Run }) {
                     onChange={(e) => change(index, { query: e.target.value })}
                   />
                 </label>
-                {plan.requirements.map((r) => (
-                  <label className="checkbox" key={r.id}>
-                    <input
-                      type="checkbox"
-                      checked={section.owns_requirement_ids.includes(r.id)}
-                      onChange={(e) =>
-                        change(index, {
-                          owns_requirement_ids: e.target.checked
-                            ? [...section.owns_requirement_ids, r.id]
-                            : section.owns_requirement_ids.filter(
-                                (id) => id !== r.id,
-                              ),
-                        })
-                      }
-                    />
-                    {r.question}
-                  </label>
-                ))}
                 <label>
-                  다음 장에 이어지는 결과
+                  다음 장에 이어지는 결과 · 선택
                   <input
                     value={section.handoff}
                     onChange={(e) => change(index, { handoff: e.target.value })}

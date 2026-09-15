@@ -46,7 +46,7 @@ pub async fn understanding(
     }
     let counts=sqlx::query("SELECT COUNT(*) total,SUM(status='indexed') indexed,SUM(status='excluded') excluded,SUM(status='skipped') skipped FROM files WHERE run_id=?").bind(&id).fetch_one(&pool).await?;
     Ok(Json(
-        json!({"coverage":coverage,"questions":purpose.and_then(|v|v.get("questions").cloned()).unwrap_or(json!([])),"overview":root.and_then(|v|v.pointer("/discovery/brief").cloned()),"batches":nodes,"next_cursor":cursor,"has_more":has_more,"total_files":counts.try_get::<i64,_>("total")?}),
+        json!({"coverage":coverage,"purpose":purpose.map(|v|json!({"brief":v.get("brief"),"validation_unresolved":v.get("validation_unresolved").and_then(Value::as_bool).unwrap_or(false)})),"overview":root.and_then(|v|v.pointer("/discovery/brief").cloned()),"batches":nodes,"next_cursor":cursor,"has_more":has_more,"total_files":counts.try_get::<i64,_>("total")?}),
     ))
 }
 #[utoipa::path(get,path="/api/v1/runs/{id}/outline",params(("id"=String,Path)),responses((status=200,body=Value)))]

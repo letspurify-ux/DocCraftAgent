@@ -164,6 +164,7 @@ pub struct SectionPlan {
     pub title: String,
     pub query: String,
     #[serde(default)]
+    /// Legacy metadata; new outlines organize sections through key_points.
     pub reader_question: String,
     #[serde(default)]
     pub handoff: String,
@@ -176,6 +177,7 @@ pub struct SectionPlan {
     #[serde(default)]
     pub evidence_ids: Vec<String>,
     #[serde(default)]
+    /// Retained for old outlines; new plans do not validate ownership.
     pub owns_requirement_ids: Vec<String>,
     #[serde(default)]
     pub key_points: Vec<String>,

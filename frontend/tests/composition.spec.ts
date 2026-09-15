@@ -18,18 +18,15 @@ test("outline preview edits stay local until submitted with their base revision"
     revision: 1,
     reader_goal: "입력과 결과 이해",
     storyline: "입력을 검증한 뒤 결과를 확인한다",
-    requirements: [{ id: "r1", question: "결과를 어떻게 확인하는가?" }],
     sections: [
       {
         id: "s1",
         title: "처리 결과",
         query: "service.py",
-        reader_question: "어떤 결과가 나오는가?",
         handoff: "",
         depends_on: [],
         evidence_ids: ["a".repeat(64)],
         key_points: ["정상 결과 확인"],
-        owns_requirement_ids: ["r1"],
         out_of_scope: [],
         diagrams: [],
       },
@@ -70,6 +67,10 @@ test("outline preview edits stay local until submitted with their base revision"
   await expect(
     page.getByRole("button", { name: "목차 확정·본문 작성" }),
   ).toBeEnabled();
+  await expect(page.getByLabel("독자가 해결할 질문")).toHaveCount(0);
+  await page
+    .getByLabel("핵심 설명 · 한 줄에 하나")
+    .fill("처리한 결과를 반환한다");
   await page.getByLabel("제목", { exact: true }).fill("결과 확인하기");
   await expect(
     page.getByRole("button", { name: "목차 확정·본문 작성" }),
@@ -81,6 +82,9 @@ test("outline preview edits stay local until submitted with their base revision"
   await expect
     .poll(() => submitted?.outline?.sections[0].title)
     .toBe("결과 확인하기");
+  expect(submitted.outline.sections[0].key_points).toEqual([
+    "처리한 결과를 반환한다",
+  ]);
   expect(submitted.base_revision).toBe(1);
   expect(submitted.outline.sections[0].id).toBe("s1");
 });

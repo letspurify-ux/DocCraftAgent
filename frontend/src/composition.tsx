@@ -36,6 +36,7 @@ type Understanding = {
   coverage?: {
     reading_complete?: boolean;
     unresolved_nodes?: number;
+    additional_reading_unresolved?: boolean;
     complete: boolean;
     read_files: number;
     read_chunks: number;
@@ -206,7 +207,7 @@ export function Composition({ run }: { run: Run }) {
           <p>
             전체 목록 {source.total_files.toLocaleString()}개 ·{" "}
             {source.coverage?.reading_complete && !source.coverage.complete
-              ? `원문 읽기 완료 · ${source.coverage.unresolved_nodes ?? 0}개 분석 묶음에 검증 미해결 항목이 있습니다`
+              ? "원문 읽기 완료 · 검증 미해결 항목이 있습니다"
               : source.coverage?.complete
                 ? `원문 읽기 ${source.coverage.read_files}개 파일 / ${source.coverage.read_chunks}개 코드 묶음 완료`
                 : "전체 소스를 나누어 읽는 중입니다."}
@@ -215,6 +216,11 @@ export function Composition({ run }: { run: Run }) {
             읽기 범위는 이해 정확도를 의미하지 않습니다. 미확인 연결은 아래에
             표시합니다.
           </small>
+          {source.coverage?.additional_reading_unresolved && (
+            <p className="banner">
+              추가 분석을 검증하지 못해 이전 검증 결과로 진행했습니다.
+            </p>
+          )}
           {source.overview && <BriefView brief={source.overview} />}
           {source.batches.map((batch) => (
             <details key={batch.id}>

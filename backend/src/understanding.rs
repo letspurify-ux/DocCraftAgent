@@ -28,6 +28,8 @@ pub struct Node {
     pub validation_issues: Vec<String>,
     #[serde(default)]
     pub unverified_brief: Option<SourceBrief>,
+    #[serde(default)]
+    pub unverified_output: Option<String>,
 }
 
 /// Salvage independently validated observations; never relabel unsupported runtime claims.
@@ -61,6 +63,31 @@ fn salvage(mut brief: SourceBrief, evidence: &[Evidence]) -> SourceBrief {
         brief.findings.pop();
     }
     brief
+}
+
+/// Recover only independently checkable findings; malformed JSON contributes no claims.
+fn recover_output(output: &str, children: &[Node], evidence: &[Evidence]) -> SourceBrief {
+    let mut findings = children
+        .iter()
+        .flat_map(|n| n.discovery.brief.findings.clone())
+        .collect::<Vec<_>>();
+    if let Ok(value) = llm::decode::<serde_json::Value>(output)
+        && let Some(items) = value.get("findings").and_then(|v| v.as_array())
+    {
+        findings.extend(
+            items
+                .iter()
+                .filter_map(|v| serde_json::from_value(v.clone()).ok()),
+        );
+    }
+    salvage(
+        SourceBrief {
+            findings,
+            uncertainties: vec![],
+            followup_queries: vec![],
+        },
+        evidence,
+    )
 }
 
 fn input_limit(ctx: &RunContext) -> usize {
@@ -167,21 +194,30 @@ async fn node(
     // same contract when resuming with explicitly changed model settings.
     let config = &ctx.snapshot.settings.llm;
     let key = format!("understanding:node:{}", source::hash(serde_json::to_string(&json!({
-        "version":4,"input":input,"children":children.iter().map(|n| &n.key).collect::<Vec<_>>(),"model":config.model,"endpoint":config.base_url,
+        "version":5,"input":input,"children":children.iter().map(|n| &n.key).collect::<Vec<_>>(),"model":config.model,"endpoint":config.base_url,
         "reasoning":config.reasoning,"effort":config.effort,"output":config.max_output_tokens
     }))?.as_bytes()));
     if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? {
         return Ok(serde_json::from_value(saved)?);
     }
     let mut error = String::new();
+    let mut repair = llm::JsonRepair::default();
     for attempt in 0..3 {
         let mut validation_issues = vec![];
         let mut unverified_brief = None;
         let mut request = input.clone();
         request["attempt"] = json!(attempt);
         request["previous_error"] = json!(error);
+        repair.apply(&mut request);
         let result = llm::call(ctx, system, request.clone()).await.and_then(|s| {
-            let mut brief: SourceBrief = llm::decode(&s)?;
+            let mut brief: SourceBrief = match repair.decode(&s) {
+                Ok(brief) => brief,
+                Err(error) if attempt == 2 => {
+                    validation_issues.push(format!("{error:#}"));
+                    return Ok(recover_output(&s, children, &available));
+                }
+                Err(error) => return Err(error),
+            };
             let validation = validate_brief(&mut brief, &available, true).and_then(|_| {
                 ensure!(
                     serde_json::to_vec(&brief)?.len() <= 18_000,
@@ -212,6 +248,11 @@ async fn node(
                 let result = Node {
                     unresolved_nodes: children.iter().map(|n| n.unresolved_nodes).sum::<usize>()
                         + usize::from(!validation_issues.is_empty()),
+                    unverified_output: if validation_issues.is_empty() {
+                        None
+                    } else {
+                        repair.response.clone()
+                    },
                     validation_issues,
                     unverified_brief,
                     key: key.clone(),
@@ -239,7 +280,7 @@ async fn node(
             Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
             Err(e) => {
                 llm::forget(ctx, system, request).await?;
-                error = editorial::excerpt(&e.to_string(), 1500);
+                error = editorial::excerpt(&format!("{e:#}"), 1500);
                 ctx.event(
                     "source_validation",
                     json!({"attempt":attempt+1,"error":error}),
@@ -261,7 +302,7 @@ fn reduction_work(mut nodes: usize) -> usize {
 }
 
 pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
-    if db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:version").await? == Some(json!(4))
+    if db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:version").await? == Some(json!(5))
         && let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:root").await?
     {
         return Ok(serde_json::from_value::<Node>(saved)?.discovery);
@@ -393,7 +434,7 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     for (step, value) in [
         ("understanding:root", serde_json::to_value(&root)?),
         ("understanding:coverage", coverage.clone()),
-        ("understanding:version", json!(4)),
+        ("understanding:version", json!(5)),
     ] {
         sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)").bind(&ctx.id).bind(step).bind(value.to_string()).execute(&mut *tx).await?;
     }
@@ -409,6 +450,63 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn malformed_output_remains_unresolved_and_valid_siblings_survive_bad_schema() {
+        let evidence = Evidence {
+            id: source::hash(b"source"),
+            path: "/project/main.rs".into(),
+            start: 1,
+            end: 1,
+            content: "fn main() {}".into(),
+        };
+        let malformed = recover_output("{not JSON", &[], std::slice::from_ref(&evidence));
+        assert!(malformed.findings.is_empty());
+        assert!(!malformed.uncertainties.is_empty());
+        let output = json!({"findings":[
+            {"topic":"main","observation":"An empty main is defined","kind":"runtime","evidence_ids":[evidence.id]},
+            {"topic":"bad type","observation":42,"kind":"runtime","evidence_ids":null}
+        ],"uncertainties":"wrong type"}).to_string();
+        let recovered = recover_output(&output, &[], &[evidence]);
+        assert_eq!(recovered.findings.len(), 1);
+        assert_eq!(recovered.findings[0].topic, "main");
+        assert!(!recovered.uncertainties.is_empty());
+    }
+
+    #[test]
+    fn failed_reduction_preserves_verified_child_findings_and_warning_on_resume() {
+        let evidence = Evidence {
+            id: source::hash(b"main"),
+            path: "/project/main.rs".into(),
+            start: 1,
+            end: 1,
+            content: "fn main() {}".into(),
+        };
+        let brief: SourceBrief = serde_json::from_value(json!({"findings":[
+            {"topic":"main","observation":"An empty main is defined","kind":"runtime","evidence_ids":[evidence.id]}
+        ],"uncertainties":[],"followup_queries":[]})).unwrap();
+        let child = Node {
+            key: "child".into(),
+            files: vec![evidence.path.clone()],
+            children: vec![],
+            discovery: Discovery {
+                brief,
+                evidence: vec![evidence.clone()],
+            },
+            unresolved_nodes: 1,
+            validation_issues: vec!["JSON error".into()],
+            unverified_brief: None,
+            unverified_output: Some("broken".into()),
+        };
+        let saved = serde_json::to_value(&child).unwrap();
+        let restored: Node = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.unresolved_nodes, 1);
+        assert_eq!(restored.unverified_output.as_deref(), Some("broken"));
+        let recovered = recover_output("broken reduction", &[restored], &[evidence]);
+        assert_eq!(recovered.findings.len(), 1);
+        assert_eq!(recovered.findings[0].topic, "main");
+        assert!(!recovered.uncertainties.is_empty());
+    }
+
     #[test]
     fn salvage_keeps_valid_observations_without_relabeling_xml_runtime() {
         let xml = Evidence {

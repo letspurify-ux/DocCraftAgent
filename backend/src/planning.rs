@@ -285,7 +285,9 @@ async fn read_sources(
     )]);
     queries.dedup();
     let mut previous_error = String::new();
+    let mut repair = llm::JsonRepair::default();
     let mut limit = evidence_budget(ctx);
+    let mut response_received = false;
     for attempt in 0..3 {
         ctx.check()?;
         ensure!(
@@ -329,14 +331,17 @@ async fn read_sources(
                 }
             }
         }
-        let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
+        let mut input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
             "verified_overview":previous.map(|p| &p.brief),
             "source_anchors":previous.map(|p| p.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>()),
             "inventory_sample":editorial::excerpt(inventory, 16000 >> attempt),"evidence":evidence,
             "open_questions":previous.map(|p| &p.brief.uncertainties),"final_pass":final_pass,
             "previous_error":previous_error,"attempt":attempt+1,"instruction":DISCOVERY});
+        response_received = false;
+        repair.apply(&mut input);
         let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
-            let mut brief: SourceBrief = llm::decode(&s)?;
+            response_received = true;
+            let mut brief: SourceBrief = repair.decode(&s)?;
             validate_brief(&mut brief, &available, final_pass)?;
             Ok(brief)
         });
@@ -358,7 +363,7 @@ async fn read_sources(
             Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
             Err(e) => {
                 llm::forget(ctx, system, input).await?;
-                previous_error = editorial::excerpt(&e.to_string(), 1500);
+                previous_error = editorial::excerpt(&format!("{e:#}"), 1500);
                 if previous_error.contains("CONTEXT_BUDGET") {
                     limit /= 2;
                 }
@@ -369,6 +374,32 @@ async fn read_sources(
                 .await?;
             }
         }
+    }
+    if response_received && let Some(prior) = previous {
+        let mut recovered = prior.clone();
+        recovered.brief.followup_queries.clear();
+        recovered.brief.uncertainties.truncate(7);
+        recovered.brief.uncertainties.push("추가 소스 분석 응답을 검증하지 못했습니다. 이전에 검증된 관찰을 유지하며 추가 연결은 미확인입니다.".into());
+        let key = format!(
+            "source_reading:unresolved:{}",
+            if final_pass { 2 } else { 1 }
+        );
+        db::checkpoint(
+            &ctx.pool,
+            &ctx.id,
+            &key,
+            &json!({"error":previous_error,"response":repair.response}),
+        )
+        .await?;
+        if let Some(mut coverage) =
+            db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:coverage").await?
+        {
+            coverage["complete"] = json!(false);
+            coverage["additional_reading_unresolved"] = json!(true);
+            db::checkpoint(&ctx.pool, &ctx.id, "understanding:coverage", &coverage).await?;
+        }
+        ctx.event("source_validation_warning", json!({"title":"추가 분석 미해결 · 이전 검증 결과로 계속합니다","error":previous_error})).await?;
+        return Ok(recovered);
     }
     bail!("Unable to understand source before planning: {previous_error}")
 }
@@ -445,6 +476,7 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
         }
         let mut limit = evidence_budget(ctx);
         let mut previous_error = String::new();
+        let mut repair = llm::JsonRepair::default();
         let mut candidate = pending.map(serde_json::from_value::<Outline>).transpose()?;
         for attempt in 0..3 {
             if candidate.is_some() {
@@ -457,12 +489,13 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
             );
             let brief = &discovery.brief;
             ctx.event("outline_planning", json!({"stage":"planning","title":"구현 근거에 맞춰 설명 순서 구성","attempt":attempt+1,"evidence_chunks":evidence.len()})).await?;
-            let input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
+            let mut input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
             "source_brief":brief,"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"project_overview":inventory,"requirements":requirements,"feedback":feedback,"revision":revision,
             "evidence":evidence,"max_diagrams":ctx.snapshot.task.max_diagrams,
             "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{PLAN} Additionally each section must include owns_requirement_ids (each supplied requirement has exactly ONE owner across the document), key_points (1-12 concrete explanations), and out_of_scope (topics owned elsewhere). Respect user feedback and preserve valid existing section IDs when supplied. Do not remove requirements to hide missing coverage.")});
+            repair.apply(&mut input);
             let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
-                let mut plan: Outline = llm::decode(&s)?;
+                let mut plan: Outline = repair.decode(&s)?;
                 plan.requirements = requirements.clone();
                 plan.revision = revision;
                 validate_outline(
@@ -480,7 +513,7 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
                 Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
                 Err(e) => {
                     llm::forget(ctx, system, input).await?;
-                    previous_error = editorial::excerpt(&e.to_string(), 1500);
+                    previous_error = editorial::excerpt(&format!("{e:#}"), 1500);
                     if previous_error.contains("CONTEXT_BUDGET") {
                         limit /= 2;
                     }
@@ -579,8 +612,10 @@ async fn requirements(ctx: &RunContext, system: &str) -> Result<Vec<Requirement>
         return Ok(serde_json::from_value(saved)?);
     }
     let mut error = String::new();
+    let mut repair = llm::JsonRepair::default();
     for attempt in 0..3 {
-        let input = json!({"phase":"document_intent","purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"attempt":attempt,"previous_error":error,"instruction":"Extract the required reader questions from the user's purpose. Return JSON {requirements:[{id:string,question:string}]}. Supply 1-12 concise questions that together fulfill the explicit purpose. Do not add unrelated installation, security or operations topics. Each question must be under 1000 characters. Use the requested language."});
+        let mut input = json!({"phase":"document_intent","purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"attempt":attempt,"previous_error":error,"instruction":"Extract the required reader questions from the user's purpose. Return JSON {requirements:[{id:string,question:string}]}. Supply 1-12 concise questions that together fulfill the explicit purpose. Do not add unrelated installation, security or operations topics. Each question must be under 1000 characters. Use the requested language."});
+        repair.apply(&mut input);
         let parsed = llm::call(ctx, system, input.clone())
             .await
             .and_then(|text| {
@@ -588,7 +623,7 @@ async fn requirements(ctx: &RunContext, system: &str) -> Result<Vec<Requirement>
                 struct Intent {
                     requirements: Vec<Requirement>,
                 }
-                let mut r = llm::decode::<Intent>(&text)?.requirements;
+                let mut r = repair.decode::<Intent>(&text)?.requirements;
                 ensure!(
                     !r.is_empty()
                         && r.len() <= 12
@@ -614,7 +649,7 @@ async fn requirements(ctx: &RunContext, system: &str) -> Result<Vec<Requirement>
             Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
             Err(e) => {
                 llm::forget(ctx, system, input).await?;
-                error = editorial::excerpt(&e.to_string(), 1000);
+                error = editorial::excerpt(&format!("{e:#}"), 1000);
             }
         }
     }
@@ -632,10 +667,12 @@ async fn review_outline(
         return Ok(serde_json::from_value(saved)?);
     }
     let mut error = String::new();
+    let mut repair = llm::JsonRepair::default();
     for attempt in 0..3 {
-        let input = json!({"phase":"outline_review","purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"outline":plan,"source_brief":discovery.brief,"evidence":pack_evidence(std::slice::from_ref(&discovery.evidence),evidence_budget(ctx)),"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"attempt":attempt,"previous_error":error,"instruction":"Review this outline BEFORE writing. Return JSON {issues:[{severity:'major'|'minor',code:string,message:string,section_ids:[string],requirement_ids:[string],query:string}]}. Check missing reader requirements, semantic overlap, prerequisites after use, oversized or empty sections, audience mismatch, unsupported runtime ordering and missing important source branches. A short orientation referencing a detailed section is valid. Sharing evidence is not duplication. Every issue must identify concrete affected IDs and a necessary correction, grounded in the supplied outline or source. For missing evidence query names observed files/symbols. Previously_read anchors support observations already checked in the source_brief. Do not invent defects or infer absence from an excerpt. Empty issues means no concrete defect supported. Use the requested language. At most 12 issues."});
+        let mut input = json!({"phase":"outline_review","purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,"outline":plan,"source_brief":discovery.brief,"evidence":pack_evidence(std::slice::from_ref(&discovery.evidence),evidence_budget(ctx)),"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"attempt":attempt,"previous_error":error,"instruction":"Review this outline BEFORE writing. Return JSON {issues:[{severity:'major'|'minor',code:string,message:string,section_ids:[string],requirement_ids:[string],query:string}]}. Check missing reader requirements, semantic overlap, prerequisites after use, oversized or empty sections, audience mismatch, unsupported runtime ordering and missing important source branches. A short orientation referencing a detailed section is valid. Sharing evidence is not duplication. Every issue must identify concrete affected IDs and a necessary correction, grounded in the supplied outline or source. For missing evidence query names observed files/symbols. Previously_read anchors support observations already checked in the source_brief. Do not invent defects or infer absence from an excerpt. Empty issues means no concrete defect supported. Use the requested language. At most 12 issues."});
+        repair.apply(&mut input);
         let parsed = llm::call(ctx, system, input.clone()).await.and_then(|s| {
-            let r: OutlineReview = llm::decode(&s)?;
+            let r: OutlineReview = repair.decode(&s)?;
             ensure!(
                 r.issues.len() <= 12
                     && r.issues
@@ -662,7 +699,7 @@ async fn review_outline(
             Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
             Err(e) => {
                 llm::forget(ctx, system, input).await?;
-                error = editorial::excerpt(&e.to_string(), 1000);
+                error = editorial::excerpt(&format!("{e:#}"), 1000);
             }
         }
     }

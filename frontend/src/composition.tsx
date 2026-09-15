@@ -137,7 +137,7 @@ export function Composition({ run }: { run: Run }) {
     });
   }
   function add() {
-    if (!plan || plan.sections.length >= 8) return;
+    if (!plan || plan.sections.length >= 32) return;
     dirty.current = true;
     const section: Section = {
       id: crypto.randomUUID(),
@@ -378,7 +378,7 @@ export function Composition({ run }: { run: Run }) {
           ))}
           <div className="card-actions">
             <button
-              disabled={active || saving || plan.sections.length >= 8}
+              disabled={active || saving || plan.sections.length >= 32}
               onClick={add}
             >
               섹션 추가

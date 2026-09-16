@@ -385,9 +385,11 @@ pub async fn order_chunks(ctx: &RunContext, chunks: &[ChunkSpan]) -> Result<Vec<
 
 /// Compact structural records for the passages in one request.
 ///
-/// The complete graph stays in the checkpoints and `coverage` audits every
-/// symbol and every site against the finished document, so this projection is a
-/// reading hint, not the record of what exists. Its job is to tell the reader
+/// The complete graph stays in the checkpoints, so this projection is a reading
+/// hint, not the record of what exists. Nothing downstream re-checks what it
+/// leaves out, so what it drops is dropped for good: the order below is the
+/// whole defence, and the request that needs links rather than declarations
+/// uses `connections` instead. Its job is to tell the reader
 /// what structure the supplied passages contain, which is why it drops
 /// storage-only fields, folds the target-less branch and exit sites into
 /// per-symbol counts, and names whatever it could not fit instead of reporting
@@ -484,9 +486,9 @@ fn ration(files: &[(String, Vec<Value>)], max: usize) -> Result<(Vec<Value>, Vec
     Ok((items, omitted))
 }
 
-/// The bounded structural hint for one request. What it cannot carry is named
-/// per file; the omitted records stay in the persisted graph and are audited
-/// against the finished document by `coverage`.
+/// The bounded structural hint for a leaf, which reads source. What it cannot
+/// carry is named per file; the omitted records stay in the persisted graph but
+/// are not revisited, so they are unresolved rather than absent.
 pub async fn context(ctx: &RunContext, evidence: &[Evidence], max: usize) -> Result<Value> {
     let mut paths: Vec<_> = evidence.iter().map(|e| &e.path).collect();
     paths.sort();
@@ -526,9 +528,414 @@ pub async fn context(ctx: &RunContext, evidence: &[Evidence], max: usize) -> Res
     )
 }
 
+/// One call between two files, folded across every site that makes it.
+///
+/// Folding by symbol pair rather than by site is what makes this table small
+/// enough to send: the same pair is typically called from many lines, and the
+/// count carries that without spending a record per line.
+///
+/// `to_path` is empty when the target name is declared in more than one file,
+/// and `candidates` then names those files. A resolved link is a much stronger
+/// claim than a bare callee name, so an ambiguous one is never dressed up as
+/// one.
+#[derive(Clone)]
+pub struct CrossLink {
+    pub from_path: String,
+    pub from: String,
+    pub to_path: String,
+    pub to: String,
+    pub candidates: Vec<String>,
+    pub calls: usize,
+}
+
+/// Every call in the run, bucketed so that none is unaccounted for.
+pub struct LinkIndex {
+    pub cross: Vec<CrossLink>,
+    pub paths: HashSet<String>,
+    /// Calls whose target is declared in the same file, per file. A reduction
+    /// reads its children's summaries, which already describe what happens
+    /// inside one file, so these are counted rather than sent.
+    pub internal: HashMap<String, usize>,
+    /// Calls whose target name no indexed file declares, per file: library and
+    /// runtime calls, and anything the parser could not resolve.
+    pub unresolved: HashMap<String, usize>,
+}
+
+/// Where one name is declared, resolved once for the whole run. `files` is
+/// ascending and distinct because symbols are walked file by file, so telling
+/// "declared nowhere else", "declared in exactly one other file" and "declared
+/// in several" apart reads at most three of its entries, whatever the name.
+#[derive(Default)]
+struct NameEntry<'a> {
+    files: Vec<usize>,
+    pick: HashMap<usize, &'a Symbol>,
+}
+
+const AMBIGUOUS_CANDIDATES_MAX: usize = 4;
+const NAMED_FILES_MAX: usize = 12;
+
+/// Resolve every call target to its declaring file, once per run.
+///
+/// The memoised `all()` index already holds exactly what this needs - every
+/// symbol, and the `calls` edges - so resolution costs no further query, and a
+/// reduction node filters this table by its own paths instead of reloading a
+/// checkpoint per file.
+async fn link_index(ctx: &RunContext) -> Result<std::sync::Arc<LinkIndex>> {
+    ctx.cross_links
+        .get_or_try_init(|| async {
+            let files = all(ctx).await?;
+            ctx.check()?;
+            let index = resolve_links(&files);
+            ctx.check()?;
+            Ok(std::sync::Arc::new(index))
+        })
+        .await
+        .cloned()
+}
+
+/// Resolution and folding, kept free of the database so it can be exercised on
+/// a parsed graph directly.
+fn resolve_links(files: &[FileGraph]) -> LinkIndex {
+    // Per name rather than per call site. A name like `get` or `run` is
+    // declared in hundreds of files, and rebuilding its candidate list
+    // for every call that mentions it makes the pass quadratic in how
+    // common the name is; here each name is resolved once and every
+    // call site then costs a binary search.
+    let mut by_name: HashMap<&str, NameEntry> = HashMap::new();
+    for (index, f) in files.iter().enumerate() {
+        for s in f.graph.symbols.iter().filter(|s| s.kind != "file") {
+            let entry = by_name.entry(s.name.as_str()).or_default();
+            if entry.files.last() != Some(&index) {
+                entry.files.push(index);
+            }
+            entry.pick.entry(index).or_insert(s);
+        }
+    }
+    let mut folded: HashMap<(usize, &str, Option<usize>, &str), usize> = HashMap::new();
+    let mut internal: HashMap<String, usize> = HashMap::new();
+    let mut unresolved: HashMap<String, usize> = HashMap::new();
+    for (index, f) in files.iter().enumerate() {
+        let owners: HashMap<&str, &str> = f
+            .graph
+            .symbols
+            .iter()
+            .map(|s| (s.id.as_str(), s.qualified_name.as_str()))
+            .collect();
+        for e in f.graph.edges.iter().filter(|e| e.kind == "calls") {
+            let tail = e.target.rsplit([':', '.']).next().unwrap_or(&e.target);
+            let owner = owners.get(e.source.as_str()).copied().unwrap_or("<file>");
+            let Some(entry) = by_name.get(tail) else {
+                *unresolved.entry(f.path.clone()).or_default() += 1;
+                continue;
+            };
+            let mut others = entry.files.iter().copied().filter(|i| *i != index);
+            let (first, second) = (others.next(), others.next());
+            match (first, second) {
+                (None, _) => *internal.entry(f.path.clone()).or_default() += 1,
+                (Some(file), None) => {
+                    let target = entry.pick[&file].qualified_name.as_str();
+                    *folded
+                        .entry((index, owner, Some(file), target))
+                        .or_default() += 1;
+                }
+                _ => *folded.entry((index, owner, None, tail)).or_default() += 1,
+            }
+        }
+    }
+    let mut cross: Vec<CrossLink> = folded
+        .into_iter()
+        .map(|((from, owner, target, to), calls)| {
+            let (to_path, candidates) = match target {
+                Some(file) => (files[file].path.clone(), vec![]),
+                None => {
+                    let paths: Vec<String> = by_name
+                        .get(to)
+                        .map(|entry| {
+                            entry
+                                .files
+                                .iter()
+                                .filter(|i| **i != from)
+                                .take(AMBIGUOUS_CANDIDATES_MAX)
+                                .map(|i| files[*i].path.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (String::new(), paths)
+                }
+            };
+            CrossLink {
+                from_path: files[from].path.clone(),
+                from: owner.to_string(),
+                to_path,
+                to: to.to_string(),
+                candidates,
+                calls,
+            }
+        })
+        .collect();
+    // Resolved links before ambiguous ones, then the busiest pair
+    // first, so rationing keeps the strongest and most certain links.
+    cross.sort_by(|a, b| {
+        a.from_path
+            .cmp(&b.from_path)
+            .then(a.to_path.is_empty().cmp(&b.to_path.is_empty()))
+            .then(b.calls.cmp(&a.calls))
+            .then(a.to.cmp(&b.to))
+            .then(a.from.cmp(&b.from))
+    });
+    LinkIndex {
+        cross,
+        paths: files.iter().map(|f| f.path.clone()).collect(),
+        internal,
+        unresolved,
+    }
+}
+
+/// The structural hint for a reduction: which supplied file calls which.
+///
+/// A reduction reads its children's summaries rather than their source, so what
+/// each symbol does is already in the request and the connections between the
+/// children are not. Declarations, per-symbol site counts and same-file calls
+/// are therefore left out entirely, and the whole budget buys cross-file links -
+/// the inverse of what a leaf needs, which is why this is not `context`.
+pub async fn connections(ctx: &RunContext, evidence: &[Evidence], max: usize) -> Result<Value> {
+    let index = link_index(ctx).await?;
+    let scope: HashSet<&str> = evidence.iter().map(|e| e.path.as_str()).collect();
+    project(&index, &scope, max)
+}
+
+fn project(index: &LinkIndex, scope: &HashSet<&str>, max: usize) -> Result<Value> {
+    let mut by_file: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    let mut leaving = 0usize;
+    for link in &index.cross {
+        if !scope.contains(link.from_path.as_str()) {
+            continue;
+        }
+        let inside = if link.to_path.is_empty() {
+            link.candidates.iter().any(|c| scope.contains(c.as_str()))
+        } else {
+            scope.contains(link.to_path.as_str())
+        };
+        if !inside {
+            leaving += link.calls;
+            continue;
+        }
+        let record = if link.to_path.is_empty() {
+            json!({"from":link.from,"to":link.to,"declared_in":link.candidates,"calls":link.calls,"resolved":false})
+        } else {
+            json!({"from":link.from,"to":format!("{}::{}",link.to_path,link.to),"calls":link.calls})
+        };
+        by_file
+            .entry(link.from_path.as_str())
+            .or_default()
+            .push(record);
+    }
+    let linked: HashSet<&str> = by_file.keys().copied().collect();
+    let mut without_links: Vec<&str> = scope
+        .iter()
+        .copied()
+        .filter(|p| index.paths.contains(*p) && !linked.contains(p))
+        .collect();
+    let mut without_graph: Vec<&str> = scope
+        .iter()
+        .copied()
+        .filter(|p| !index.paths.contains(*p))
+        .collect();
+    without_links.sort_unstable();
+    without_graph.sort_unstable();
+    let files: Vec<(String, Vec<Value>)> = by_file
+        .into_iter()
+        .map(|(path, records)| (path.to_string(), records))
+        .collect();
+    let (items, omitted) = ration(&files, max)?;
+    let deferred: usize = omitted
+        .iter()
+        .filter_map(|o| o["omitted_records"].as_u64())
+        .sum::<u64>() as usize;
+    let counted =
+        |m: &HashMap<String, usize>| -> usize { scope.iter().filter_map(|p| m.get(*p)).sum() };
+    Ok(json!({
+        "items":items,"omitted":omitted,"deferred_links":deferred,
+        "files_without_links":named(&without_links),"files_without_graph":named(&without_graph),
+        "not_shown":{"same_file_calls":counted(&index.internal),
+            "calls_leaving_this_request":leaving,
+            "calls_to_undeclared_names":counted(&index.unresolved)},
+        "semantics":"Syntax only, and never a citation: `from` and `to` are declaration names with a call count folded across every site, not evidence IDs, so cite the supplied child findings instead. A `to` of the form `path::symbol` means that name is declared in exactly one other supplied file; a record with `resolved:false` means several files declare the name and `declared_in` lists them, so treat which one runs as unresolved. `calls` counts call sites, not executions, and this table carries no order or condition: do not assert runtime sequence from it. Same-file calls are left out because the child summaries already describe them. `omitted`, `files_without_links` and `files_without_graph` name connections this request could not carry or could not see; treat those as unresolved, never as evidence that none exist."
+    }))
+}
+
+/// Name the files, up to a cap, rather than report a bare total: a reader that
+/// sees only a count cannot tell which summary to distrust.
+fn named(paths: &[&str]) -> Value {
+    if paths.len() <= NAMED_FILES_MAX {
+        return json!(paths);
+    }
+    json!({"paths":&paths[..NAMED_FILES_MAX],"further":paths.len()-NAMED_FILES_MAX})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parsed(path: &str, source: &str) -> Result<FileGraph> {
+        Ok(FileGraph {
+            path: path.into(),
+            graph: crate::code_graph::parse_test(source, "rust")?.at_path(path),
+        })
+    }
+
+    fn scope_of<'a>(paths: &[&'a str]) -> HashSet<&'a str> {
+        paths.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_call_into_another_file_folds_into_one_counted_link() -> Result<()> {
+        let files = [
+            parsed("a.rs", "fn run() { helper(); helper(); helper(); }")?,
+            parsed("b.rs", "fn helper() {}")?,
+        ];
+        let index = resolve_links(&files);
+        assert_eq!(index.cross.len(), 1);
+        let link = &index.cross[0];
+        assert_eq!(
+            (link.from_path.as_str(), link.from.as_str()),
+            ("a.rs", "run")
+        );
+        assert_eq!(
+            (link.to_path.as_str(), link.to.as_str()),
+            ("b.rs", "helper")
+        );
+        // Three sites, one record: the count is what keeps the table sendable.
+        assert_eq!(link.calls, 3);
+        let value = project(&index, &scope_of(&["a.rs", "b.rs"]), 4000)?;
+        assert_eq!(value["items"][0]["to"], "b.rs::helper");
+        assert_eq!(value["items"][0]["calls"], 3);
+        assert_eq!(value["items"][0]["path"], "a.rs");
+        Ok(())
+    }
+
+    #[test]
+    fn a_same_file_call_is_counted_rather_than_sent() -> Result<()> {
+        let files = [parsed("a.rs", "fn run() { helper(); }\nfn helper() {}")?];
+        let index = resolve_links(&files);
+        assert!(index.cross.is_empty());
+        // The child summary already describes what happens inside one file, so
+        // the budget must not be spent restating it - but it is still reported.
+        assert_eq!(index.internal.get("a.rs").copied(), Some(1));
+        let value = project(&index, &scope_of(&["a.rs"]), 4000)?;
+        assert_eq!(value["not_shown"]["same_file_calls"], 1);
+        assert_eq!(value["files_without_links"][0], "a.rs");
+        Ok(())
+    }
+
+    #[test]
+    fn an_ambiguous_target_is_never_dressed_up_as_resolved() -> Result<()> {
+        let files = [
+            parsed("a.rs", "fn run() { helper(); }")?,
+            parsed("b.rs", "fn helper() {}")?,
+            parsed("c.rs", "fn helper() {}")?,
+        ];
+        let index = resolve_links(&files);
+        assert_eq!(index.cross.len(), 1);
+        assert!(index.cross[0].to_path.is_empty());
+        let value = project(&index, &scope_of(&["a.rs", "b.rs", "c.rs"]), 4000)?;
+        let record = &value["items"][0];
+        assert_eq!(record["resolved"], false);
+        assert_eq!(record["to"], "helper");
+        assert_eq!(record["declared_in"], json!(["b.rs", "c.rs"]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_call_to_a_name_no_file_declares_is_separated_from_a_missing_link() -> Result<()> {
+        let files = [parsed(
+            "a.rs",
+            "fn run() { println!(\"x\"); external_thing(); }",
+        )?];
+        let index = resolve_links(&files);
+        assert!(index.cross.is_empty());
+        assert!(index.unresolved.get("a.rs").copied().unwrap_or(0) >= 1);
+        let value = project(&index, &scope_of(&["a.rs"]), 4000)?;
+        assert!(
+            value["not_shown"]["calls_to_undeclared_names"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_leaving_the_request_is_counted_not_silently_dropped() -> Result<()> {
+        let files = [
+            parsed("a.rs", "fn run() { helper(); helper(); }")?,
+            parsed("b.rs", "fn helper() {}")?,
+        ];
+        let index = resolve_links(&files);
+        let value = project(&index, &scope_of(&["a.rs"]), 4000)?;
+        assert_eq!(value["items"].as_array().map(Vec::len), Some(0));
+        // A reduction that cannot see the far end must know the group is open,
+        // not conclude that the caller talks to nobody.
+        assert_eq!(value["not_shown"]["calls_leaving_this_request"], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_the_graph_never_saw_is_named_apart_from_one_without_links() -> Result<()> {
+        let files = [
+            parsed("a.rs", "fn run() { helper(); }")?,
+            parsed("b.rs", "fn helper() {}")?,
+        ];
+        let index = resolve_links(&files);
+        let value = project(&index, &scope_of(&["a.rs", "b.rs", "z.md"]), 4000)?;
+        assert_eq!(value["files_without_graph"], json!(["z.md"]));
+        // b.rs is graphed and calls nothing; that is not the same as unseen.
+        assert_eq!(value["files_without_links"], json!(["b.rs"]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_hundreds_of_files_declare_resolves_once_and_caps_its_candidates() -> Result<()> {
+        // Resolving per call site would build this candidate list 300 times.
+        let mut files = vec![parsed(
+            "caller.rs",
+            "fn run() { handle(); handle(); handle(); }",
+        )?];
+        for i in 0..300 {
+            files.push(parsed(&format!("m{i:03}.rs"), "fn handle() {}")?);
+        }
+        let index = resolve_links(&files);
+        assert_eq!(index.cross.len(), 1);
+        let link = &index.cross[0];
+        assert!(link.to_path.is_empty());
+        assert_eq!(link.calls, 3);
+        assert_eq!(link.candidates.len(), AMBIGUOUS_CANDIDATES_MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn a_squeezed_budget_still_describes_every_calling_file() -> Result<()> {
+        let files = [
+            parsed("a.rs", "fn a1() { t1(); t1(); t1(); }\nfn a2() { t2(); }")?,
+            parsed("b.rs", "fn b1() { t1(); }\nfn b2() { t2(); t2(); }")?,
+            parsed("t.rs", "fn t1() {}\nfn t2() {}")?,
+        ];
+        let index = resolve_links(&files);
+        let scope = scope_of(&["a.rs", "b.rs", "t.rs"]);
+        let full = project(&index, &scope, 4000)?;
+        assert_eq!(full["items"].as_array().map(Vec::len), Some(4));
+        let tight = project(&index, &scope, 150)?;
+        let items = tight["items"].as_array().cloned().unwrap_or_default();
+        assert!(!items.is_empty() && items.len() < 4);
+        let described: HashSet<&str> = items.iter().filter_map(|i| i["path"].as_str()).collect();
+        // Breadth-first: a long first file cannot consume the whole budget.
+        assert_eq!(described.len(), 2);
+        assert!(tight["deferred_links"].as_u64().unwrap_or(0) > 0);
+        // The busiest pair survives the squeeze.
+        let kept = items.iter().find(|i| i["path"] == "a.rs").context("a.rs")?;
+        assert_eq!(kept["calls"], 3);
+        Ok(())
+    }
 
     #[test]
     fn site_records_fold_targetless_edges_and_drop_storage_only_fields() -> Result<()> {

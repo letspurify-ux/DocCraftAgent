@@ -107,6 +107,7 @@ impl TestRun {
                 reserved_cost: AtomicU64::new(0),
                 extra_margin: AtomicU32::new(0),
                 graph_index: tokio::sync::OnceCell::new(),
+                cross_links: tokio::sync::OnceCell::new(),
             },
             _data: data,
         })

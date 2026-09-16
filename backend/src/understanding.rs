@@ -290,9 +290,12 @@ async fn node(
         // structure of the files those children read is the one thing it cannot
         // recover from the request. Without it every connection between two
         // children has to be written off as uncertain even where the graph
-        // plainly holds the call. The hint is drawn over the same originals the
-        // children kept, and its share of the request is already reserved.
-        input["source_graph"] = crate::graph::context(ctx, &available, graph_limit(ctx)).await?;
+        // plainly holds the call. What each symbol does is already in the
+        // summaries, so the budget buys links rather than declarations. The
+        // hint is drawn over the same originals the children kept, and its
+        // share of the request is already reserved.
+        input["source_graph"] =
+            crate::graph::connections(ctx, &available, graph_limit(ctx)).await?;
     }
     if final_overview {
         input["evidence"] = json!([]);
@@ -524,7 +527,11 @@ fn plan_groups(costs: &[usize], limit: usize) -> Result<Vec<(usize, usize)>> {
 }
 
 pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
-    if db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:version").await? == Some(json!(7))
+    // The node keys below stay at version 7 on purpose: a leaf's request did not
+    // change, so its checkpoint is still valid and is reused. Only a reduction's
+    // input changed, which changes its own key, so redoing the tree re-runs the
+    // reductions and none of the reads.
+    if db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:version").await? == Some(json!(8))
         && let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:root").await?
     {
         return Ok(serde_json::from_value::<Node>(saved)?.discovery);
@@ -725,7 +732,7 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     for (step, value) in [
         ("understanding:root", serde_json::to_value(&root)?),
         ("understanding:coverage", coverage.clone()),
-        ("understanding:version", json!(7)),
+        ("understanding:version", json!(8)),
     ] {
         sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)").bind(&ctx.id).bind(step).bind(value.to_string()).execute(&mut *tx).await?;
     }

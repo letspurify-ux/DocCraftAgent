@@ -85,6 +85,11 @@ pub struct RunContext {
     /// view and a run asks for one per section and per retrieval, so rebuilding
     /// it each time turns linear work into linear work repeated a hundred times.
     pub graph_index: tokio::sync::OnceCell<std::sync::Arc<Vec<crate::graph::FileGraph>>>,
+    /// Call targets resolved to their declaring file, folded across call sites
+    /// and built once. A reduction reads summaries rather than source, so the
+    /// links between its children are the one thing it cannot recover from the
+    /// request, and every node of the reduction tree asks for them.
+    pub cross_links: tokio::sync::OnceCell<std::sync::Arc<crate::graph::LinkIndex>>,
 }
 impl RunContext {
     pub fn check(&self) -> Result<()> {
@@ -272,7 +277,7 @@ fn spawn_worker(
             let _slot=tokio::select!{_=token.cancelled()=>bail!("CANCELLED"),p=state.jobs.acquire()=>p?};
             let client=llm::client(&snapshot.settings.llm)?;
             let budget=db::load_checkpoint(&pool,&task_id,"budget").await?.unwrap_or(json!({}));
-            let ctx=RunContext{state:state.clone(),pool:pool.clone(),id:task_id.clone(),snapshot,cancel:token.clone(),gate:gate.clone(),client,started:Instant::now(),elapsed_before:budget.get("elapsed").and_then(Value::as_u64).unwrap_or(0),finalizing:std::sync::atomic::AtomicBool::new(false),reserved_tokens:AtomicU64::new(budget.get("tokens").and_then(Value::as_u64).unwrap_or(0)),reserved_cost:AtomicU64::new(budget.get("cost").and_then(Value::as_u64).unwrap_or(0)),extra_margin:AtomicU32::new(budget.get("extra_margin").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32),graph_index:tokio::sync::OnceCell::new()};
+            let ctx=RunContext{state:state.clone(),pool:pool.clone(),id:task_id.clone(),snapshot,cancel:token.clone(),gate:gate.clone(),client,started:Instant::now(),elapsed_before:budget.get("elapsed").and_then(Value::as_u64).unwrap_or(0),finalizing:std::sync::atomic::AtomicBool::new(false),reserved_tokens:AtomicU64::new(budget.get("tokens").and_then(Value::as_u64).unwrap_or(0)),reserved_cost:AtomicU64::new(budget.get("cost").and_then(Value::as_u64).unwrap_or(0)),extra_margin:AtomicU32::new(budget.get("extra_margin").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32),graph_index:tokio::sync::OnceCell::new(),cross_links:tokio::sync::OnceCell::new()};
             sqlx::query("UPDATE runs SET status='running' WHERE id=?").bind(&task_id).execute(&pool).await?;
             let timeout=Duration::from_secs(ctx.snapshot.task.max_seconds.saturating_sub(ctx.elapsed_before));
             let result=tokio::select! {

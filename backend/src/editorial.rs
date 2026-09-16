@@ -96,6 +96,19 @@ pub fn code_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
         let width = i - start;
         let mut end = i;
         while end < bytes.len() && !blocks.iter().any(|r| r.contains(&end)) {
+            // A code span does not cross a blank line. A stray backtick with no
+            // closer in its own paragraph is literal text, and pairing it with
+            // one further down the document marks every citation in between as
+            // a code example, which then reaches the published page raw.
+            if bytes[end] == b'\n' {
+                let mut peek = end + 1;
+                while peek < bytes.len() && matches!(bytes[peek], b' ' | b'\t' | b'\r') {
+                    peek += 1;
+                }
+                if peek >= bytes.len() || bytes[peek] == b'\n' {
+                    break;
+                }
+            }
             if bytes[end] != b'`' {
                 end += 1;
                 continue;
@@ -278,6 +291,39 @@ mod tests {
         ));
         assert!(has_unclosed_fence("~~~rust\nlet value = 1;"));
     }
+    #[test]
+    fn a_code_span_does_not_cross_a_blank_line() {
+        let e = Evidence {
+            id: "d".repeat(64),
+            path: "parse.js".into(),
+            start: 1,
+            end: 9,
+            content: "function parseCandidate() {}".into(),
+        };
+        // A stray backtick with no closer in its own paragraph used to pair with
+        // one several paragraphs later, marking every citation between them as a
+        // code example. Nothing rewrote them, nothing validated them, and the
+        // raw marker reached the published page.
+        let section = Section {
+            title: "파싱".into(),
+            markdown: format!(
+                "여는 ` 문자는 문자열 안에만 온다.\n\n파서는 중괄호 깊이를 센다 [E:{id}].\n\n`parseCandidate`가 끝을 정한다.\n",
+                id = e.id
+            ),
+            evidence: vec![e.clone()],
+        };
+        let (body, refs) = render_sections(std::slice::from_ref(&section));
+        assert!(body.contains("[^s1]"), "{body}");
+        assert!(
+            !body.contains(&e.id),
+            "a raw citation reached the document: {body}"
+        );
+        assert!(refs.contains(&e.id));
+        // A span that opens and closes normally is still a literal.
+        let ranges = code_ranges("Call `parseCandidate` now.");
+        assert!(ranges.iter().any(|r| r.contains(&6)), "{ranges:?}");
+    }
+
     #[test]
     fn list_indentation_is_not_code_but_real_indented_blocks_still_are() {
         let e = Evidence {

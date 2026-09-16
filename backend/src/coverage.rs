@@ -19,6 +19,9 @@ const AUDIT: &str = "Audit omissions against ORIGINAL source, independently of s
 #[derive(Clone, Serialize, Deserialize)]
 struct Obligation {
     id: String,
+    /// The passage this belongs to. A request carries several, so an obligation
+    /// has to say which source it came from.
+    path: String,
     subject: String,
     kind: String,
     span: Span,
@@ -50,8 +53,9 @@ struct Page {
     offset: usize,
     content: String,
 }
-struct Passage<'a> {
-    evidence: &'a Evidence,
+/// One source passage and where it starts in its file.
+struct Passage {
+    evidence: Evidence,
     start_byte: usize,
 }
 
@@ -108,6 +112,7 @@ fn obligations(e: &Evidence, g: &CodeGraph, offset: usize) -> Vec<Obligation> {
             ranges.push(span.start_byte.max(offset)..span.end_byte.min(end));
             result.push(Obligation {
                 id: source::hash(format!("{}:{}", e.id, s.id).as_bytes()),
+                path: e.path.clone(),
                 subject: s.qualified_name.clone(),
                 kind: s.kind.clone(),
                 span: span.clone(),
@@ -132,6 +137,7 @@ fn obligations(e: &Evidence, g: &CodeGraph, offset: usize) -> Vec<Obligation> {
                         .count() as u32;
                 result.push(Obligation {
                     id: source::hash(format!("gap:{}:{position}", e.id).as_bytes()),
+                    path: e.path.clone(),
                     subject: e.path.clone(),
                     kind: "passage".into(),
                     span: Span {
@@ -178,6 +184,7 @@ fn obligations(e: &Evidence, g: &CodeGraph, offset: usize) -> Vec<Obligation> {
         let owner = owners.get(source).copied().unwrap_or("<file>");
         result.push(Obligation {
             id: source::hash(format!("{}:{source}:{kind}:{target}", e.id).as_bytes()),
+            path: e.path.clone(),
             subject: match (target.is_empty(), sites) {
                 (true, 1) => format!("{kind} in {owner} at line {}", span.start),
                 (true, n) => format!(
@@ -313,6 +320,25 @@ fn prioritize(order: &mut [usize], pages: &[Page], owners: &HashSet<usize>) {
     order.sort_by_key(|page| !owners.contains(&pages[*page].section));
 }
 
+/// What the audit holds a document answerable for.
+///
+/// A reader looks up a declaration: what a function does, what a type holds.
+/// Measured on a real run, obligations drawn from anything else came back out of
+/// scope 92% of the time — the audit spent its budget confirming that a
+/// package.json and an index.html needed no explaining, which is the budget a
+/// genuinely missing explanation elsewhere never got. Closures are left out for
+/// the same reason: nothing looks one up by name.
+///
+/// What this gives up is per-site checking of branches and exits, and of
+/// top-level code outside any declaration. The graph still records them and the
+/// published coverage statement says so.
+fn audited_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function" | "method" | "class" | "type" | "interface" | "implementation" | "module"
+    )
+}
+
 /// The order the audit walks files in.
 ///
 /// What the document cited is where a reader can be told something wrong; what
@@ -343,6 +369,13 @@ fn group_size(room: usize) -> usize {
     (room / 2000).clamp(1, 24)
 }
 
+/// The distinct files a batch of passages came from.
+fn paths(passages: &[Passage]) -> Vec<&str> {
+    let mut seen: Vec<&str> = passages.iter().map(|p| p.evidence.path.as_str()).collect();
+    seen.dedup();
+    seen
+}
+
 /// Assess what this page can settle. A group may come back partly unresolved:
 /// the caller carries those obligations to the next page and finally reports
 /// them, rather than failing the run over one unusable verdict.
@@ -352,10 +385,9 @@ async fn compare(
     outline: &Outline,
     sections: &[Section],
     page: &Page,
-    passage: Passage<'_>,
+    passages: &[Passage],
     items: &[Obligation],
 ) -> Result<Vec<Assessment>> {
-    let e = passage.evidence;
     let mut accepted: Vec<Assessment> = vec![];
     let mut pending = items.to_vec();
     let mut repair = llm::JsonRepair::default();
@@ -368,7 +400,9 @@ async fn compare(
         let mut input = json!({"phase":"coverage_audit","purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
             "outline":outline.sections.iter().enumerate().map(|(i,s)|json!({"section":i,"title":s.title,"key_points":s.key_points})).collect::<Vec<_>>(),
             "document":{"section":page.section,"offset":page.offset,"content":page.content},
-            "evidence":[e],"source_start_byte":passage.start_byte,"runtime_allowed":source::is_implementation(&e.path),
+            "evidence":passages.iter().map(|p| json!({"id":p.evidence.id,"path":p.evidence.path,
+                "start":p.evidence.start,"end":p.evidence.end,"content":p.evidence.content,
+                "source_start_byte":p.start_byte,"runtime_allowed":source::is_implementation(&p.evidence.path)})).collect::<Vec<_>>(),
             "obligations":pending,"attempt":attempt,"previous_error":error,"instruction":AUDIT});
         repair.apply(&mut input);
         match llm::call(ctx, system, input.clone())
@@ -388,13 +422,13 @@ async fn compare(
                     &format!("Reassess only the supplied obligations. {problems}"),
                     1500,
                 );
-                ctx.event("coverage_retry",json!({"stage":"reviewing","path":e.path,"attempt":attempt+1,"unaccepted":pending.len(),"error":error})).await?;
+                ctx.event("coverage_retry",json!({"stage":"reviewing","paths":paths(passages),"attempt":attempt+1,"unaccepted":pending.len(),"error":error})).await?;
             }
             Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
             Err(failure) => {
                 llm::forget(ctx, system, input).await?;
                 error = editorial::excerpt(&format!("{failure:#}"), 1500);
-                ctx.event("coverage_retry",json!({"stage":"reviewing","path":e.path,"attempt":attempt+1,"unaccepted":pending.len(),"error":error})).await?;
+                ctx.event("coverage_retry",json!({"stage":"reviewing","paths":paths(passages),"attempt":attempt+1,"unaccepted":pending.len(),"error":error})).await?;
             }
         }
     }
@@ -437,6 +471,7 @@ pub async fn audit(
         "COVERAGE_AUDIT_INCOMPLETE: insufficient context for original-source omission audit"
     );
     let pages = pages(sections, (room / 2).min(24_000));
+    let passage_room = (room / 4).min(8000);
     ensure!(
         !pages.is_empty(),
         "COVERAGE_AUDIT_INCOMPLETE: empty document"
@@ -461,16 +496,22 @@ pub async fn audit(
             })
             .unwrap_or_default();
     let mut files = vec![];
+    let mut excluded_files = 0usize;
     for row in
         sqlx::query("SELECT id,path FROM files WHERE run_id=? AND status='indexed' ORDER BY id")
             .bind(&ctx.id)
             .fetch_all(&ctx.pool)
             .await?
     {
-        files.push((
-            row.try_get::<u64, _>("id")?,
-            row.try_get::<String, _>("path")?,
-        ));
+        let path: String = row.try_get("path")?;
+        // Only implementation carries behavior a document is answerable for. A
+        // lockfile or a page template has no declaration to look up, and asking
+        // about one costs the same request as asking about a public entry point.
+        if source::is_implementation(&path) {
+            files.push((row.try_get::<u64, _>("id")?, path));
+        } else {
+            excluded_files += 1;
+        }
     }
     files.sort_by_key(|(_, path)| audit_tier(path, &cited, &considered));
     let (mut audited_files, mut unaudited_files) = (0usize, 0usize);
@@ -486,7 +527,7 @@ pub async fn audit(
         .await?;
     let mut chunks_audited = 0usize;
     let mut issues = vec![];
-    let mut progress = json!({"scope":scope,"complete":false,"checked":0,"covered":0,"out_of_scope":0,"missing":0,"unresolved":0,"passages":0,"chunks":0,"total_chunks":total_chunks});
+    let mut progress = json!({"scope":scope,"complete":false,"checked":0,"covered":0,"out_of_scope":0,"missing":0,"unresolved":0,"passages":0,"chunks":0,"total_chunks":total_chunks,"audited_files":0,"unaudited_files":files.len(),"excluded_files":excluded_files});
     db::checkpoint(&ctx.pool, &ctx.id, "coverage:document", &progress).await?;
     for (position, (file, _)) in files.iter().enumerate() {
         ctx.check()?;
@@ -500,6 +541,7 @@ pub async fn audit(
         let graph = graph::file(ctx, *file).await?.graph;
         let mut byte_offset = 0usize;
         let mut after = 0u64;
+        let mut units: Vec<(Evidence, usize, Vec<Obligation>)> = vec![];
         loop {
             ctx.check()?;
             let rows = sqlx::query("SELECT c.id,c.path,c.start_line,c.end_line,COALESCE(b.content,c.content) content FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.run_id=? AND c.file_id=? AND c.id>? ORDER BY c.id LIMIT 16")
@@ -517,123 +559,157 @@ pub async fn audit(
                     content: row.try_get("content")?,
                 };
                 chunks_audited += 1;
-                for e in understanding::segments(&e, (room / 4).min(8000)) {
+                for e in understanding::segments(&e, passage_room) {
                     let source_start = byte_offset;
-                    let obligations = obligations(&e, &graph, byte_offset);
+                    let items: Vec<Obligation> = obligations(&e, &graph, byte_offset)
+                        .into_iter()
+                        .filter(|o| audited_kind(&o.kind))
+                        .collect();
                     byte_offset += e.content.len();
                     passages += 1;
-                    for group in obligations.chunks(group_size(room)) {
-                        let key = format!(
+                    if !items.is_empty() {
+                        units.push((e, source_start, items));
+                    }
+                }
+            }
+        }
+        // Batch consecutive passages into one request. Grouping obligations only
+        // within a passage meant a file with no parsed graph spent a whole
+        // request - a document page, an instruction and a source passage - on
+        // the single obligation that passage carried.
+        let mut cursor = 0usize;
+        let mut taken = 0usize;
+        while cursor < units.len() {
+            let mut batch: Vec<Passage> = vec![];
+            let mut group: Vec<Obligation> = vec![];
+            let mut bytes = 0usize;
+            while cursor < units.len() && group.len() < group_size(room) {
+                let (evidence, start, items) = &units[cursor];
+                let fresh = batch
+                    .last()
+                    .is_none_or(|last| last.evidence.id != evidence.id);
+                if fresh && !batch.is_empty() && bytes + evidence.content.len() > passage_room {
+                    break;
+                }
+                if fresh {
+                    bytes += evidence.content.len();
+                    batch.push(Passage {
+                        evidence: evidence.clone(),
+                        start_byte: *start,
+                    });
+                }
+                let room_left = group_size(room) - group.len();
+                let take = (items.len() - taken).min(room_left);
+                group.extend(items[taken..taken + take].iter().cloned());
+                taken += take;
+                if taken == items.len() {
+                    cursor += 1;
+                    taken = 0;
+                } else {
+                    // The request is full in the middle of a passage; the rest
+                    // of it starts the next one.
+                    break;
+                }
+            }
+            if group.is_empty() {
+                break;
+            }
+            {
+                let group = &group[..];
+                let key = format!(
                             "coverage:batch:{}",
                             source::hash(
                                 serde_json::to_vec(
-                                    &json!({"scope":scope,"evidence":e.id,"items":group})
+                                    &json!({"scope":scope,"passages":batch.iter().map(|p| &p.evidence.id).collect::<Vec<_>>(),"items":group})
                                 )?
                                 .as_slice()
                             )
                         );
-                        let results: Vec<Assessment> = if let Some(saved) =
-                            db::load_checkpoint(&ctx.pool, &ctx.id, &key).await?
-                        {
-                            serde_json::from_value(saved)?
-                        } else {
-                            let mut decisions = BTreeMap::<String, Assessment>::new();
-                            let mut order: Vec<usize> = (0..pages.len()).collect();
-                            let mut visited = 0usize;
-                            while visited < order.len() {
-                                let pending: Vec<_> = group
-                                    .iter()
-                                    .filter(|o| {
-                                        decisions
-                                            .get(&o.id)
-                                            .is_none_or(|a| a.status == Status::Missing)
-                                    })
-                                    .cloned()
-                                    .collect();
-                                if pending.is_empty() {
-                                    break;
-                                }
-                                let page = &pages[order[visited]];
-                                let response = compare(
-                                    ctx,
-                                    system,
-                                    outline,
-                                    sections,
-                                    page,
-                                    Passage {
-                                        evidence: &e,
-                                        start_byte: source_start,
-                                    },
-                                    &pending,
-                                )
-                                .await?;
-                                for decision in response {
-                                    if decision.status != Status::Missing
-                                        || !decisions.contains_key(&decision.id)
-                                    {
-                                        decisions.insert(decision.id.clone(), decision);
-                                    }
-                                }
-                                visited += 1;
-                                // An unsettled verdict names the section that
-                                // should own the explanation. Look there next
-                                // rather than walking the document in order.
-                                let owners: HashSet<usize> = decisions
-                                    .values()
-                                    .filter(|a| a.status == Status::Missing)
-                                    .map(|a| a.section)
-                                    .collect();
-                                prioritize(&mut order[visited..], &pages, &owners);
-                            }
-                            let results: Vec<_> = decisions.into_values().collect();
-                            db::checkpoint(&ctx.pool, &ctx.id, &key, &json!(results)).await?;
-                            results
-                        };
-                        // An obligation no page could settle stays on the ledger as
-                        // unresolved. It is a warning about the audit, not a claim
-                        // that the document omitted something, and it never stops
-                        // the remaining source from being checked.
-                        unresolved += group.len().saturating_sub(results.len());
-                        for result in &results {
-                            checked += 1;
-                            match result.status {
-                                Status::Covered => covered += 1,
-                                Status::OutOfScope => out_of_scope += 1,
-                                Status::Missing => {
-                                    missing += 1;
-                                    let item = group
-                                        .iter()
-                                        .find(|o| o.id == result.id)
-                                        .ok_or_else(|| {
-                                            anyhow::anyhow!(
-                                                "COVERAGE_AUDIT_INCOMPLETE: stale obligation"
-                                            )
-                                        })?;
-                                    issues.push(Issue {
-                                        severity: "major".into(),
-                                        section: result.section,
-                                        message: format!(
-                                            "원본 대조에서 누락된 설명 ({}:{}–{}, {}): {}",
-                                            e.path,
-                                            item.span.start,
-                                            item.span.end,
-                                            item.subject,
-                                            result.reason
-                                        ),
-                                        query: format!("{} {}", e.path, item.subject),
-                                    });
-                                }
+                let results: Vec<Assessment> = if let Some(saved) =
+                    db::load_checkpoint(&ctx.pool, &ctx.id, &key).await?
+                {
+                    serde_json::from_value(saved)?
+                } else {
+                    let mut decisions = BTreeMap::<String, Assessment>::new();
+                    let mut order: Vec<usize> = (0..pages.len()).collect();
+                    let mut visited = 0usize;
+                    while visited < order.len() {
+                        let pending: Vec<_> = group
+                            .iter()
+                            .filter(|o| {
+                                decisions
+                                    .get(&o.id)
+                                    .is_none_or(|a| a.status == Status::Missing)
+                            })
+                            .cloned()
+                            .collect();
+                        if pending.is_empty() {
+                            break;
+                        }
+                        let page = &pages[order[visited]];
+                        let response =
+                            compare(ctx, system, outline, sections, page, &batch, &pending).await?;
+                        for decision in response {
+                            if decision.status != Status::Missing
+                                || !decisions.contains_key(&decision.id)
+                            {
+                                decisions.insert(decision.id.clone(), decision);
                             }
                         }
-                        // Stable current-run ledger, separate from immutable cache.
-                        db::checkpoint(&ctx.pool,&ctx.id,&format!("coverage:item:{}",source::hash(serde_json::to_vec(group)?.as_slice())),
-                        &json!({"scope":scope,"path":e.path,"evidence_id":e.id,"obligations":group,"assessments":results})).await?;
-                        progress = json!({"scope":scope,"complete":false,"checked":checked,"covered":covered,"out_of_scope":out_of_scope,"missing":missing,"unresolved":unresolved,"passages":passages,
-                        "chunks":chunks_audited,"total_chunks":total_chunks,"audited_files":audited_files,"unaudited_files":files.len()-audited_files});
-                        db::checkpoint(&ctx.pool, &ctx.id, "coverage:document", &progress).await?;
-                        ctx.event("coverage_audit",json!({"stage":"reviewing","title":"원본·그래프와 문서 누락 대조","path":e.path,"coverage":progress})).await?;
+                        visited += 1;
+                        // An unsettled verdict names the section that
+                        // should own the explanation. Look there next
+                        // rather than walking the document in order.
+                        let owners: HashSet<usize> = decisions
+                            .values()
+                            .filter(|a| a.status == Status::Missing)
+                            .map(|a| a.section)
+                            .collect();
+                        prioritize(&mut order[visited..], &pages, &owners);
+                    }
+                    let results: Vec<_> = decisions.into_values().collect();
+                    db::checkpoint(&ctx.pool, &ctx.id, &key, &json!(results)).await?;
+                    results
+                };
+                // An obligation no page could settle stays on the ledger as
+                // unresolved. It is a warning about the audit, not a claim
+                // that the document omitted something, and it never stops
+                // the remaining source from being checked.
+                unresolved += group.len().saturating_sub(results.len());
+                for result in &results {
+                    checked += 1;
+                    match result.status {
+                        Status::Covered => covered += 1,
+                        Status::OutOfScope => out_of_scope += 1,
+                        Status::Missing => {
+                            missing += 1;
+                            let item =
+                                group.iter().find(|o| o.id == result.id).ok_or_else(|| {
+                                    anyhow::anyhow!("COVERAGE_AUDIT_INCOMPLETE: stale obligation")
+                                })?;
+                            issues.push(Issue {
+                                severity: "major".into(),
+                                section: result.section,
+                                message: format!(
+                                    "원본 대조에서 누락된 설명 ({}:{}–{}, {}): {}",
+                                    item.path,
+                                    item.span.start,
+                                    item.span.end,
+                                    item.subject,
+                                    result.reason
+                                ),
+                                query: format!("{} {}", item.path, item.subject),
+                            });
+                        }
                     }
                 }
+                // Stable current-run ledger, separate from immutable cache.
+                db::checkpoint(&ctx.pool,&ctx.id,&format!("coverage:item:{}",source::hash(serde_json::to_vec(group)?.as_slice())),
+                        &json!({"scope":scope,"paths":paths(&batch),"passages":batch.iter().map(|p| &p.evidence.id).collect::<Vec<_>>(),"obligations":group,"assessments":results})).await?;
+                progress = json!({"scope":scope,"complete":false,"checked":checked,"covered":covered,"out_of_scope":out_of_scope,"missing":missing,"unresolved":unresolved,"passages":passages,
+                        "chunks":chunks_audited,"total_chunks":total_chunks,"audited_files":audited_files,"unaudited_files":files.len()-audited_files});
+                db::checkpoint(&ctx.pool, &ctx.id, "coverage:document", &progress).await?;
+                ctx.event("coverage_audit",json!({"stage":"reviewing","title":"원본·그래프와 문서 누락 대조","paths":paths(&batch),"coverage":progress})).await?;
             }
         }
         audited_files += 1;
@@ -647,6 +723,7 @@ pub async fn audit(
     progress["complete"] = json!(true);
     progress["audited_files"] = json!(audited_files);
     progress["unaudited_files"] = json!(unaudited_files);
+    progress["excluded_files"] = json!(excluded_files);
     db::checkpoint(&ctx.pool, &ctx.id, "coverage:document", &progress).await?;
     Ok(issues)
 }
@@ -654,6 +731,75 @@ pub async fn audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_audit_asks_about_declarations_not_every_statement() -> Result<()> {
+        let content = "export function run(x) {\n  if (x) { return fail(); }\n  return ok();\n}\nconst tail = 1;\n";
+        let graph = crate::code_graph::parse_test(content, "javascript")?.at_path("run.js");
+        let e = Evidence {
+            id: source::hash(b"run"),
+            path: "/project/run.js".into(),
+            start: 1,
+            end: 5,
+            content: content.into(),
+        };
+        let all = obligations(&e, &graph, 0);
+        let asked: Vec<&Obligation> = all.iter().filter(|o| audited_kind(&o.kind)).collect();
+        // The declaration is what a reader looks up, and it is what survives.
+        assert!(asked.iter().any(|o| o.kind == "function"));
+        assert!(!asked.is_empty() && asked.len() < all.len());
+        // Branch and exit sites, and the top-level code outside a declaration,
+        // are recorded by the graph but are not what the document is asked for.
+        assert!(
+            all.iter()
+                .any(|o| o.kind == "branch" || o.kind == "returns")
+        );
+        assert!(asked.iter().all(|o| o.kind != "passage"));
+        // A page template has no declaration to look up and never reaches the
+        // audit at all.
+        assert!(!source::is_implementation("/project/index.html"));
+        assert!(!source::is_implementation("/project/package.json"));
+        assert!(source::is_implementation("/project/run.js"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_carries_obligations_from_more_than_one_passage() -> Result<()> {
+        // A file with no parsed graph yields one obligation per passage. Batching
+        // only within a passage spent a whole request - a document page, an
+        // instruction and a source passage - on that single obligation.
+        let content = "plain text with no declarations\n".repeat(400);
+        let source = Evidence {
+            id: String::new(),
+            path: "/project/notes.txt".into(),
+            start: 1,
+            end: 400,
+            content,
+        };
+        let empty = CodeGraph::default();
+        let mut offset = 0usize;
+        let mut units = vec![];
+        for e in understanding::segments(&source, 900) {
+            let items = obligations(&e, &empty, offset);
+            offset += e.content.len();
+            if !items.is_empty() {
+                units.push((e, offset, items));
+            }
+        }
+        assert!(units.len() > 4, "{} passages", units.len());
+        assert!(
+            units.iter().all(|(_, _, items)| items.len() == 1),
+            "a graphless passage carries exactly one obligation"
+        );
+        // Those passages have to share a request rather than each taking one.
+        let per_request = group_size(48_000);
+        assert!(
+            per_request >= units.len(),
+            "{per_request} obligations per request should cover {} passages",
+            units.len()
+        );
+        Ok(())
+    }
 
     #[test]
     fn the_named_owning_section_is_visited_next_without_skipping_the_rest() {
@@ -732,6 +878,7 @@ mod tests {
     fn obligation(id: &str, subject: &str) -> Obligation {
         Obligation {
             id: id.into(),
+            path: "/project/flow.rs".into(),
             subject: subject.into(),
             kind: "function".into(),
             span: Span::default(),

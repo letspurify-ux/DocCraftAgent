@@ -334,8 +334,41 @@ async fn node(
                     "Source summary exceeds {summary_cap} bytes; compress observations"
                 );
                 if children.is_empty() {
-                    ensure!(available.iter().all(|e| brief.findings.iter().any(|f|f.evidence_ids.contains(&e.id))),
-                        "Source overview left supplied passages unaccounted for; include a supported observation for every evidence ID");
+                    // Name the passages that were left out. "Cite every evidence
+                    // ID" tells a repair attempt nothing it can act on when
+                    // three dozen were supplied, and the identifiers are given
+                    // by their short form because that is what the request
+                    // showed the reader.
+                    let uncited: Vec<String> = available
+                        .iter()
+                        .filter(|e| {
+                            !brief
+                                .findings
+                                .iter()
+                                .any(|f| f.evidence_ids.contains(&e.id))
+                        })
+                        .map(|e| {
+                            format!(
+                                "{} ({} L{}-{})",
+                                e.id.get(..8).unwrap_or(&e.id),
+                                e.path.rsplit(['/', '\\']).next().unwrap_or(&e.path),
+                                e.start,
+                                e.end
+                            )
+                        })
+                        .collect();
+                    ensure!(
+                        uncited.is_empty(),
+                        "{} of {} supplied passages are cited by no finding. Extend existing observations to cite them alongside their related passages, or add one that does: {}",
+                        uncited.len(),
+                        available.len(),
+                        uncited
+                            .iter()
+                            .take(20)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    );
                 }
                 Ok(())
             });

@@ -1473,6 +1473,11 @@ async fn write_section(
                 )
             }
         };
+        // Planned anchors and the citations an existing draft already made are
+        // mandatory, so reducing the retrieval budget leaves them whole and the
+        // request the same size. They give up content instead, which is what
+        // lets the input_limit reduction actually converge.
+        let evidence = source::fit_evidence(evidence, max_bytes, &source::search_terms(&query));
         if evidence.is_empty() {
             bail!("No evidence available for section {}", plan.title);
         }

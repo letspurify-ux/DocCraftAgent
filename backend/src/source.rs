@@ -580,6 +580,45 @@ fn prioritize_named(ranked: &mut [(u8, i64, Evidence)], query: &str) {
     ranked.sort_by_key(|(_, _, e)| priorities.get(&e.id).copied().unwrap_or(usize::MAX));
 }
 
+/// Fit passages into a byte budget without dropping any of them.
+///
+/// A section's planned anchors are mandatory: it has to be able to cite what
+/// the outline promised, and the existing draft's citations have to keep
+/// resolving. So when they do not fit, every passage keeps its place and gives
+/// up content instead. Halving a retrieval budget cannot shrink a mandatory
+/// passage, which is how a section can retry five times at the same size and
+/// end the run with SECTION_REPAIR_EXHAUSTED.
+pub(crate) fn fit_evidence(
+    evidence: Vec<Evidence>,
+    max_bytes: usize,
+    terms: &[String],
+) -> Vec<Evidence> {
+    let used: usize = evidence
+        .iter()
+        .map(|e| e.content.len() + e.path.len() + 128)
+        .sum();
+    if used <= max_bytes || evidence.is_empty() {
+        return evidence;
+    }
+    let share = (max_bytes / evidence.len()).saturating_sub(256).max(512);
+    evidence
+        .into_iter()
+        .map(|mut e| {
+            if e.content.len() > share {
+                let (offset, shortened) = focused_excerpt(&e.content, share, terms);
+                e.start += e.content[..offset].bytes().filter(|b| *b == b'\n').count() as u32;
+                let lines = shortened.bytes().filter(|b| *b == b'\n').count() as u32;
+                e.end = e.start + lines - u32::from(shortened.ends_with('\n'));
+                e.content = shortened.to_string();
+                e.id = hash(
+                    format!("{}:{}:{}", e.path, e.start, hash(e.content.as_bytes())).as_bytes(),
+                );
+            }
+            e
+        })
+        .collect()
+}
+
 fn focused_excerpt<'a>(content: &'a str, limit: usize, terms: &[String]) -> (usize, &'a str) {
     if content.len() <= limit {
         return (0, content);
@@ -1035,6 +1074,45 @@ mod tests {
         assert_eq!(ordered.first().copied(), Some("000"));
         assert_eq!(ordered.last().copied(), Some("129"));
     }
+    #[test]
+    fn mandatory_passages_give_up_content_rather_than_their_place() {
+        // A reduction that only shrinks retrieval cannot move a mandatory
+        // passage, so a section retries at the same size until its attempts run
+        // out. Every passage has to stay citable and get smaller instead.
+        let passages: Vec<Evidence> = (0..6)
+            .map(|i| Evidence {
+                id: hash(format!("chunk{i}").as_bytes()),
+                path: format!("/project/module{i}.js"),
+                start: 1,
+                end: 400,
+                content: format!("const marker{i} = 1;\n{}", "  filler();\n".repeat(900)),
+            })
+            .collect();
+        let before: usize = passages.iter().map(|e| e.content.len()).sum();
+        let ids: Vec<String> = passages.iter().map(|e| e.id.clone()).collect();
+        let fitted = fit_evidence(passages, 12_000, &search_terms("marker3 filler"));
+        // Nothing was dropped, and the budget is respected.
+        assert_eq!(fitted.len(), 6);
+        let after: usize = fitted
+            .iter()
+            .map(|e| e.content.len() + e.path.len() + 128)
+            .sum();
+        assert!(after <= 12_000, "{after}");
+        assert!(after < before);
+        // A shortened passage is re-identified, because its content decides its
+        // citation id everywhere else.
+        assert!(fitted.iter().zip(&ids).all(|(e, old)| &e.id != old));
+        // What already fits is left exactly as it was.
+        let small = vec![Evidence {
+            id: hash(b"small"),
+            path: "/project/tiny.js".into(),
+            start: 1,
+            end: 1,
+            content: "export const ok = true;".into(),
+        }];
+        assert_eq!(fit_evidence(small.clone(), 12_000, &[])[0].id, small[0].id);
+    }
+
     #[test]
     fn truncated_evidence_keeps_the_matching_logic_and_source_range() {
         let content = format!(

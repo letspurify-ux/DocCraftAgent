@@ -769,6 +769,14 @@ async fn execute_document(ctx: &RunContext) -> Result<()> {
             coverage["missing"].as_u64().unwrap_or(0)
         );
     }
+    // Obligations no page could settle are a gap in the audit, not a verdict on
+    // the document. They are reported rather than hidden, and they do not stop a
+    // finished document from being published.
+    if let Some(unresolved) = coverage["unresolved"].as_u64().filter(|n| *n > 0) {
+        warnings.push(format!(
+            "원본 대조에서 {unresolved}개 항목의 판정을 확정하지 못했습니다. 해당 항목은 누락 원장에 남아 있습니다"
+        ));
+    }
     let indexed = db::load_checkpoint(&ctx.pool, &ctx.id, "indexed")
         .await?
         .unwrap_or(json!({}));

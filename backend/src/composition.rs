@@ -33,17 +33,32 @@ pub async fn understanding(
     let purpose = db::load_checkpoint(&pool, &id, "source_understanding").await?;
     let graph = db::load_checkpoint(&pool, &id, "graph:coverage").await?;
     let document_coverage = db::load_checkpoint(&pool, &id, "coverage:document").await?;
-    let rows=sqlx::query("SELECT step,data FROM checkpoints WHERE run_id=? AND step LIKE 'understanding:node:%' AND step>? ORDER BY step LIMIT 21")
-        .bind(&id).bind(page.after.unwrap_or_default()).fetch_all(&pool).await?;
-    let has_more = rows.len() > 20;
+    // Reduction nodes share the key prefix with the leaves this page shows, so a
+    // raw page of checkpoints can hold none of them. Keep scanning until the
+    // page is full, or the caller sees an empty page that still says has_more.
+    let mut cursor = page.after.unwrap_or_default();
     let mut nodes = vec![];
-    let mut cursor = String::new();
-    for row in rows.into_iter().take(20) {
-        cursor = row.try_get("step")?;
-        let n: crate::understanding::Node =
-            serde_json::from_str(&row.try_get::<String, _>("data")?)?;
-        if n.children.is_empty() {
-            nodes.push(json!({"id":n.key,"files":n.files,"brief":n.discovery.brief,"validation_issues":n.validation_issues}));
+    let mut has_more = false;
+    loop {
+        let rows=sqlx::query("SELECT step,data FROM checkpoints WHERE run_id=? AND step LIKE 'understanding:node:%' AND step>? ORDER BY step LIMIT 64")
+            .bind(&id).bind(&cursor).fetch_all(&pool).await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            if nodes.len() >= 20 {
+                has_more = true;
+                break;
+            }
+            cursor = row.try_get("step")?;
+            let n: crate::understanding::Node =
+                serde_json::from_str(&row.try_get::<String, _>("data")?)?;
+            if n.children.is_empty() {
+                nodes.push(json!({"id":n.key,"files":n.files,"brief":n.discovery.brief,"validation_issues":n.validation_issues}));
+            }
+        }
+        if has_more {
+            break;
         }
     }
     let counts=sqlx::query("SELECT COUNT(*) total,SUM(status='indexed') indexed,SUM(status='excluded') excluded,SUM(status='skipped') skipped FROM files WHERE run_id=?").bind(&id).fetch_one(&pool).await?;

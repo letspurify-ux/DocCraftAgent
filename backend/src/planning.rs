@@ -50,6 +50,13 @@ pub(crate) struct Discovery {
     pub validation_unresolved: bool,
 }
 
+/// A brief carries at most `MAX_FINDINGS` findings of at most
+/// `MAX_EVIDENCE_IDS` citations, so one brief can name at most their product in
+/// distinct passages. Callers that must have every supplied passage cited size
+/// their requests against that ceiling.
+pub(crate) const MAX_FINDINGS: usize = 12;
+pub(crate) const MAX_EVIDENCE_IDS: usize = 6;
+
 fn bounded_text(value: &str, max: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max
 }
@@ -83,8 +90,8 @@ pub(crate) fn validate_brief(
     final_pass: bool,
 ) -> Result<()> {
     ensure!(
-        !brief.findings.is_empty() && brief.findings.len() <= 12,
-        "Supply 1-12 source findings"
+        !brief.findings.is_empty() && brief.findings.len() <= MAX_FINDINGS,
+        "Supply 1-{MAX_FINDINGS} source findings"
     );
     ensure!(
         brief.uncertainties.len() <= 8 && brief.uncertainties.iter().all(|s| bounded_text(s, 1500)),
@@ -121,7 +128,7 @@ pub(crate) fn validate_brief(
             bounded_text(&finding.topic, 300) && bounded_text(&finding.observation, 4000),
             "Invalid source finding text"
         );
-        resolve_ids(&mut finding.evidence_ids, evidence, 6)?;
+        resolve_ids(&mut finding.evidence_ids, evidence, MAX_EVIDENCE_IDS)?;
         if matches!(finding.kind, FindingKind::Runtime) {
             ensure!(
                 evidence
@@ -353,14 +360,17 @@ pub(crate) fn pack_evidence(groups: &[Vec<Evidence>], limit: usize) -> Vec<Evide
     selected
 }
 
+// The brief, supporting findings, anchors, project overview, feedback and the
+// planning instruction that ride along with the packed evidence.
+const PLAN_REQUEST_OVERHEAD_BYTES: usize = 32_000;
+
 pub(crate) fn evidence_budget(ctx: &RunContext) -> usize {
-    let l = &ctx.snapshot.settings.llm;
-    let available = (l.context_limit.min(l.model_context_limit).min(200_000) as usize)
-        .saturating_mul(100usize.saturating_sub(l.safety_percent as usize))
-        / 100;
-    available
-        .saturating_sub(l.max_output_tokens as usize + ctx.snapshot.task.direction.len() + 32_000)
-        .min(48_000)
+    crate::budget::packing_limit(
+        &ctx.snapshot.settings.llm,
+        ctx.extra_margin.load(std::sync::atomic::Ordering::Relaxed),
+        PLAN_REQUEST_OVERHEAD_BYTES.saturating_add(ctx.snapshot.task.direction.len()),
+    )
+    .min(48_000)
 }
 
 pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
@@ -679,7 +689,7 @@ mod tests {
     fn generated_title_prerequisites_resolve_through_32_sections() -> Result<()> {
         let source = evidence("/project/main.py", "def process(): return 1");
         let mut value = generated_plan(32);
-        for section in value["sections"].as_array_mut().unwrap() {
+        for section in value["sections"].as_array_mut().context("sections")? {
             section["evidence_ids"] = json!([source.id]);
         }
         value["sections"][31]["prerequisite_titles"] = json!(["단계 1", "단계 31", "단계 1"]);
@@ -732,10 +742,10 @@ mod tests {
     fn legacy_generated_dependencies_deduplicate_but_do_not_shift_numbering() -> Result<()> {
         let source = evidence("/project/main.py", "def process(): return 1");
         let mut value = generated_plan(3);
-        for section in value["sections"].as_array_mut().unwrap() {
+        for section in value["sections"].as_array_mut().context("sections")? {
             section
                 .as_object_mut()
-                .unwrap()
+                .context("section object")?
                 .remove("prerequisite_titles");
             section["evidence_ids"] = json!([source.id]);
         }
@@ -751,7 +761,8 @@ mod tests {
         ] {
             plan.sections[1].depends_on = vec![reference];
             let error = validate_outline(&mut plan, std::slice::from_ref(&source), Some(0))
-                .unwrap_err()
+                .err()
+                .context("an invalid dependency must be rejected")?
                 .to_string();
             assert!(error.contains("sections[1]"), "{error}");
             assert!(error.contains(reason), "{error}");
@@ -760,16 +771,17 @@ mod tests {
     }
 
     #[test]
-    fn dependency_repair_includes_middle_sections_of_long_responses() {
+    fn dependency_repair_includes_middle_sections_of_long_responses() -> Result<()> {
         let mut value = generated_plan(32);
-        for section in value["sections"].as_array_mut().unwrap() {
+        for section in value["sections"].as_array_mut().context("sections")? {
             section["key_points"] = json!(["detail".repeat(1000)]);
         }
         let context = dependency_repair_context(&value.to_string());
-        assert_eq!(context.as_array().unwrap().len(), 32);
+        assert_eq!(context.as_array().map(Vec::len), Some(32));
         assert_eq!(context[16]["title"], "단계 17");
         assert_eq!(context[16]["prerequisite_titles"], json!(["단계 16"]));
         assert!(context[16].get("key_points").is_none());
+        Ok(())
     }
 
     #[test]

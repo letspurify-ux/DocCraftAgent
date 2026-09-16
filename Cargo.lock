@@ -419,6 +419,7 @@ dependencies = [
  "serde_path_to_error",
  "sha2",
  "sqlx",
+ "subtle",
  "tempfile",
  "tokio",
  "tokio-util",

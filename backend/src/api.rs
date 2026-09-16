@@ -262,9 +262,15 @@ async fn authenticate(State(s): State<Arc<AppState>>, req: Request, next: Next) 
         .get(header::COOKIE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
-    let ok = cookie
-        .split(';')
-        .any(|c| c.trim() == format!("doccraft_session={}", s.session));
+    // Compare in constant time: the session is the only credential the local
+    // API has, and a plain string compare returns as soon as a byte differs.
+    let expected = format!("doccraft_session={}", s.session);
+    let ok = cookie.split(';').any(|c| {
+        bool::from(subtle::ConstantTimeEq::ct_eq(
+            c.trim().as_bytes(),
+            expected.as_bytes(),
+        ))
+    });
     if !ok {
         return (
             StatusCode::UNAUTHORIZED,
@@ -756,8 +762,14 @@ async fn events(
                 },
                 Err(_)=>{yield Ok(Event::default().event("connection").data("database temporarily unavailable"));}
             }
-            if idle_polls == 1 || idle_polls >= 20 {
-                idle_polls = 0;
+            // Check the run status as soon as the stream goes idle, then once
+            // every twenty idle polls. Resetting the counter to zero here would
+            // make every idle poll a status query, because the next empty page
+            // puts it straight back at one.
+            if idle_polls == 1 || idle_polls == 20 {
+                if idle_polls == 20 {
+                    idle_polls = 1;
+                }
                 match sqlx::query_scalar::<_,String>("SELECT status FROM runs WHERE id=?").bind(&id).fetch_optional(&pool).await {
                     Ok(Some(status)) if stream_terminal(&status) => {
                         // Completion may commit after the first event query. Drain its

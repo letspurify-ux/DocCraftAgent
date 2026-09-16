@@ -667,7 +667,7 @@ mod quota_tests {
         assert!(!retryable_status(reqwest::StatusCode::UNAUTHORIZED));
     }
     #[test]
-    fn decoder_reports_field_paths_types_and_syntax_positions() {
+    fn decoder_reports_field_paths_types_and_syntax_positions() -> Result<()> {
         #[derive(serde::Deserialize)]
         #[allow(dead_code)]
         struct Item {
@@ -680,13 +680,13 @@ mod quota_tests {
         }
         let error = decode::<Response>(r#"{"findings":[{"evidence_ids":42}]}"#)
             .err()
-            .unwrap()
+            .context("a wrong evidence_ids type must not decode")?
             .to_string();
         assert!(error.contains("findings[0].evidence_ids"), "{error}");
         assert!(error.contains("sequence"), "{error}");
         let missing = decode::<Response>(r#"{"findings":[{}]}"#)
             .err()
-            .unwrap()
+            .context("a missing evidence_ids field must not decode")?
             .to_string();
         assert!(
             missing.contains("missing field `evidence_ids`"),
@@ -694,9 +694,10 @@ mod quota_tests {
         );
         let syntax = decode::<Response>(r#"{"findings":["#)
             .err()
-            .unwrap()
+            .context("truncated JSON must not decode")?
             .to_string();
         assert!(syntax.contains("line 1 column"), "{syntax}");
+        Ok(())
     }
 
     #[test]
@@ -711,8 +712,7 @@ mod quota_tests {
         assert!(
             input["repair_instruction"]
                 .as_str()
-                .unwrap()
-                .contains("untrusted")
+                .is_some_and(|text| text.contains("untrusted"))
         );
     }
 

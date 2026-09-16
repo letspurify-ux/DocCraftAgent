@@ -2,7 +2,7 @@
 //! never truncate the file inventory or mark unread input as understood.
 use crate::{
     db, editorial, llm,
-    model::Evidence,
+    model::{Evidence, LlmConfig},
     planning::{Discovery, SourceBrief, pack_evidence, validate_brief},
     runner::{RunContext, fatal, is_budget},
     source,
@@ -16,11 +16,27 @@ use std::collections::{HashMap, HashSet};
 const READ: &str = "Read source evidence before planning, independently of any future documentation purpose. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Read ALL supplied passages. Explain module responsibilities, entry points, inputs, conditions, decisions, state/data changes, outputs, consumers and errors/cancellation/lifecycle. Preserve distinct public workflows, important branches, and producer/consumer contracts. Imports and call names are navigation candidates, not proof of execution. Mark unresolved connections. Runtime observations require implementation passages; tests/docs describe context only. Use at most 12 findings, observations under 1000 characters, at most 6 evidence IDs each, and 8 uncertainties. Do not design a table of contents or force unrelated flows into one sequence. Use the requested language.";
 const REDUCE: &str = "Read source evidence before planning. Integrate ALL supplied child summaries into a higher-level source overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve distinct workflows, module contracts, state changes, result consumers, conditional/error/cancel branches and unresolved cross-module links. Child findings have already been checked against their original passages. Preserve their important workflows and source anchors even when those passages are not repeated in this bounded request. previously_read anchors identify those originals; they support carrying the child observation, not inventing new facts. Use newly supplied original evidence to establish NEW connections; mark any other cross-module synthesis as uncertain. Never invent an execution order to join independent workflows. Do not assume a missing excerpt is absent from the project. Include at most 12 findings, each observation under 1000 characters and with 1-6 supplied evidence IDs, and at most 8 uncertainties. Do not produce a document outline. Use the requested language.";
 
-// Keep summaries compact for downstream planning while preserving distinct
-// workflows and their supporting observations.
+// Ceilings, not the operating limits. Both effective limits are derived from
+// the configured context window so that a request always fits the gate in
+// budget::check; these only stop a very large context from growing a single
+// batch or summary without bound.
 const SUMMARY_MAX_BYTES: usize = 48_000;
-// Leave room in the 200k-token model context for output, metadata and retries.
 const SOURCE_INPUT_MAX_BYTES: usize = 96_000;
+// A leaf must cite every passage it was given, and one brief can name at most
+// MAX_FINDINGS x MAX_EVIDENCE_IDS distinct passages. Filling a batch to that
+// exact ceiling would demand a perfect partition - twelve findings of six
+// distinct passages each, no passage shared - which no reading produces, so the
+// batch takes half of it and leaves the rest for passages that support more
+// than one observation.
+const MAX_BATCH_PASSAGES: usize =
+    crate::planning::MAX_FINDINGS * crate::planning::MAX_EVIDENCE_IDS / 2;
+// Instructions, policies and the per-evidence class table that ride along with
+// every understanding request. The structural hint is not in here: it scales
+// with the request instead, so a small context window still leaves room to read
+// source rather than reserving a fixed block it cannot afford.
+const REQUEST_OVERHEAD_BYTES: usize = 16_000;
+// The structural hint describes every file in the batch, not just the first.
+const GRAPH_CONTEXT_MAX_BYTES: usize = 12_000;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -55,7 +71,7 @@ fn validated_findings(brief: &SourceBrief, evidence: &[Evidence]) -> Vec<crate::
         })
         .collect()
 }
-fn salvage(mut brief: SourceBrief, evidence: &[Evidence]) -> SourceBrief {
+fn salvage(mut brief: SourceBrief, evidence: &[Evidence], maximum: usize) -> SourceBrief {
     brief.findings = validated_findings(&brief, evidence)
         .into_iter()
         .take(12)
@@ -69,7 +85,7 @@ fn salvage(mut brief: SourceBrief, evidence: &[Evidence]) -> SourceBrief {
         .collect();
     brief.uncertainties.push("일부 소스 관찰은 근거 검증을 통과하지 못해 제외되었습니다. 해당 분석 묶음의 검증 오류와 원문을 재검토해야 합니다.".into());
     brief.followup_queries = vec![];
-    while serde_json::to_vec(&brief).map_or(true, |v| v.len() > SUMMARY_MAX_BYTES)
+    while serde_json::to_vec(&brief).map_or(true, |v| v.len() > maximum)
         && !brief.findings.is_empty()
     {
         brief.findings.pop();
@@ -78,7 +94,12 @@ fn salvage(mut brief: SourceBrief, evidence: &[Evidence]) -> SourceBrief {
 }
 
 /// Recover only independently checkable findings; malformed JSON contributes no claims.
-fn recover_output(output: &str, children: &[Node], evidence: &[Evidence]) -> SourceBrief {
+fn recover_output(
+    output: &str,
+    children: &[Node],
+    evidence: &[Evidence],
+    maximum: usize,
+) -> SourceBrief {
     let mut findings = children
         .iter()
         .flat_map(|n| n.discovery.brief.findings.clone())
@@ -99,16 +120,66 @@ fn recover_output(output: &str, children: &[Node], evidence: &[Evidence]) -> Sou
             followup_queries: vec![],
         },
         evidence,
+        maximum,
     )
 }
 
+/// Raw bytes one understanding request may carry for source and its structural
+/// hint together, mirroring the gate in `budget::check` so that packing never
+/// builds a request the gate rejects.
+fn request_space(l: &LlmConfig, extra_margin: u32) -> usize {
+    crate::budget::packing_limit(l, extra_margin, REQUEST_OVERHEAD_BYTES)
+        .min(SOURCE_INPUT_MAX_BYTES + GRAPH_CONTEXT_MAX_BYTES)
+}
+
+/// The hint shares the request with the source it describes, so it takes a
+/// share rather than a fixed block.
+fn graph_budget(space: usize) -> usize {
+    (space / 8).min(GRAPH_CONTEXT_MAX_BYTES)
+}
+
+/// Raw source bytes one request may carry, once the hint has taken its share.
+fn request_limit(l: &LlmConfig, extra_margin: u32) -> usize {
+    let space = request_space(l, extra_margin);
+    space.saturating_sub(graph_budget(space))
+}
+
+fn margin(ctx: &RunContext) -> u32 {
+    // The provider may already have forced extra margin on this run. Ignoring
+    // it rebuilds the same oversized request on every retry.
+    ctx.extra_margin.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn input_limit(ctx: &RunContext) -> usize {
-    let l = &ctx.snapshot.settings.llm;
-    ((l.context_limit.min(l.model_context_limit).min(200_000) as usize)
-        .saturating_mul(100usize.saturating_sub(l.safety_percent as usize))
-        / 100)
-        .saturating_sub(l.max_output_tokens as usize + 20_000)
-        .min(SOURCE_INPUT_MAX_BYTES)
+    request_limit(&ctx.snapshot.settings.llm, margin(ctx))
+}
+
+fn graph_limit(ctx: &RunContext) -> usize {
+    graph_budget(request_space(&ctx.snapshot.settings.llm, margin(ctx)))
+}
+
+/// A reduction carries its children's summaries whole, so no single summary may
+/// claim more than its share of one request.
+fn summary_maximum(limit: usize) -> usize {
+    (limit / 6).clamp(4_000, SUMMARY_MAX_BYTES)
+}
+
+fn summary_limit(ctx: &RunContext) -> usize {
+    summary_maximum(input_limit(ctx))
+}
+
+/// Bytes a reduction must carry before any original passage is re-read: every
+/// child summary, plus one `source_anchors` entry and one `evidence_classes`
+/// entry per retained original. Only what is left may be spent on originals.
+fn mandatory_bytes(children: &[Node]) -> Result<usize> {
+    let mut total = 0usize;
+    for child in children {
+        total = total.saturating_add(serde_json::to_vec(&child.discovery.brief)?.len());
+        for e in &child.discovery.evidence {
+            total = total.saturating_add(2 * (e.id.len() + e.path.len()) + 128);
+        }
+    }
+    Ok(total)
 }
 
 /// Every byte belongs to one segment, including long lines and Unicode.
@@ -198,7 +269,7 @@ async fn node(
         object.remove("source_anchors");
     }
     if children.is_empty() {
-        input["source_graph"] = crate::graph::context(ctx, &evidence, 4000).await?;
+        input["source_graph"] = crate::graph::context(ctx, &evidence, graph_limit(ctx)).await?;
         input["preservation_policy"] = json!(
             "This is an overview of preserved originals. Use graph symbols and branches to check important contracts. Every supplied evidence passage must be cited by at least one finding; do not silently leave a passage unread. The final document is independently checked against originals even when a fact does not fit this overview."
         );
@@ -213,12 +284,13 @@ async fn node(
     // same contract when resuming with explicitly changed model settings.
     let config = &ctx.snapshot.settings.llm;
     let key = format!("understanding:node:{}", source::hash(serde_json::to_string(&json!({
-        "version":6,"input":input,"children":children.iter().map(|n| &n.key).collect::<Vec<_>>(),"model":config.model,"endpoint":config.base_url,
+        "version":7,"input":input,"children":children.iter().map(|n| &n.key).collect::<Vec<_>>(),"model":config.model,"endpoint":config.base_url,
         "reasoning":config.reasoning,"effort":config.effort,"output":config.max_output_tokens
     }))?.as_bytes()));
     if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? {
         return Ok(serde_json::from_value(saved)?);
     }
+    let summary_cap = summary_limit(ctx);
     let mut error = String::new();
     let mut repair = llm::JsonRepair::default();
     for attempt in 0..3 {
@@ -233,14 +305,14 @@ async fn node(
                 Ok(brief) => brief,
                 Err(error) if attempt == 2 => {
                     validation_issues.push(format!("{error:#}"));
-                    return Ok(recover_output(&s, children, &available));
+                    return Ok(recover_output(&s, children, &available, summary_cap));
                 }
                 Err(error) => return Err(error),
             };
             let validation = validate_brief(&mut brief, &available, true).and_then(|_| {
                 ensure!(
-                    serde_json::to_vec(&brief)?.len() <= SUMMARY_MAX_BYTES,
-                    "Source summary exceeds 48000 bytes; compress observations"
+                    serde_json::to_vec(&brief)?.len() <= summary_cap,
+                    "Source summary exceeds {summary_cap} bytes; compress observations"
                 );
                 if children.is_empty() {
                     ensure!(available.iter().all(|e| brief.findings.iter().any(|f|f.evidence_ids.contains(&e.id))),
@@ -254,7 +326,7 @@ async fn node(
                 }
                 validation_issues.push(error.to_string());
                 unverified_brief = Some(brief.clone());
-                brief = salvage(brief, &available);
+                brief = salvage(brief, &available, summary_cap);
             }
             Ok(brief)
         });
@@ -321,7 +393,12 @@ async fn node(
                 db::checkpoint(&ctx.pool, &ctx.id, &key, &serde_json::to_value(&result)?).await?;
                 return Ok(result);
             }
-            Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
+            // A context-budget rejection happens before the request is sent and
+            // the request is identical on every attempt. Hand it back so the
+            // caller can shrink the request instead of burning the retries.
+            Err(e) if fatal(&e) || is_budget(&e) || crate::runner::is_context_budget(&e) => {
+                return Err(e);
+            }
             Err(e) => {
                 llm::forget(ctx, system, request).await?;
                 error = editorial::excerpt(&format!("{e:#}"), 1500);
@@ -345,8 +422,57 @@ fn reduction_work(mut nodes: usize) -> usize {
     total
 }
 
+/// Group one level's children so that a reduction's mandatory payload fits a
+/// single request. Four keeps the tree shallow; narrower groups are used only
+/// when the summaries and their anchors leave no room. Two is the floor, because
+/// a group of one makes no progress towards a single root.
+async fn reduction_groups(
+    ctx: &RunContext,
+    nodes: &[String],
+    limit: usize,
+) -> Result<Vec<Vec<String>>> {
+    // Measure first and drop each child again; a level's nodes together hold
+    // far more source than one request may carry.
+    let mut costs = Vec::with_capacity(nodes.len());
+    for key in nodes {
+        let value = db::load_checkpoint(&ctx.pool, &ctx.id, key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Missing source analysis node"))?;
+        let child: Node = serde_json::from_value(value)?;
+        costs.push(mandatory_bytes(std::slice::from_ref(&child))?);
+    }
+    Ok(plan_groups(&costs, limit)?
+        .into_iter()
+        .map(|(start, end)| nodes[start..end].to_vec())
+        .collect())
+}
+
+/// Half-open ranges over one level's children, at most four wide.
+fn plan_groups(costs: &[usize], limit: usize) -> Result<Vec<(usize, usize)>> {
+    let mut groups = vec![];
+    let mut start = 0;
+    while start < costs.len() {
+        let mut end = start + 1;
+        let mut used = costs[start];
+        while end < costs.len() && end - start < 4 && used + costs[end] <= limit {
+            used += costs[end];
+            end += 1;
+        }
+        // A trailing single child passes through to the next level, but a
+        // single child with work still behind it would never converge.
+        ensure!(
+            end - start > 1 || end == costs.len(),
+            "CONTEXT_BUDGET: two source summaries no longer fit one request ({} of {limit} bytes); raise the context limit or lower the output limit in LLM settings",
+            costs[start] + costs[end]
+        );
+        groups.push((start, end));
+        start = end;
+    }
+    Ok(groups)
+}
+
 pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
-    if db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:version").await? == Some(json!(6))
+    if db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:version").await? == Some(json!(7))
         && let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:root").await?
     {
         return Ok(serde_json::from_value::<Node>(saved)?.discovery);
@@ -407,6 +533,13 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     let mut chunks_read = 0;
     for indices in order.chunks(64) {
         ctx.check()?;
+        let limit = input_limit(ctx);
+        // Forced margin can shrink the request mid-pass. Splitting source into
+        // fragments to fit a window this small would read nothing useful.
+        ensure!(
+            limit >= 1024,
+            "CONTEXT_BUDGET: insufficient input space for whole-source reading"
+        );
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "SELECT c.id,c.path,c.start_line,c.end_line,COALESCE(b.content,c.content) content FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.run_id=",
         );
@@ -440,7 +573,8 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
                 .ok_or_else(|| anyhow::anyhow!("Missing source chunk {id}"))?;
             for part in segments(&e, limit.saturating_sub(e.path.len() + 512)) {
                 let bytes = part.content.len() + part.path.len() + 256;
-                if (size + bytes > limit || group.len() >= 72) && !group.is_empty() {
+                if (size + bytes > limit || group.len() >= MAX_BATCH_PASSAGES) && !group.is_empty()
+                {
                     nodes.push(
                         node(ctx, system, std::mem::take(&mut group), &[], false)
                             .await?
@@ -466,7 +600,7 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     let leaves = nodes.clone();
     let batch_count = leaves.len();
     db::checkpoint(&ctx.pool, &ctx.id, "understanding:leaves", &json!(leaves)).await?;
-    let total_summaries = reduction_work(batch_count);
+    let mut total_summaries = reduction_work(batch_count);
     let mut completed_summaries = 0usize;
     if total_summaries > 0 {
         ctx.event("source_connections", json!({"stage":"understanding","title":"모듈 역할과 흐름 종합","level":1,"completed":0,"total":nodes.len().div_ceil(4),"level_completed":0,"level_total":nodes.len().div_ceil(4),"completed_summaries":0,"total_summaries":total_summaries})).await?;
@@ -474,13 +608,16 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     let mut level = 0;
     while nodes.len() > 1 {
         level += 1;
+        // Re-read the limit each level: the provider may have forced extra
+        // margin on this run since the leaves were read.
+        let limit = input_limit(ctx);
+        let groups = reduction_groups(ctx, &nodes, limit).await?;
         let mut next = vec![];
-        let level_total = nodes
-            .chunks(4)
-            .filter(|children| children.len() > 1)
-            .count();
+        let level_total = groups.iter().filter(|children| children.len() > 1).count();
+        // A narrower fan-out means more summaries than the four-way estimate.
+        total_summaries = total_summaries.max(completed_summaries + level_total);
         let mut level_completed = 0usize;
-        for children in nodes.chunks(4) {
+        for children in &groups {
             if children.len() == 1 {
                 next.push(children[0].clone());
                 continue;
@@ -492,21 +629,31 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
                     .ok_or_else(|| anyhow::anyhow!("Missing source analysis node"))?;
                 loaded.push(serde_json::from_value::<Node>(value)?);
             }
-            let evidence = pack_evidence(
-                &loaded
-                    .iter()
-                    .map(|n| n.discovery.evidence.clone())
-                    .collect::<Vec<_>>(),
-                limit,
-            );
+            // The children's summaries and anchors are mandatory in this
+            // request; originals are re-read only with what is left over. The
+            // final synthesis is shown no originals at all, so packing them
+            // would spend the budget on passages it never sees and would let it
+            // cite an anchor it was never given.
+            let final_overview = groups.len() == 1;
+            let evidence = if final_overview {
+                vec![]
+            } else {
+                pack_evidence(
+                    &loaded
+                        .iter()
+                        .map(|n| n.discovery.evidence.clone())
+                        .collect::<Vec<_>>(),
+                    limit.saturating_sub(mandatory_bytes(&loaded)?),
+                )
+            };
             next.push(
-                node(ctx, system, evidence, &loaded, nodes.len() <= 4)
+                node(ctx, system, evidence, &loaded, final_overview)
                     .await?
                     .key,
             );
             level_completed += 1;
             completed_summaries += 1;
-            ctx.event("source_connections", json!({"stage":"understanding","title":"모듈 역할과 흐름 종합","level":level,"completed":next.len(),"total":nodes.len().div_ceil(4),"level_completed":level_completed,"level_total":level_total,"completed_summaries":completed_summaries,"total_summaries":total_summaries})).await?;
+            ctx.event("source_connections", json!({"stage":"understanding","title":"모듈 역할과 흐름 종합","level":level,"completed":next.len(),"total":groups.len(),"level_completed":level_completed,"level_total":level_total,"completed_summaries":completed_summaries,"total_summaries":total_summaries})).await?;
         }
         nodes = next;
     }
@@ -526,7 +673,7 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     for (step, value) in [
         ("understanding:root", serde_json::to_value(&root)?),
         ("understanding:coverage", coverage.clone()),
-        ("understanding:version", json!(6)),
+        ("understanding:version", json!(7)),
     ] {
         sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)").bind(&ctx.id).bind(step).bind(value.to_string()).execute(&mut *tx).await?;
     }
@@ -551,21 +698,26 @@ mod tests {
             end: 1,
             content: "fn main() {}".into(),
         };
-        let malformed = recover_output("{not JSON", &[], std::slice::from_ref(&evidence));
+        let malformed = recover_output(
+            "{not JSON",
+            &[],
+            std::slice::from_ref(&evidence),
+            SUMMARY_MAX_BYTES,
+        );
         assert!(malformed.findings.is_empty());
         assert!(!malformed.uncertainties.is_empty());
         let output = json!({"findings":[
             {"topic":"main","observation":"An empty main is defined","kind":"runtime","evidence_ids":[evidence.id]},
             {"topic":"bad type","observation":42,"kind":"runtime","evidence_ids":null}
         ],"uncertainties":"wrong type"}).to_string();
-        let recovered = recover_output(&output, &[], &[evidence]);
+        let recovered = recover_output(&output, &[], &[evidence], SUMMARY_MAX_BYTES);
         assert_eq!(recovered.findings.len(), 1);
         assert_eq!(recovered.findings[0].topic, "main");
         assert!(!recovered.uncertainties.is_empty());
     }
 
     #[test]
-    fn failed_reduction_preserves_verified_child_findings_and_warning_on_resume() {
+    fn failed_reduction_preserves_verified_child_findings_and_warning_on_resume() -> Result<()> {
         let evidence = Evidence {
             id: source::hash(b"main"),
             path: "/project/main.rs".into(),
@@ -575,7 +727,7 @@ mod tests {
         };
         let brief: SourceBrief = serde_json::from_value(json!({"findings":[
             {"topic":"main","observation":"An empty main is defined","kind":"runtime","evidence_ids":[evidence.id]}
-        ],"uncertainties":[],"followup_queries":[]})).unwrap();
+        ],"uncertainties":[],"followup_queries":[]}))?;
         let child = Node {
             key: "child".into(),
             files: vec![evidence.path.clone()],
@@ -591,18 +743,24 @@ mod tests {
             unverified_brief: None,
             unverified_output: Some("broken".into()),
         };
-        let saved = serde_json::to_value(&child).unwrap();
-        let restored: Node = serde_json::from_value(saved).unwrap();
+        let saved = serde_json::to_value(&child)?;
+        let restored: Node = serde_json::from_value(saved)?;
         assert_eq!(restored.unresolved_nodes, 1);
         assert_eq!(restored.unverified_output.as_deref(), Some("broken"));
-        let recovered = recover_output("broken reduction", &[restored], &[evidence]);
+        let recovered = recover_output(
+            "broken reduction",
+            &[restored],
+            &[evidence],
+            SUMMARY_MAX_BYTES,
+        );
         assert_eq!(recovered.findings.len(), 1);
         assert_eq!(recovered.findings[0].topic, "main");
         assert!(!recovered.uncertainties.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn salvage_keeps_valid_observations_without_relabeling_xml_runtime() {
+    fn salvage_keeps_valid_observations_without_relabeling_xml_runtime() -> Result<()> {
         let xml = Evidence {
             id: source::hash(b"xml"),
             path: "/project/mapper.xml".into(),
@@ -624,23 +782,179 @@ mod tests {
                 {"topic":"entry","observation":"An empty main is defined", "kind":"runtime","evidence_ids":[&code.id[..8]]},
                 {"topic":"unknown anchor","observation":"Unverified", "kind":"context","evidence_ids":["ffffffff"]}
             ],"uncertainties":[],"followup_queries":[]
-        })).unwrap();
-        let recovered = salvage(brief, &[xml, code.clone()]);
+        }))?;
+        let recovered = salvage(brief, &[xml, code.clone()], SUMMARY_MAX_BYTES);
         assert_eq!(recovered.findings.len(), 2);
         assert_eq!(recovered.findings[0].topic, "declaration");
         assert_eq!(recovered.findings[1].evidence_ids, vec![code.id]);
         assert!(!recovered.uncertainties.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn salvage_does_not_invent_findings_when_all_evidence_is_invalid() {
+    fn salvage_does_not_invent_findings_when_all_evidence_is_invalid() -> Result<()> {
         let brief: SourceBrief = serde_json::from_value(json!({
             "findings":[{"topic":"invalid","observation":"Unsupported execution", "kind":"runtime","evidence_ids":["ffffffff"]}],
             "uncertainties":[],"followup_queries":[]
-        })).unwrap();
-        let recovered = salvage(brief, &[]);
+        }))?;
+        let recovered = salvage(brief, &[], SUMMARY_MAX_BYTES);
         assert!(recovered.findings.is_empty());
         assert_eq!(recovered.uncertainties.len(), 1);
+        Ok(())
+    }
+
+    /// A child summarised right up to its cap, with the originals it must keep
+    /// anchoring, is what a reduction has to carry before it reads anything new.
+    fn saturated_child(seed: u8, maximum: usize, originals: usize) -> Node {
+        let evidence: Vec<Evidence> = (0..originals)
+            .map(|i| Evidence {
+                id: source::hash(&[seed, i as u8]),
+                path: format!("/Users/someone/workspace/project/backend/src/module{i}.rs"),
+                start: 1,
+                end: 200,
+                content: String::new(),
+            })
+            .collect();
+        let mut brief = SourceBrief {
+            findings: vec![],
+            uncertainties: vec![],
+            followup_queries: vec![],
+        };
+        while serde_json::to_vec(&brief).is_ok_and(|v| v.len() <= maximum) {
+            brief.findings.push(crate::planning::Finding {
+                topic: "관측".into(),
+                observation: "가".repeat(900),
+                kind: crate::planning::FindingKind::Context,
+                evidence_ids: evidence.iter().take(6).map(|e| e.id.clone()).collect(),
+            });
+        }
+        brief.findings.pop();
+        assert!(serde_json::to_vec(&brief).is_ok_and(|v| v.len() <= maximum));
+        Node {
+            key: format!("understanding:node:{seed}"),
+            files: vec![],
+            children: vec![],
+            unresolved_nodes: 0,
+            validation_issues: vec![],
+            unverified_brief: None,
+            unverified_output: None,
+            discovery: Discovery {
+                brief,
+                evidence,
+                details: vec![],
+                validation_unresolved: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_request_packed_to_the_limit_survives_the_budget_gate() {
+        for output in [4_096u32, 16_384, 32_000, 64_000] {
+            for safety in [5u32, 20, 40] {
+                for extra in [0u32, 5, 10] {
+                    let c = LlmConfig {
+                        max_output_tokens: output,
+                        model_max_output: 150_000,
+                        safety_percent: safety,
+                        ..Default::default()
+                    };
+                    let space = request_space(&c, extra);
+                    let limit = request_limit(&c, extra);
+                    assert_eq!(limit + graph_budget(space), space);
+                    // What the gate will actually weigh: the packed source and
+                    // its structural hint and the fixed request scaffolding,
+                    // all of it through both JSON escapes.
+                    let serialized = (space + REQUEST_OVERHEAD_BYTES)
+                        * crate::budget::ESCAPE_EXPANSION_PERCENT as usize
+                        / 100;
+                    assert!(
+                        crate::budget::check(&c, serialized as u64, extra).is_ok(),
+                        "packing {limit} bytes at output {output}, safety {safety}+{extra} builds a request the gate rejects"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_leaf_batch_can_always_be_cited_by_one_brief() {
+        // A leaf must cite every passage it was given. Filling a batch to the
+        // citation ceiling would require twelve findings of six distinct
+        // passages each, with no passage supporting two observations, so the
+        // batch has to stop well short of it.
+        let ceiling = crate::planning::MAX_FINDINGS * crate::planning::MAX_EVIDENCE_IDS;
+        assert!(MAX_BATCH_PASSAGES < ceiling);
+        let findings_needed = MAX_BATCH_PASSAGES.div_ceil(crate::planning::MAX_EVIDENCE_IDS);
+        assert!(
+            findings_needed <= crate::planning::MAX_FINDINGS / 2,
+            "a full batch already needs {findings_needed} of {} findings just to name its passages",
+            crate::planning::MAX_FINDINGS
+        );
+    }
+
+    #[test]
+    fn a_modest_context_window_still_leaves_room_to_read_source() {
+        // A fixed scaffolding reserve larger than the window itself would refuse
+        // every batch outright, so the hint has to scale instead.
+        for context in [32_000u32, 64_000, 128_000] {
+            let c = LlmConfig {
+                context_limit: context,
+                model_context_limit: context,
+                max_output_tokens: 4_096,
+                ..Default::default()
+            };
+            let limit = request_limit(&c, 0);
+            assert!(
+                limit >= 1024,
+                "a {context}-token window leaves only {limit} bytes for source"
+            );
+            assert!(graph_budget(request_space(&c, 0)) < limit);
+        }
+    }
+
+    #[test]
+    fn a_reduction_reads_originals_only_with_what_its_summaries_leave() -> Result<()> {
+        let c = LlmConfig {
+            max_output_tokens: 32_000,
+            ..Default::default()
+        };
+        let limit = request_limit(&c, 0);
+        let maximum = summary_maximum(limit);
+        let children: Vec<Node> = (0..4)
+            .map(|seed| saturated_child(seed, maximum, 12))
+            .collect();
+        let mandatory = mandatory_bytes(&children)?;
+        let room = limit.saturating_sub(mandatory);
+        assert!(
+            room >= limit / 8,
+            "four saturated summaries ({mandatory} bytes) leave only {room} of {limit} for originals"
+        );
+        let fits = (mandatory + room + REQUEST_OVERHEAD_BYTES)
+            * crate::budget::ESCAPE_EXPANSION_PERCENT as usize
+            / 100;
+        assert!(crate::budget::check(&c, fits as u64, 0).is_ok());
+        // Spending the whole limit on originals, as the fan-out did before the
+        // summaries were measured, is exactly what the gate rejected.
+        let ignoring_summaries = (mandatory + limit + REQUEST_OVERHEAD_BYTES)
+            * crate::budget::ESCAPE_EXPANSION_PERCENT as usize
+            / 100;
+        assert!(crate::budget::check(&c, ignoring_summaries as u64, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn reduction_narrows_the_fan_out_instead_of_overfilling_a_request() -> Result<()> {
+        assert_eq!(plan_groups(&[10, 10, 10, 10, 10], 100)?, [(0, 4), (4, 5)]);
+        // Wide summaries fall back to pairs rather than four at a time.
+        assert_eq!(plan_groups(&[60, 60, 60, 60], 150)?, [(0, 2), (2, 4)]);
+        // A lone trailing child is carried to the next level untouched.
+        assert_eq!(plan_groups(&[60, 60, 60], 150)?, [(0, 2), (2, 3)]);
+        // Two that cannot share a request would never converge to one root.
+        assert!(
+            plan_groups(&[200, 200, 200], 150)
+                .is_err_and(|e| e.to_string().contains("CONTEXT_BUDGET"))
+        );
+        Ok(())
     }
 
     #[test]

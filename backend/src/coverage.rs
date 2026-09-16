@@ -273,19 +273,19 @@ pub async fn audit(
         "model":config.model,"endpoint":config.base_url,"reasoning":config.reasoning,"effort":config.effort,
         "output":config.max_output_tokens,"context":config.context_limit,"model_context":config.model_context_limit,"safety":config.safety_percent,
         "source":db::load_checkpoint(&ctx.pool,&ctx.id,"index_fingerprint").await?,"graph":crate::parser::VERSION}))?.as_slice());
+    // The audit instruction, the outline, the purpose and the system prompt ride
+    // along with every page/passage pair.
     let fixed = serde_json::to_vec(outline)?.len()
         + ctx.snapshot.task.direction.len()
         + system.len()
-        + 10_000;
-    let room = (config
-        .context_limit
-        .min(config.model_context_limit)
-        .min(200_000) as usize)
-        .saturating_mul(100usize.saturating_sub(config.safety_percent as usize))
-        / 100;
-    let room = room
-        .saturating_sub(config.max_output_tokens as usize + fixed)
-        .min(48_000);
+        + AUDIT.len()
+        + 4_000;
+    let room = crate::budget::packing_limit(
+        config,
+        ctx.extra_margin.load(std::sync::atomic::Ordering::Relaxed),
+        fixed,
+    )
+    .min(48_000);
     ensure!(
         room >= 4096,
         "COVERAGE_AUDIT_INCOMPLETE: insufficient context for original-source omission audit"

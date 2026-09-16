@@ -146,7 +146,7 @@ async fn summary_pipeline_skips_questions_recovers_and_reuses_general_reading() 
             unresolved_nodes:0,validation_issues:vec![],unverified_brief:None,unverified_output:None};
         let root = serde_json::to_value(node("root",whole))?;
         let leaf = serde_json::to_value(node("understanding:node:leaf",detail.clone()))?;
-        for (key,value) in [("understanding:root",root.clone()),("understanding:version",json!(6)),
+        for (key,value) in [("understanding:root",root.clone()),("understanding:version",json!(7)),
             ("understanding:coverage",json!({"root":"root","complete":true})),("understanding:leaves",json!(["understanding:node:leaf"])),
             ("understanding:node:leaf",leaf.clone()),("index_fingerprint",json!("stable-source"))] {
             db::checkpoint(&pool,&run.ctx.id,key,&value).await?;

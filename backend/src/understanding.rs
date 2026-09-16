@@ -13,8 +13,8 @@ use serde_json::json;
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 
-const READ: &str = "Read source evidence before planning, independently of any future documentation purpose. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Read ALL supplied passages. Explain module responsibilities, entry points, inputs, conditions, decisions, state/data changes, outputs, consumers and errors/cancellation/lifecycle. Preserve distinct public workflows, important branches, and producer/consumer contracts. Imports and call names are navigation candidates, not proof of execution. Mark unresolved connections. Runtime observations require implementation passages; tests/docs describe context only. Use at most 12 findings, observations under 1000 characters, at most 6 evidence IDs each, and 8 uncertainties. Do not design a table of contents or force unrelated flows into one sequence. Use the requested language.";
-const REDUCE: &str = "Read source evidence before planning. Integrate ALL supplied child summaries into a higher-level source overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve distinct workflows, module contracts, state changes, result consumers, conditional/error/cancel branches and unresolved cross-module links. Child findings have already been checked against their original passages. Preserve their important workflows and source anchors even when those passages are not repeated in this bounded request. previously_read anchors identify those originals; they support carrying the child observation, not inventing new facts. source_graph lists the declarations and connections of the files those children read: a connection there is a syntax candidate, so use it to name and follow a link between two children instead of dropping it, and mark it unresolved rather than asserting execution it does not prove. A finding about such a link still cites supplied evidence IDs at its ends; graph records carry names, not IDs. Use newly supplied original evidence to establish NEW connections; mark any other cross-module synthesis as uncertain. Never invent an execution order to join independent workflows. Do not assume a missing excerpt is absent from the project. Include at most 12 findings, each observation under 1000 characters and with 1-6 supplied evidence IDs, and at most 8 uncertainties. Do not produce a document outline. Use the requested language.";
+const READ: &str = "Read source evidence before planning, independently of any future documentation purpose. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Read ALL supplied passages. Explain module responsibilities, entry points, inputs, conditions, decisions, state/data changes, outputs, consumers and errors/cancellation/lifecycle. Preserve distinct public workflows, important branches, and producer/consumer contracts. Imports and call names are navigation candidates, not proof of execution. Mark unresolved connections. Runtime observations require implementation passages; tests/docs describe context only. Use at most 12 findings, observations under 1000 characters, at most 6 evidence IDs each, and 8 uncertainties. The whole findings array must serialize under summary_budget_bytes, so write fewer and denser observations rather than many that have to be trimmed; non-ASCII text costs about three bytes per character. Do not design a table of contents or force unrelated flows into one sequence. Use the requested language.";
+const REDUCE: &str = "Read source evidence before planning. Integrate ALL supplied child summaries into a higher-level source overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve distinct workflows, module contracts, state changes, result consumers, conditional/error/cancel branches and unresolved cross-module links. Child findings have already been checked against their original passages. Preserve their important workflows and source anchors even when those passages are not repeated in this bounded request. previously_read anchors identify those originals; they support carrying the child observation, not inventing new facts. source_graph lists the declarations and connections of the files those children read: a connection there is a syntax candidate, so use it to name and follow a link between two children instead of dropping it, and mark it unresolved rather than asserting execution it does not prove. A finding about such a link still cites supplied evidence IDs at its ends; graph records carry names, not IDs. Use newly supplied original evidence to establish NEW connections; mark any other cross-module synthesis as uncertain. Never invent an execution order to join independent workflows. Do not assume a missing excerpt is absent from the project. Include at most 12 findings, each observation under 1000 characters and with 1-6 supplied evidence IDs, and at most 8 uncertainties. The whole findings array must serialize under summary_budget_bytes, so write fewer and denser observations rather than many that have to be trimmed; non-ASCII text costs about three bytes per character. Do not produce a document outline. Use the requested language.";
 
 // Ceilings, not the operating limits. Both effective limits are derived from
 // the configured context window so that a request always fits the gate in
@@ -267,7 +267,9 @@ async fn node(
         })
         .map(|e| json!({"id":e.id,"path":e.path,"previously_read":true}))
         .collect::<Vec<_>>();
+    let summary_cap = summary_limit(ctx);
     let mut input = json!({"phase":if children.is_empty(){"understanding_batch"}else{"understanding_reduce"},
+        "summary_budget_bytes":summary_cap,
         "language":ctx.snapshot.task.language,"final_pass":true,"evidence":evidence,
         "summaries":summaries,"source_anchors":anchors,
         "evidence_classes":available.iter().map(|e| json!({"id":e.id,"path":e.path,"runtime_allowed":source::is_implementation(&e.path)})).collect::<Vec<_>>(),
@@ -295,7 +297,7 @@ async fn node(
     if final_overview {
         input["evidence"] = json!([]);
         input["instruction"] = json!(
-            "Read source evidence before planning through verified child findings. Synthesize ALL verified child findings into a balanced project overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve the main product workflows, public entry points, processing, persisted/returned results, consumers and error/cancel paths across ALL children. Dependencies and test harness details together need at most two findings; do not let them displace product behavior. Use at most 12 findings, each under 1000 characters and with 1-6 source_anchors from its child findings, and at most 8 uncertainties. Previously-read originals are retained and validated by the caller; do not treat their omission from this synthesis request as an unknown project behavior. Carry only observations already in children and distinguish their runtime/context kinds. Do not add new facts or invent cross-module execution order; retain genuinely unresolved connections. Use the requested language."
+            "Read source evidence before planning through verified child findings. Synthesize ALL verified child findings into a balanced project overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve the main product workflows, public entry points, processing, persisted/returned results, consumers and error/cancel paths across ALL children. Dependencies and test harness details together need at most two findings; do not let them displace product behavior. Use at most 12 findings, each under 1000 characters and with 1-6 source_anchors from its child findings, and at most 8 uncertainties. The whole findings array must serialize under summary_budget_bytes, so write fewer and denser observations rather than many that have to be trimmed; non-ASCII text costs about three bytes per character. Previously-read originals are retained and validated by the caller; do not treat their omission from this synthesis request as an unknown project behavior. Carry only observations already in children and distinguish their runtime/context kinds. Do not add new facts or invent cross-module execution order; retain genuinely unresolved connections. Use the requested language."
         );
     }
     // LLM cache also includes model/endpoint/settings. Checkpoints must obey the
@@ -308,7 +310,6 @@ async fn node(
     if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? {
         return Ok(serde_json::from_value(saved)?);
     }
-    let summary_cap = summary_limit(ctx);
     let mut error = String::new();
     let mut repair = llm::JsonRepair::default();
     for attempt in 0..3 {
@@ -707,6 +708,28 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_stated_finding_limits_fit_the_byte_budget_they_are_checked_against() {
+        // A brief is rejected on bytes, so twelve findings written to the stated
+        // per-observation limit have to fit that budget. In Korean a character
+        // costs three bytes, and the request tells the reader the budget for
+        // exactly this reason.
+        let c = LlmConfig {
+            max_output_tokens: 32_000,
+            ..Default::default()
+        };
+        let cap = summary_maximum(request_limit(&c, 0));
+        let per_finding = cap / crate::planning::MAX_FINDINGS;
+        assert!(
+            per_finding >= 400,
+            "{cap} bytes over {} findings leaves {per_finding} each, too little to say anything",
+            crate::planning::MAX_FINDINGS
+        );
+        // The budget travels with the request rather than only in the checker.
+        assert!(READ.contains("summary_budget_bytes"));
+        assert!(REDUCE.contains("summary_budget_bytes"));
+    }
+
     #[test]
     fn a_response_cut_off_mid_observation_keeps_what_it_finished() -> Result<()> {
         let evidence = Evidence {

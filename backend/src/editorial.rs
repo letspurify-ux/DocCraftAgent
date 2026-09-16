@@ -2,15 +2,38 @@
 use crate::model::Section;
 use serde_json::{Value, json};
 
+/// A bullet or ordered list marker at any indentation.
+fn list_marker(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    match bytes.first() {
+        Some(b'-' | b'*' | b'+') => matches!(bytes.get(1), Some(b' ' | b'\t')),
+        Some(b'0'..=b'9') => {
+            let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+            digits <= 9
+                && matches!(bytes.get(digits), Some(b'.' | b')'))
+                && matches!(bytes.get(digits + 1), Some(b' ' | b'\t'))
+        }
+        _ => false,
+    }
+}
+
 fn block_code_ranges(markdown: &str) -> (Vec<std::ops::Range<usize>>, bool) {
     let mut ranges = Vec::new();
     let mut fence: Option<(u8, usize, usize)> = None;
     let mut offset = 0;
+    // An indented code block cannot interrupt a paragraph, and inside a list the
+    // same indentation is item continuation. Without both rules a third-level
+    // bullet reads as a code literal, and a citation on that line is never
+    // validated, never resolved and reaches the published document raw.
+    let (mut paragraph, mut in_list) = (false, false);
     for line in markdown.split_inclusive('\n') {
+        let inside_fence = fence.is_some();
+        let blank = line.trim().is_empty();
         let trimmed = line.trim_start_matches(' ');
         let indent = line.len() - trimmed.len();
         let marker = trimmed.as_bytes().first().copied().unwrap_or_default();
         let width = trimmed.bytes().take_while(|b| *b == marker).count();
+        let mut indented_code = false;
         if let Some((kind, size, start)) = fence {
             if indent <= 3 && marker == kind && width >= size && trimmed[width..].trim().is_empty()
             {
@@ -23,8 +46,20 @@ fn block_code_ranges(markdown: &str) -> (Vec<std::ops::Range<usize>>, bool) {
             && (marker != b'`' || !trimmed[width..].contains('`'))
         {
             fence = Some((marker, width, offset));
-        } else if indent >= 4 || line.starts_with('\t') {
+        } else if (indent >= 4 || line.starts_with('\t')) && !paragraph && !in_list {
             ranges.push(offset..offset + line.len());
+            indented_code = true;
+        }
+        // Blank lines, fences and indented code all leave no paragraph open for
+        // the next line to continue; a list survives the blank lines between
+        // its items and ends at the next unindented line that starts no item.
+        paragraph = !blank && !indented_code && !inside_fence && fence.is_none();
+        if !inside_fence && fence.is_none() && !indented_code {
+            if list_marker(trimmed) {
+                in_list = true;
+            } else if !blank && indent == 0 {
+                in_list = false;
+            }
         }
         offset += line.len();
     }
@@ -243,6 +278,50 @@ mod tests {
         ));
         assert!(has_unclosed_fence("~~~rust\nlet value = 1;"));
     }
+    #[test]
+    fn list_indentation_is_not_code_but_real_indented_blocks_still_are() {
+        let e = Evidence {
+            id: "b".repeat(64),
+            path: "source.rs".into(),
+            start: 1,
+            end: 4,
+            content: "source".into(),
+        };
+        // Four spaces is an ordinary third-level bullet, and a continuation line
+        // under an ordered item is item text, not a code literal.
+        let nested = format!(
+            "- 상위\n  - 중간\n    - 하위는 값을 검증한다 [E:{id}]\n\n1. 첫째\n    이어지는 설명 [E:{id}]\n",
+            id = e.id
+        );
+        let section = Section {
+            title: "절차".into(),
+            markdown: nested,
+            evidence: vec![e.clone()],
+        };
+        let (body, refs) = render_sections(std::slice::from_ref(&section));
+        assert_eq!(body.matches("[^s1]").count(), 2, "{body}");
+        assert!(
+            !body.contains(&e.id),
+            "a raw citation reached the document: {body}"
+        );
+        assert!(refs.contains(&e.id));
+        // A genuinely indented block after a blank line, and one right after a
+        // closing fence, are still literals.
+        let literal = format!(
+            "설명\n\n    [E:{id}]\n\n~~~~\ncode\n~~~~\n    [E:{id}]\n",
+            id = e.id
+        );
+        let ranges = code_ranges(&literal);
+        assert_eq!(
+            literal
+                .match_indices(&format!("[E:{}]", e.id))
+                .filter(|(at, _)| ranges.iter().any(|r| r.contains(at)))
+                .count(),
+            2,
+            "{ranges:?}"
+        );
+    }
+
     #[test]
     fn digest_counts_only_rendered_headings() {
         let section = Section {

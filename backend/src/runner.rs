@@ -1603,7 +1603,11 @@ fn merge_evidence(
 }
 fn normalize_citations(markdown: &str, evidence: &[crate::model::Evidence]) -> Result<String> {
     let literals = crate::editorial::code_ranges(markdown);
-    let cite = regex::Regex::new(r"\[E:([^\]\s]+)\]")?;
+    // A citation holds no closing bracket, so everything up to one is its id
+    // list. Matching only a run without spaces missed [E:a, b], which then
+    // passed every later check untouched: nothing resolved it, nothing
+    // validated it, and the raw marker reached the page.
+    let cite = regex::Regex::new(r"\[E:([^\]]{1,400})\]")?;
     Ok(cite
         .replace_all(markdown, |captures: &regex::Captures<'_>| {
             if captures
@@ -1630,14 +1634,30 @@ fn normalize_citations(markdown: &str, evidence: &[crate::model::Evidence]) -> R
             // as [E:b85584b4(`resolvePassword`)]. The id in front of the label
             // still names one supplied passage; keeping it and dropping the
             // label is more faithful than rejecting the claim it anchors.
-            let labelled = || {
-                let hex: String = id.chars().take_while(char::is_ascii_hexdigit).collect();
-                (hex.len() < id.len()).then(|| resolve(&hex)).flatten()
+            let labelled = |candidate: &str| {
+                let hex: String = candidate
+                    .chars()
+                    .take_while(char::is_ascii_hexdigit)
+                    .collect();
+                (hex.len() < candidate.len())
+                    .then(|| resolve(&hex))
+                    .flatten()
             };
-            match resolve(id).or_else(labelled) {
-                Some(full) => format!("[E:{full}]"),
-                None => captures[0].to_string(),
+            // One citation may name several passages. Each becomes its own
+            // reference; if any of them names nothing, the whole citation is
+            // left for review to reject rather than half-resolved.
+            let mut ids = vec![];
+            for part in id.split(',').map(str::trim) {
+                let Some(full) = resolve(part).or_else(|| labelled(part)) else {
+                    return captures[0].to_string();
+                };
+                if !ids.contains(&full) {
+                    ids.push(full);
+                }
             }
+            ids.iter()
+                .map(|full| format!("[E:{full}]"))
+                .collect::<String>()
         })
         .into_owned())
 }
@@ -2150,6 +2170,50 @@ mod tests {
         assert!(path.with_extension("invalid").exists());
         // A database outage must leave the journal in place for the next sweep.
         assert!(!unreplayable(&anyhow::Error::from(sqlx::Error::PoolClosed)));
+        Ok(())
+    }
+
+    #[test]
+    fn one_citation_may_name_several_passages() -> Result<()> {
+        let first = Evidence {
+            id: format!("26032d1f{}", "a".repeat(56)),
+            path: "server.js".into(),
+            start: 1,
+            end: 4,
+            content: "listen()".into(),
+        };
+        let second = Evidence {
+            id: format!("dbf5a59c{}", "b".repeat(56)),
+            path: "agent.js".into(),
+            start: 1,
+            end: 4,
+            content: "decide()".into(),
+        };
+        let supplied = [first.clone(), second.clone()];
+        // The old pattern stopped at the first space, so this matched nothing:
+        // no resolution, no validation, and the raw marker reached the page.
+        let prepared =
+            normalize_citations("The server hands off [E:26032d1f, dbf5a59c].", &supplied)?;
+        assert!(
+            prepared.contains(&format!("[E:{}][E:{}]", first.id, second.id)),
+            "{prepared}"
+        );
+        let section = Section {
+            title: "Flow".into(),
+            markdown: prepared,
+            evidence: supplied.to_vec(),
+        };
+        assert!(validate_sections(std::slice::from_ref(&section))?.is_empty());
+        let (body, refs) = crate::editorial::render_sections(std::slice::from_ref(&section));
+        assert!(body.contains("[^s1][^s2]"), "{body}");
+        assert!(
+            !body.contains("[E:"),
+            "a raw citation reached the document: {body}"
+        );
+        assert!(refs.contains(&first.id) && refs.contains(&second.id));
+        // If any of them names nothing the whole citation is left for review.
+        let partial = normalize_citations("Claim [E:26032d1f, ffffffff].", &supplied)?;
+        assert!(partial.contains("[E:26032d1f, ffffffff]"), "{partial}");
         Ok(())
     }
 

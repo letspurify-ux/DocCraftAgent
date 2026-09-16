@@ -1658,20 +1658,31 @@ fn normalize_citations(markdown: &str, evidence: &[crate::model::Evidence]) -> R
             {
                 return captures[0].to_string();
             }
-            let id = &captures[1];
-            let matches: std::collections::HashSet<&str> = evidence
-                .iter()
-                .filter(|e| id.len() >= 8 && e.id.starts_with(id))
-                .map(|e| e.id.as_str())
-                .collect();
-            if matches.len() == 1 {
-                matches
+            let resolve = |candidate: &str| -> Option<String> {
+                if candidate.len() < 8 {
+                    return None;
+                }
+                let matches: std::collections::HashSet<&str> = evidence
                     .iter()
-                    .next()
-                    .map(|full| format!("[E:{full}]"))
-                    .unwrap_or_else(|| captures[0].to_string())
-            } else {
-                captures[0].to_string()
+                    .filter(|e| e.id.starts_with(candidate))
+                    .map(|e| e.id.as_str())
+                    .collect();
+                (matches.len() == 1)
+                    .then(|| matches.into_iter().next().map(str::to_string))
+                    .flatten()
+            };
+            let id = &captures[1];
+            // A model sometimes labels a citation with the symbol it points at,
+            // as [E:b85584b4(`resolvePassword`)]. The id in front of the label
+            // still names one supplied passage; keeping it and dropping the
+            // label is more faithful than rejecting the claim it anchors.
+            let labelled = || {
+                let hex: String = id.chars().take_while(char::is_ascii_hexdigit).collect();
+                (hex.len() < id.len()).then(|| resolve(&hex)).flatten()
+            };
+            match resolve(id).or_else(labelled) {
+                Some(full) => format!("[E:{full}]"),
+                None => captures[0].to_string(),
             }
         })
         .into_owned())
@@ -2185,6 +2196,28 @@ mod tests {
         assert!(path.with_extension("invalid").exists());
         // A database outage must leave the journal in place for the next sweep.
         assert!(!unreplayable(&anyhow::Error::from(sqlx::Error::PoolClosed)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_labelled_citation_keeps_the_id_it_names() -> Result<()> {
+        let e = Evidence {
+            id: format!("b85584b4{}", "c".repeat(56)),
+            path: "resolve.js".into(),
+            start: 1,
+            end: 4,
+            content: "function resolvePassword() {}".into(),
+        };
+        let prepared = normalize_citations(
+            "The password is resolved [E:b85584b4(`resolvePassword`)].",
+            std::slice::from_ref(&e),
+        )?;
+        assert!(prepared.contains(&format!("[E:{}]", e.id)), "{prepared}");
+        assert!(!prepared.contains("resolvePassword("), "{prepared}");
+        // A label over an id that names nothing is still left for review to
+        // reject, rather than resolved to whatever happens to be nearby.
+        let unknown = normalize_citations("Claim [E:ffffffff(`gone`)].", std::slice::from_ref(&e))?;
+        assert!(unknown.contains("[E:ffffffff(`gone`)]"), "{unknown}");
         Ok(())
     }
 

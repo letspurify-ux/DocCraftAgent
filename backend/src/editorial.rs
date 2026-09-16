@@ -207,25 +207,101 @@ pub fn digest(sections: &[Section], byte_budget: usize) -> Vec<Value> {
     }).collect()
 }
 
-pub fn render_sections(sections: &[Section]) -> (String, String) {
-    let mut numbers = std::collections::HashMap::new();
-    let mut references = String::from("## Source references\n\n");
+/// The passages the body actually cites, in the order footnote numbers are
+/// handed out. Extracted so that anything else pointing at a passage - a review
+/// warning, say - lands on the same footnote as the body rather than printing a
+/// raw evidence id, and cannot drift out of step with it.
+pub fn cited(sections: &[Section]) -> Vec<&crate::model::Evidence> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = vec![];
     for section in sections {
         for e in &section.evidence {
             if replace_citation(&section.markdown, &e.id, "") != section.markdown
-                && !numbers.contains_key(&e.id)
+                && seen.insert(e.id.as_str())
             {
-                let number = numbers.len() + 1;
-                numbers.insert(e.id.clone(), number);
-                references.push_str(&format!(
-                    "[^s{number}]: `{}` L{}–L{} · Evidence `{}`\n\n",
-                    e.path.replace('`', ""),
-                    e.start,
-                    e.end,
-                    e.id
-                ));
+                result.push(e);
             }
         }
+    }
+    result
+}
+
+/// Point a review warning at the same footnote the body uses.
+///
+/// A reviewer writes its warnings in prose and names the passage it is talking
+/// about, usually by a short prefix of the evidence id. That prose is appended
+/// to the document verbatim, so it never passed through citation normalisation
+/// and the raw `[E:...]` marker reached the page - a bare hash the reader can do
+/// nothing with. A passage the body cites becomes its footnote; one it does not
+/// becomes the file name, which is what the sentence is about anyway; a prefix
+/// that names nothing is dropped, since it identified no passage to begin with.
+pub fn warning_citations(warning: &str, sections: &[Section]) -> String {
+    let Ok(cite) = regex::Regex::new(r"\[E:([^\]]{1,400})\]") else {
+        return warning.to_string();
+    };
+    let numbered = cited(sections);
+    let literals = code_ranges(warning);
+    let unique = |pool: &mut dyn Iterator<Item = (usize, &crate::model::Evidence)>| {
+        let first = pool.next();
+        match (first, pool.next()) {
+            (Some(hit), None) => Some((hit.0, hit.1.path.clone())),
+            _ => None,
+        }
+    };
+    cite.replace_all(warning, |captures: &regex::Captures<'_>| {
+        if captures
+            .get(0)
+            .is_some_and(|m| literals.iter().any(|r| r.contains(&m.start())))
+        {
+            return captures[0].to_string();
+        }
+        // A reviewer names the passage by a short prefix and sometimes appends a
+        // label, the same shapes the body's own citations arrive in.
+        let prefix: String = captures[1]
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect();
+        if prefix.len() < 8 {
+            return String::new();
+        }
+        if let Some((index, _)) = unique(
+            &mut numbered
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, e)| e.id.starts_with(&prefix)),
+        ) {
+            return format!("[^s{}]", index + 1);
+        }
+        // Not cited by the body, so it has no footnote. The file is what the
+        // sentence is about and is what a reader can act on.
+        match unique(
+            &mut sections
+                .iter()
+                .flat_map(|s| &s.evidence)
+                .enumerate()
+                .filter(|(_, e)| e.id.starts_with(&prefix)),
+        ) {
+            Some((_, path)) => format!("`{}`", path.rsplit('/').next().unwrap_or(&path)),
+            None => String::new(),
+        }
+    })
+    .into_owned()
+}
+
+pub fn render_sections(sections: &[Section]) -> (String, String) {
+    let mut numbers = std::collections::HashMap::new();
+    let mut references = String::from("## Source references\n\n");
+    for (index, e) in cited(sections).into_iter().enumerate() {
+        let number = index + 1;
+        numbers.insert(e.id.clone(), number);
+        references.push_str(&format!(
+            "[^s{number}]: `{}` L{}–L{} · Evidence `{}`\n\n",
+            e.path.replace('`', ""),
+            e.start,
+            e.end,
+            e.id
+        ));
     }
     let mut body = String::new();
     for section in sections {
@@ -257,6 +333,81 @@ mod tests {
         assert!(o.storyline.is_empty());
         Ok(())
     }
+    #[test]
+    fn a_review_warning_lands_on_the_same_footnote_as_the_body() {
+        let cited_ev = Evidence {
+            id: "a".repeat(64),
+            path: "/repo/backend/src/server.js".into(),
+            start: 2,
+            end: 9,
+            content: "source".into(),
+        };
+        let only_supplied = Evidence {
+            id: "b".repeat(64),
+            path: "/repo/backend/src/oracle.js".into(),
+            ..cited_ev.clone()
+        };
+        let section = Section {
+            title: "요청 처리".into(),
+            markdown: format!("응답을 기록한다 [E:{}].", cited_ev.id),
+            evidence: vec![cited_ev.clone(), only_supplied.clone()],
+        };
+        let sections = [section];
+        let (body, _) = render_sections(&sections);
+        assert!(body.contains("[^s1]"));
+
+        // Cited by the body: the warning points at the footnote the reader
+        // already has, not at a hash they can do nothing with.
+        let fixed = warning_citations(
+            &format!(
+                "[minor] 근거 [E:{}]에서 훅 존재까지만 확인된다.",
+                &cited_ev.id[..8]
+            ),
+            &sections,
+        );
+        assert_eq!(fixed, "[minor] 근거 [^s1]에서 훅 존재까지만 확인된다.");
+
+        // Supplied but never cited, so it has no footnote; the file is what the
+        // sentence is about.
+        let fixed = warning_citations(
+            &format!(
+                "[minor] 제공된 [E:{}] 발췌에는 정리 코드가 없다.",
+                &only_supplied.id[..10]
+            ),
+            &sections,
+        );
+        assert_eq!(
+            fixed,
+            "[minor] 제공된 `oracle.js` 발췌에는 정리 코드가 없다."
+        );
+
+        // Names no supplied passage at all, so it identified nothing to keep.
+        let fixed = warning_citations("[minor] 근거 [E:deadbeef99]는 확인되지 않는다.", &sections);
+        assert_eq!(fixed, "[minor] 근거 는 확인되지 않는다.");
+        assert!(!fixed.contains("[E:"));
+    }
+
+    #[test]
+    fn a_warning_that_quotes_the_citation_syntax_keeps_it() {
+        let e = Evidence {
+            id: "a".repeat(64),
+            path: "/repo/src/server.js".into(),
+            start: 2,
+            end: 9,
+            content: "source".into(),
+        };
+        let sections = [Section {
+            title: "인용".into(),
+            markdown: format!("본문 [E:{}].", e.id),
+            evidence: vec![e.clone()],
+        }];
+        let warning = format!(
+            "[minor] 예시 `[E:{}]` 표기는 그대로 두어야 한다.",
+            &e.id[..8]
+        );
+        assert_eq!(warning_citations(&warning, &sections), warning);
+    }
+
     #[test]
     fn citations_are_short_but_traceable_and_unused_evidence_is_omitted() {
         let e = Evidence {

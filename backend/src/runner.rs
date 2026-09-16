@@ -1735,7 +1735,13 @@ fn assemble(ctx: &RunContext, sections: &[Section], warnings: &[String]) -> Stri
     if !warnings.is_empty() {
         out.push_str("\n## Unresolved items and coverage limits\n\n");
         for w in warnings {
-            out.push_str(&format!("- {w}\n"));
+            // Reviewer prose is appended verbatim, so it never met the citation
+            // pass the body goes through and its raw evidence ids reached the
+            // page. Point them at the footnotes the body already has.
+            out.push_str(&format!(
+                "- {}\n",
+                crate::editorial::warning_citations(w, sections)
+            ));
         }
     }
     out

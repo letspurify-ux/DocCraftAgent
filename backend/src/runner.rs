@@ -1653,6 +1653,12 @@ fn normalize_citations(markdown: &str, evidence: &[crate::model::Evidence]) -> R
             // left for review to reject rather than half-resolved.
             let mut ids = vec![];
             for part in id.split(',').map(str::trim) {
+                // A model that names several passages often repeats the marker
+                // on every part, as [E:a, E:b]. That prefix is the syntax the
+                // part is already inside, not a character of the id it names,
+                // and leaving it attached failed the whole citation: one part
+                // that resolves to nothing keeps the raw marker on the page.
+                let part = part.strip_prefix("E:").unwrap_or(part).trim_start();
                 let Some(full) = resolve(part).or_else(|| labelled(part)) else {
                     return captures[0].to_string();
                 };
@@ -2208,6 +2214,15 @@ mod tests {
         assert!(
             prepared.contains(&format!("[E:{}][E:{}]", first.id, second.id)),
             "{prepared}"
+        );
+        // A model that names several passages usually repeats the marker on
+        // every part. Treating that prefix as part of the id resolved neither,
+        // so the whole citation stayed raw on the published page.
+        let repeated =
+            normalize_citations("The server hands off [E:26032d1f, E:dbf5a59c].", &supplied)?;
+        assert!(
+            repeated.contains(&format!("[E:{}][E:{}]", first.id, second.id)),
+            "{repeated}"
         );
         let section = Section {
             title: "Flow".into(),

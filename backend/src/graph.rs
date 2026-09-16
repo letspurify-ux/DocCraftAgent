@@ -107,21 +107,35 @@ pub async fn file(ctx: &RunContext, file: u64) -> Result<FileGraph> {
     Ok(serde_json::from_value(value)?)
 }
 
-async fn all(ctx: &RunContext) -> Result<Vec<FileGraph>> {
-    let mut cursor = String::new();
-    let mut result = vec![];
-    loop {
-        ctx.check()?;
-        let rows = sqlx::query("SELECT step,data FROM checkpoints WHERE run_id=? AND step LIKE 'graph:file:%' AND step>? ORDER BY step LIMIT 16")
-            .bind(&ctx.id).bind(&cursor).fetch_all(&ctx.pool).await?;
-        if rows.is_empty() {
-            return Ok(result);
-        }
-        for row in rows {
-            cursor = row.try_get("step")?;
-            result.push(serde_json::from_str(&row.try_get::<String, _>("data")?)?);
-        }
-    }
+/// The project-wide call graph, built once per run.
+///
+/// Both callers resolve a name against every file and use only `calls` edges, so
+/// the rest is dropped on the way in: at a few thousand files the branch, return
+/// and assignment sites are the majority of the bytes and none of them are read
+/// here.
+async fn all(ctx: &RunContext) -> Result<std::sync::Arc<Vec<FileGraph>>> {
+    ctx.graph_index
+        .get_or_try_init(|| async {
+            let mut cursor = String::new();
+            let mut result: Vec<FileGraph> = vec![];
+            loop {
+                ctx.check()?;
+                let rows = sqlx::query("SELECT step,data FROM checkpoints WHERE run_id=? AND step LIKE 'graph:file:%' AND step>? ORDER BY step LIMIT 16")
+                    .bind(&ctx.id).bind(&cursor).fetch_all(&ctx.pool).await?;
+                if rows.is_empty() {
+                    return Ok(std::sync::Arc::new(result));
+                }
+                for row in rows {
+                    cursor = row.try_get("step")?;
+                    let mut file: FileGraph =
+                        serde_json::from_str(&row.try_get::<String, _>("data")?)?;
+                    file.graph.edges.retain(|e| e.kind == "calls");
+                    result.push(file);
+                }
+            }
+        })
+        .await
+        .cloned()
 }
 
 #[derive(Clone)]
@@ -244,6 +258,16 @@ fn graph_order(adjacency: &[HashMap<usize, u32>]) -> Vec<usize> {
     order
 }
 
+/// The chunk holding a site, found by line. The chunks of one file arrive in
+/// line order, so a call site does not have to scan them.
+fn chunk_at(chunks: &[ChunkSpan], file_chunks: &[usize], span: &Span) -> Option<usize> {
+    let at = file_chunks.partition_point(|index| chunks[*index].end < span.start);
+    file_chunks
+        .get(at)
+        .copied()
+        .filter(|index| span.overlaps(chunks[*index].start, chunks[*index].end))
+}
+
 fn link(adjacency: &mut [HashMap<usize, u32>], left: usize, right: usize, weight: u32) {
     if left == right {
         return;
@@ -271,7 +295,7 @@ pub async fn order_chunks(ctx: &RunContext, chunks: &[ChunkSpan]) -> Result<Vec<
     let mut symbols = HashMap::<String, (&str, &Symbol)>::new();
     let mut names = HashMap::<String, Vec<String>>::new();
 
-    for file in &files {
+    for file in files.iter() {
         let Some(file_chunks) = by_path.get(&file.path) else {
             continue;
         };
@@ -323,19 +347,19 @@ pub async fn order_chunks(ctx: &RunContext, chunks: &[ChunkSpan]) -> Result<Vec<
         }
     }
 
-    for file in &files {
+    for file in files.iter() {
+        let Some(file_chunks) = by_path.get(&file.path) else {
+            continue;
+        };
         for edge in file.graph.edges.iter().filter(|e| e.kind == "calls") {
-            let source_chunks = symbol_chunks.get(&edge.source).cloned().unwrap_or_else(|| {
-                by_path
-                    .get(&file.path)
-                    .into_iter()
-                    .flat_map(|items| items.iter().copied())
-                    .filter(|index| edge.span.overlaps(chunks[*index].start, chunks[*index].end))
-                    .collect()
-            });
-            if source_chunks.is_empty() {
+            // The call site, not every chunk of the symbol that owns it. Linking
+            // whole symbols joined k source chunks to m target chunks for every
+            // call, which is quadratic in how far a declaration is split; the
+            // site is where the connection physically is, and a symbol's own
+            // chunks are already tied together by their parent links.
+            let Some(source) = chunk_at(chunks, file_chunks, &edge.span) else {
                 continue;
-            }
+            };
             let target = edge
                 .target
                 .rsplit([':', '.'])
@@ -348,14 +372,10 @@ pub async fn order_chunks(ctx: &RunContext, chunks: &[ChunkSpan]) -> Result<Vec<
             // Ambiguous syntax names remain useful as local grouping hints, but
             // cap fan-out so one common name cannot join the entire repository.
             for target_id in target_ids.iter().take(8) {
-                let Some(target_chunks) = symbol_chunks.get(target_id) else {
+                let Some(target) = symbol_chunks.get(target_id).and_then(|c| c.first()) else {
                     continue;
                 };
-                for left in &source_chunks {
-                    for right in target_chunks {
-                        link(&mut adjacency, *left, *right, 5);
-                    }
-                }
+                link(&mut adjacency, source, *target, 5);
             }
         }
     }
@@ -546,6 +566,37 @@ mod tests {
     }
 
     #[test]
+    fn a_projection_over_several_files_carries_both_ends_of_a_connection() -> Result<()> {
+        // a.rs calls validate(), which b.rs declares. A reduction reads only its
+        // children's summaries, so unless the projection carries the call site
+        // and the declaration together it has nothing to name that link with and
+        // has to write the connection off as uncertain.
+        let a =
+            crate::code_graph::parse_test("fn start() { validate(); }", "rust")?.at_path("a.rs");
+        let b = crate::code_graph::parse_test("fn validate() -> bool { true }", "rust")?
+            .at_path("b.rs");
+        let files = vec![
+            ("a.rs".to_string(), records(&a, &[(1, 99)])),
+            ("b.rs".to_string(), records(&b, &[(1, 99)])),
+        ];
+        let (items, omitted) = ration(&files, 4000)?;
+        assert!(omitted.is_empty(), "{omitted:?}");
+        assert!(
+            items
+                .iter()
+                .any(|r| r["path"] == "a.rs" && r["from"] == "start" && r["to"] == "validate"),
+            "{items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|r| r["path"] == "b.rs" && r["symbol"] == "validate"),
+            "{items:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn every_file_in_a_request_is_described_and_omissions_are_named() -> Result<()> {
         let files = vec![
             (
@@ -569,6 +620,35 @@ mod tests {
         assert_eq!(all.len(), 4);
         assert!(none.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn a_call_site_maps_to_one_chunk_by_line() {
+        let span = |start: u32, end: u32| ChunkSpan {
+            path: "a.rs".into(),
+            start,
+            end,
+        };
+        let chunks = vec![span(1, 100), span(101, 200), span(201, 300)];
+        let file_chunks = vec![0usize, 1, 2];
+        let at = |line: u32| {
+            chunk_at(
+                &chunks,
+                &file_chunks,
+                &Span {
+                    start: line,
+                    end: line,
+                    ..Default::default()
+                },
+            )
+        };
+        // A site resolves to the one chunk that holds it, so a declaration split
+        // across chunks no longer multiplies out against its call targets.
+        assert_eq!(at(1), Some(0));
+        assert_eq!(at(100), Some(0));
+        assert_eq!(at(101), Some(1));
+        assert_eq!(at(300), Some(2));
+        assert_eq!(at(301), None);
     }
 
     #[test]

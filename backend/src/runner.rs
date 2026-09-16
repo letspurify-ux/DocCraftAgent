@@ -81,6 +81,10 @@ pub struct RunContext {
     pub reserved_tokens: AtomicU64,
     pub reserved_cost: AtomicU64,
     pub extra_margin: AtomicU32,
+    /// Every file's call graph, built once. Name resolution needs a project-wide
+    /// view and a run asks for one per section and per retrieval, so rebuilding
+    /// it each time turns linear work into linear work repeated a hundred times.
+    pub graph_index: tokio::sync::OnceCell<std::sync::Arc<Vec<crate::graph::FileGraph>>>,
 }
 impl RunContext {
     pub fn check(&self) -> Result<()> {
@@ -96,6 +100,26 @@ impl RunContext {
             bail!("TIME_BUDGET: run deadline reached");
         }
         Ok(())
+    }
+    /// The largest share of any run budget already committed.
+    ///
+    /// A pass that walks the whole project uses this to stop while there is
+    /// still room to finish the document, instead of being cut off mid-way by
+    /// `check` or `reserve` and leaving the caller unable to say what it did.
+    pub fn budget_spent(&self) -> f64 {
+        let share = |used: f64, limit: f64| if limit > 0.0 { used / limit } else { 0.0 };
+        let elapsed = self
+            .elapsed_before
+            .saturating_add(self.started.elapsed().as_secs());
+        share(
+            self.reserved_tokens.load(Ordering::Relaxed) as f64,
+            self.snapshot.task.max_tokens as f64,
+        )
+        .max(share(elapsed as f64, self.snapshot.task.max_seconds as f64))
+        .max(share(
+            self.reserved_cost.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.snapshot.task.max_cost,
+        ))
     }
     pub fn reserve(&self, tokens: u64, cost: f64) -> Result<()> {
         let current = self.reserved_tokens.load(Ordering::Relaxed);
@@ -268,7 +292,7 @@ fn spawn_worker(
             let _slot=tokio::select!{_=token.cancelled()=>bail!("CANCELLED"),p=state.jobs.acquire()=>p?};
             let client=llm::client(&snapshot.settings.llm)?;
             let budget=db::load_checkpoint(&pool,&task_id,"budget").await?.unwrap_or(json!({}));
-            let ctx=RunContext{state:state.clone(),pool:pool.clone(),id:task_id.clone(),snapshot,cancel:token.clone(),gate:gate.clone(),client,started:Instant::now(),elapsed_before:budget.get("elapsed").and_then(Value::as_u64).unwrap_or(0),finalizing:std::sync::atomic::AtomicBool::new(false),reserved_tokens:AtomicU64::new(budget.get("tokens").and_then(Value::as_u64).unwrap_or(0)),reserved_cost:AtomicU64::new(budget.get("cost").and_then(Value::as_u64).unwrap_or(0)),extra_margin:AtomicU32::new(budget.get("extra_margin").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32)};
+            let ctx=RunContext{state:state.clone(),pool:pool.clone(),id:task_id.clone(),snapshot,cancel:token.clone(),gate:gate.clone(),client,started:Instant::now(),elapsed_before:budget.get("elapsed").and_then(Value::as_u64).unwrap_or(0),finalizing:std::sync::atomic::AtomicBool::new(false),reserved_tokens:AtomicU64::new(budget.get("tokens").and_then(Value::as_u64).unwrap_or(0)),reserved_cost:AtomicU64::new(budget.get("cost").and_then(Value::as_u64).unwrap_or(0)),extra_margin:AtomicU32::new(budget.get("extra_margin").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32),graph_index:tokio::sync::OnceCell::new()};
             sqlx::query("UPDATE runs SET status='running' WHERE id=?").bind(&task_id).execute(&pool).await?;
             let timeout=Duration::from_secs(ctx.snapshot.task.max_seconds.saturating_sub(ctx.elapsed_before));
             let result=tokio::select! {
@@ -777,6 +801,15 @@ async fn execute_document(ctx: &RunContext) -> Result<()> {
             "원본 대조에서 {unresolved}개 항목의 판정을 확정하지 못했습니다. 해당 항목은 누락 원장에 남아 있습니다"
         ));
     }
+    // A project can be larger than one run's budget. Saying which files were
+    // compared against the original is the difference between a selective audit
+    // and an unstated one.
+    let audited_files = coverage["audited_files"].as_u64().unwrap_or(0);
+    if let Some(unaudited) = coverage["unaudited_files"].as_u64().filter(|n| *n > 0) {
+        warnings.push(format!(
+            "실행 예산 안에서 {audited_files}개 파일을 원본 대조했고 {unaudited}개 파일은 대조하지 못했습니다. 대조한 범위에서는 핵심 누락이 없습니다"
+        ));
+    }
     let indexed = db::load_checkpoint(&ctx.pool, &ctx.id, "indexed")
         .await?
         .unwrap_or(json!({}));
@@ -799,7 +832,8 @@ async fn execute_document(ctx: &RunContext) -> Result<()> {
         .len();
     ctx.event("coverage",json!({"stage":"publishing","indexed_files":total_files,"excluded_files":excluded_files,"skipped_files":skipped_files,"retrieved_files":retrieved_files,"selective_analysis":true})).await?;
     let mut markdown = assemble(ctx, &sections, &warnings);
-    markdown.push_str(&format!("\n## Analysis coverage\n\nIndexed files: {total_files}. Files included in retrieved evidence: {retrieved_files}. Files excluded by configured or built-in rules: {excluded_files}. Unreadable or failed files: {skipped_files}. Analysis is selective and does not imply exhaustive semantic verification of every source line.\n"));
+    let unaudited_files = coverage["unaudited_files"].as_u64().unwrap_or(0);
+    markdown.push_str(&format!("\n## Analysis coverage\n\nIndexed files: {total_files}. Files included in retrieved evidence: {retrieved_files}. Files compared against the original source by the omission audit: {audited_files}. Files the audit did not reach within this run's budget: {unaudited_files}. Files excluded by configured or built-in rules: {excluded_files}. Unreadable or failed files: {skipped_files}. Analysis is selective and does not imply exhaustive semantic verification of every source line.\n"));
     markdown.push_str(&format!("\nOriginal-source omission audit: {} obligations inspected; {} supported by document quotations; {} outside the requested scope with recorded reasons; {} missing. This is model-assisted coverage, not a proof of semantic completeness.\n", coverage["checked"], coverage["covered"], coverage["out_of_scope"], coverage["missing"]));
     publish::save(ctx, &markdown, &warnings).await?;
     Ok(())

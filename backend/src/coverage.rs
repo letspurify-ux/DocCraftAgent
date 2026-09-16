@@ -10,7 +10,7 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::Row;
 use std::collections::{BTreeMap, HashSet};
 
@@ -301,6 +301,40 @@ fn screen(
     (accepted, problems.join("; "))
 }
 
+/// Visit the pages of sections an unsettled obligation names as its owner before
+/// the rest of the document.
+///
+/// The named section is where the audit thinks the explanation belongs, not
+/// where it saw one, so a wrong guess must cost nothing: this only reorders what
+/// is left. Every page is still visited before anything is called missing, which
+/// is what keeps an explanation that lives in another section from being
+/// reported as an omission and duplicated into the named one.
+fn prioritize(order: &mut [usize], pages: &[Page], owners: &HashSet<usize>) {
+    order.sort_by_key(|page| !owners.contains(&pages[*page].section));
+}
+
+/// The order the audit walks files in.
+///
+/// What the document cited is where a reader can be told something wrong; what
+/// the analysis considered but the document never cited is where retrieval may
+/// have missed something it should have found; the rest is least likely to
+/// change what the document should say. A run that can afford every file still
+/// reaches all three.
+fn audit_tier(path: &str, cited: &HashSet<&str>, considered: &HashSet<String>) -> u8 {
+    if cited.contains(path) {
+        0
+    } else if considered.contains(path) {
+        1
+    } else {
+        2
+    }
+}
+
+// Leave the rest of the run - repairs, review and publication - room to finish.
+// A pass that walks every source file must not be the thing that spends the last
+// of a budget the document still needs.
+const AUDIT_BUDGET_SHARE: f64 = 0.75;
+
 /// Obligations per audit request. Each request already carries a document page
 /// and a source passage, so the obligations themselves are a rounding error
 /// beside them. The upper bound is what one response can still assess reliably,
@@ -407,10 +441,39 @@ pub async fn audit(
         !pages.is_empty(),
         "COVERAGE_AUDIT_INCOMPLETE: empty document"
     );
-    let mut after = 0u64;
-    let mut current_file = 0;
-    let mut graph = CodeGraph::default();
-    let mut byte_offset = 0;
+    // Walk the files in the order a reader is most likely to be misled by: what
+    // the document cited, then what the analysis judged relevant, then the rest.
+    // A project too large to audit in full must spend what it has on those first,
+    // and say what it did not reach rather than leave it implied.
+    let cited: HashSet<&str> = sections
+        .iter()
+        .flat_map(|s| s.evidence.iter().map(|e| e.path.as_str()))
+        .collect();
+    let considered: HashSet<String> =
+        db::load_checkpoint(&ctx.pool, &ctx.id, "source_understanding")
+            .await?
+            .and_then(|v| v.get("evidence").and_then(Value::as_array).cloned())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|e| e.get("path").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+    let mut files = vec![];
+    for row in
+        sqlx::query("SELECT id,path FROM files WHERE run_id=? AND status='indexed' ORDER BY id")
+            .bind(&ctx.id)
+            .fetch_all(&ctx.pool)
+            .await?
+    {
+        files.push((
+            row.try_get::<u64, _>("id")?,
+            row.try_get::<String, _>("path")?,
+        ));
+    }
+    files.sort_by_key(|(_, path)| audit_tier(path, &cited, &considered));
+    let (mut audited_files, mut unaudited_files) = (0usize, 0usize);
     let (mut checked, mut covered, mut out_of_scope, mut missing, mut passages) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut unresolved = 0usize;
@@ -425,50 +488,59 @@ pub async fn audit(
     let mut issues = vec![];
     let mut progress = json!({"scope":scope,"complete":false,"checked":0,"covered":0,"out_of_scope":0,"missing":0,"unresolved":0,"passages":0,"chunks":0,"total_chunks":total_chunks});
     db::checkpoint(&ctx.pool, &ctx.id, "coverage:document", &progress).await?;
-    loop {
+    for (position, (file, _)) in files.iter().enumerate() {
         ctx.check()?;
-        let rows = sqlx::query("SELECT c.id,c.file_id,c.path,c.start_line,c.end_line,COALESCE(b.content,c.content) content FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.run_id=? AND c.id>? ORDER BY c.id LIMIT 16")
-            .bind(&ctx.id).bind(after).fetch_all(&ctx.pool).await?;
-        if rows.is_empty() {
+        // Stop while there is still budget to finish the document. Being cut off
+        // by check or reserve instead would end the run with the audit unable to
+        // say how far it got.
+        if audited_files > 0 && ctx.budget_spent() > AUDIT_BUDGET_SHARE {
+            unaudited_files = files.len() - position;
             break;
         }
-        for row in rows {
-            after = row.try_get("id")?;
-            let file: u64 = row.try_get("file_id")?;
-            if file != current_file {
-                graph = graph::file(ctx, file).await?.graph;
-                current_file = file;
-                byte_offset = 0;
+        let graph = graph::file(ctx, *file).await?.graph;
+        let mut byte_offset = 0usize;
+        let mut after = 0u64;
+        loop {
+            ctx.check()?;
+            let rows = sqlx::query("SELECT c.id,c.path,c.start_line,c.end_line,COALESCE(b.content,c.content) content FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.run_id=? AND c.file_id=? AND c.id>? ORDER BY c.id LIMIT 16")
+                .bind(&ctx.id).bind(file).bind(after).fetch_all(&ctx.pool).await?;
+            if rows.is_empty() {
+                break;
             }
-            let e = Evidence {
-                id: String::new(),
-                path: row.try_get("path")?,
-                start: row.try_get("start_line")?,
-                end: row.try_get("end_line")?,
-                content: row.try_get("content")?,
-            };
-            chunks_audited += 1;
-            for e in understanding::segments(&e, (room / 4).min(8000)) {
-                let source_start = byte_offset;
-                let obligations = obligations(&e, &graph, byte_offset);
-                byte_offset += e.content.len();
-                passages += 1;
-                for group in obligations.chunks(group_size(room)) {
-                    let key = format!(
-                        "coverage:batch:{}",
-                        source::hash(
-                            serde_json::to_vec(
-                                &json!({"scope":scope,"evidence":e.id,"items":group})
-                            )?
-                            .as_slice()
-                        )
-                    );
-                    let results: Vec<Assessment> =
-                        if let Some(saved) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? {
+            for row in rows {
+                after = row.try_get("id")?;
+                let e = Evidence {
+                    id: String::new(),
+                    path: row.try_get("path")?,
+                    start: row.try_get("start_line")?,
+                    end: row.try_get("end_line")?,
+                    content: row.try_get("content")?,
+                };
+                chunks_audited += 1;
+                for e in understanding::segments(&e, (room / 4).min(8000)) {
+                    let source_start = byte_offset;
+                    let obligations = obligations(&e, &graph, byte_offset);
+                    byte_offset += e.content.len();
+                    passages += 1;
+                    for group in obligations.chunks(group_size(room)) {
+                        let key = format!(
+                            "coverage:batch:{}",
+                            source::hash(
+                                serde_json::to_vec(
+                                    &json!({"scope":scope,"evidence":e.id,"items":group})
+                                )?
+                                .as_slice()
+                            )
+                        );
+                        let results: Vec<Assessment> = if let Some(saved) =
+                            db::load_checkpoint(&ctx.pool, &ctx.id, &key).await?
+                        {
                             serde_json::from_value(saved)?
                         } else {
                             let mut decisions = BTreeMap::<String, Assessment>::new();
-                            for page in &pages {
+                            let mut order: Vec<usize> = (0..pages.len()).collect();
+                            let mut visited = 0usize;
+                            while visited < order.len() {
                                 let pending: Vec<_> = group
                                     .iter()
                                     .filter(|o| {
@@ -481,6 +553,7 @@ pub async fn audit(
                                 if pending.is_empty() {
                                     break;
                                 }
+                                let page = &pages[order[visited]];
                                 let response = compare(
                                     ctx,
                                     system,
@@ -501,60 +574,79 @@ pub async fn audit(
                                         decisions.insert(decision.id.clone(), decision);
                                     }
                                 }
+                                visited += 1;
+                                // An unsettled verdict names the section that
+                                // should own the explanation. Look there next
+                                // rather than walking the document in order.
+                                let owners: HashSet<usize> = decisions
+                                    .values()
+                                    .filter(|a| a.status == Status::Missing)
+                                    .map(|a| a.section)
+                                    .collect();
+                                prioritize(&mut order[visited..], &pages, &owners);
                             }
                             let results: Vec<_> = decisions.into_values().collect();
                             db::checkpoint(&ctx.pool, &ctx.id, &key, &json!(results)).await?;
                             results
                         };
-                    // An obligation no page could settle stays on the ledger as
-                    // unresolved. It is a warning about the audit, not a claim
-                    // that the document omitted something, and it never stops
-                    // the remaining source from being checked.
-                    unresolved += group.len().saturating_sub(results.len());
-                    for result in &results {
-                        checked += 1;
-                        match result.status {
-                            Status::Covered => covered += 1,
-                            Status::OutOfScope => out_of_scope += 1,
-                            Status::Missing => {
-                                missing += 1;
-                                let item =
-                                    group.iter().find(|o| o.id == result.id).ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "COVERAGE_AUDIT_INCOMPLETE: stale obligation"
-                                        )
-                                    })?;
-                                issues.push(Issue {
-                                    severity: "major".into(),
-                                    section: result.section,
-                                    message: format!(
-                                        "원본 대조에서 누락된 설명 ({}:{}–{}, {}): {}",
-                                        e.path,
-                                        item.span.start,
-                                        item.span.end,
-                                        item.subject,
-                                        result.reason
-                                    ),
-                                    query: format!("{} {}", e.path, item.subject),
-                                });
+                        // An obligation no page could settle stays on the ledger as
+                        // unresolved. It is a warning about the audit, not a claim
+                        // that the document omitted something, and it never stops
+                        // the remaining source from being checked.
+                        unresolved += group.len().saturating_sub(results.len());
+                        for result in &results {
+                            checked += 1;
+                            match result.status {
+                                Status::Covered => covered += 1,
+                                Status::OutOfScope => out_of_scope += 1,
+                                Status::Missing => {
+                                    missing += 1;
+                                    let item = group
+                                        .iter()
+                                        .find(|o| o.id == result.id)
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "COVERAGE_AUDIT_INCOMPLETE: stale obligation"
+                                            )
+                                        })?;
+                                    issues.push(Issue {
+                                        severity: "major".into(),
+                                        section: result.section,
+                                        message: format!(
+                                            "원본 대조에서 누락된 설명 ({}:{}–{}, {}): {}",
+                                            e.path,
+                                            item.span.start,
+                                            item.span.end,
+                                            item.subject,
+                                            result.reason
+                                        ),
+                                        query: format!("{} {}", e.path, item.subject),
+                                    });
+                                }
                             }
                         }
-                    }
-                    // Stable current-run ledger, separate from immutable cache.
-                    db::checkpoint(&ctx.pool,&ctx.id,&format!("coverage:item:{}",source::hash(serde_json::to_vec(group)?.as_slice())),
+                        // Stable current-run ledger, separate from immutable cache.
+                        db::checkpoint(&ctx.pool,&ctx.id,&format!("coverage:item:{}",source::hash(serde_json::to_vec(group)?.as_slice())),
                         &json!({"scope":scope,"path":e.path,"evidence_id":e.id,"obligations":group,"assessments":results})).await?;
-                    progress = json!({"scope":scope,"complete":false,"checked":checked,"covered":covered,"out_of_scope":out_of_scope,"missing":missing,"unresolved":unresolved,"passages":passages,"chunks":chunks_audited,"total_chunks":total_chunks});
-                    db::checkpoint(&ctx.pool, &ctx.id, "coverage:document", &progress).await?;
-                    ctx.event("coverage_audit",json!({"stage":"reviewing","title":"원본·그래프와 문서 누락 대조","path":e.path,"coverage":progress})).await?;
+                        progress = json!({"scope":scope,"complete":false,"checked":checked,"covered":covered,"out_of_scope":out_of_scope,"missing":missing,"unresolved":unresolved,"passages":passages,
+                        "chunks":chunks_audited,"total_chunks":total_chunks,"audited_files":audited_files,"unaudited_files":files.len()-audited_files});
+                        db::checkpoint(&ctx.pool, &ctx.id, "coverage:document", &progress).await?;
+                        ctx.event("coverage_audit",json!({"stage":"reviewing","title":"원본·그래프와 문서 누락 대조","path":e.path,"coverage":progress})).await?;
+                    }
                 }
             }
         }
+        audited_files += 1;
     }
     ensure!(
         checked > 0,
         "COVERAGE_AUDIT_INCOMPLETE: no source obligations inspected"
     );
+    // Complete means the audit finished the scope it set out to walk, which is
+    // not always every file. The scope itself is on the ledger beside it.
     progress["complete"] = json!(true);
+    progress["audited_files"] = json!(audited_files);
+    progress["unaudited_files"] = json!(unaudited_files);
     db::checkpoint(&ctx.pool, &ctx.id, "coverage:document", &progress).await?;
     Ok(issues)
 }
@@ -562,6 +654,48 @@ pub async fn audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_named_owning_section_is_visited_next_without_skipping_the_rest() {
+        let sections: Vec<Section> = (0..5)
+            .map(|_| section("Some prose that is long enough."))
+            .collect();
+        let pages = pages(&sections, 4000);
+        assert_eq!(pages.len(), 5);
+        let mut order: Vec<usize> = (0..pages.len()).collect();
+        // Page 0 is visited, and the verdict names section 3 as the owner.
+        prioritize(&mut order[1..], &pages, &HashSet::from([3usize]));
+        assert_eq!(order, vec![0, 3, 1, 2, 4]);
+        // A wrong guess only reorders: every page is still in the list.
+        prioritize(&mut order[2..], &pages, &HashSet::from([4usize]));
+        assert_eq!(order, vec![0, 3, 4, 1, 2]);
+        assert_eq!(
+            order.iter().copied().collect::<HashSet<_>>(),
+            (0..5).collect()
+        );
+        // No named owner leaves the remaining order untouched.
+        let mut untouched: Vec<usize> = (0..pages.len()).collect();
+        prioritize(&mut untouched[1..], &pages, &HashSet::new());
+        assert_eq!(untouched, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn the_audit_reaches_cited_then_considered_then_unread_files() {
+        let cited = HashSet::from(["/p/cited.rs"]);
+        let considered = HashSet::from(["/p/cited.rs".to_string(), "/p/seen.rs".to_string()]);
+        let mut files = [
+            (1u64, "/p/other.rs".to_string()),
+            (2, "/p/seen.rs".to_string()),
+            (3, "/p/cited.rs".to_string()),
+            (4, "/p/another.rs".to_string()),
+        ];
+        files.sort_by_key(|(_, path)| audit_tier(path, &cited, &considered));
+        assert_eq!(
+            files.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![3, 2, 1, 4],
+            "cited first, then considered, then the rest in index order"
+        );
+    }
 
     #[test]
     fn an_audit_request_carries_the_obligations_its_room_affords() {

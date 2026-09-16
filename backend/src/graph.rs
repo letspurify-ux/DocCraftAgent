@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Row;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FileGraph {
@@ -307,7 +307,7 @@ pub async fn order_chunks(ctx: &RunContext, chunks: &[ChunkSpan]) -> Result<Vec<
 
     // Parent symbols may have appeared after their children in a file's graph,
     // so connect the remaining parent/child pairs in a second pass.
-    for (_, (_, symbol)) in &symbols {
+    for (_, symbol) in symbols.values() {
         let Some(parent) = &symbol.parent else {
             continue;
         };
@@ -363,64 +363,213 @@ pub async fn order_chunks(ctx: &RunContext, chunks: &[ChunkSpan]) -> Result<Vec<
     Ok(graph_order(&adjacency))
 }
 
-/// Whole records only; omitted records remain in the persisted graph and audit.
+/// Compact structural records for the passages in one request.
+///
+/// The complete graph stays in the checkpoints and `coverage` audits every
+/// symbol and every site against the finished document, so this projection is a
+/// reading hint, not the record of what exists. Its job is to tell the reader
+/// what structure the supplied passages contain, which is why it drops
+/// storage-only fields, folds the target-less branch and exit sites into
+/// per-symbol counts, and names whatever it could not fit instead of reporting
+/// a bare total.
+fn records(g: &CodeGraph, spans: &[(u32, u32)]) -> Vec<Value> {
+    let overlaps = |s: &Span| spans.iter().any(|(a, b)| s.overlaps(*a, *b));
+    let owners: HashMap<&str, &str> = g
+        .symbols
+        .iter()
+        .map(|s| (s.id.as_str(), s.qualified_name.as_str()))
+        .collect();
+    let mut result = vec![];
+    for s in g
+        .symbols
+        .iter()
+        .filter(|s| s.kind != "file" && overlaps(&s.span))
+    {
+        result.push(
+            json!({"symbol":s.qualified_name,"kind":s.kind,"lines":[s.span.start,s.span.end]}),
+        );
+    }
+    let mut sites: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
+    let mut structural = vec![];
+    let mut calls = vec![];
+    for e in g.edges.iter().filter(|e| overlaps(&e.span)) {
+        let owner = owners.get(e.source.as_str()).copied().unwrap_or("<file>");
+        if e.target.is_empty() {
+            *sites
+                .entry(owner)
+                .or_default()
+                .entry(e.kind.as_str())
+                .or_default() += 1;
+            continue;
+        }
+        let link = json!({"from":owner,"kind":e.kind,"to":crate::editorial::excerpt(&e.target, 200),"line":e.span.start});
+        if e.kind == "calls" {
+            calls.push(link);
+        } else {
+            structural.push(link);
+        }
+    }
+    // Branch, return, error and assignment sites carry no target, so one record
+    // per site would spend the whole budget restating that a line exists. The
+    // counts still tell the reader how much conditional and error handling the
+    // supplied passage contains, and the passage itself holds the detail.
+    //
+    // The order below is the order the budget is spent in: the declarations in
+    // the passage, then how much branching and error handling each one carries,
+    // then its module-level dependencies, and only then the individual call
+    // sites, which are the most numerous and the easiest to re-read in the
+    // passage itself.
+    for (owner, kinds) in sites {
+        result.push(json!({"in":owner,"sites":kinds}));
+    }
+    result.extend(structural);
+    result.extend(calls);
+    result
+}
+
+/// Spend the budget breadth-first so every file in the request is described.
+/// Taking one record per file per round means a long first file can no longer
+/// consume the whole budget and leave its neighbours undescribed.
+fn ration(files: &[(String, Vec<Value>)], max: usize) -> Result<(Vec<Value>, Vec<Value>)> {
+    let mut items = vec![];
+    let mut taken = vec![0usize; files.len()];
+    let mut used = 0usize;
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for (index, (path, records)) in files.iter().enumerate() {
+            let Some(record) = records.get(taken[index]) else {
+                continue;
+            };
+            let mut value = record.clone();
+            value["path"] = json!(path);
+            let size = serde_json::to_vec(&value)?.len() + 1;
+            if used + size > max {
+                continue;
+            }
+            used += size;
+            taken[index] += 1;
+            items.push(value);
+            progress = true;
+        }
+    }
+    let omitted = files
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, records))| taken[*index] < records.len())
+        .map(|(index, (path, records))| {
+            json!({"path":path,"omitted_records":records.len() - taken[index]})
+        })
+        .collect();
+    Ok((items, omitted))
+}
+
+/// The bounded structural hint for one request. What it cannot carry is named
+/// per file; the omitted records stay in the persisted graph and are audited
+/// against the finished document by `coverage`.
 pub async fn context(ctx: &RunContext, evidence: &[Evidence], max: usize) -> Result<Value> {
     let mut paths: Vec<_> = evidence.iter().map(|e| &e.path).collect();
     paths.sort();
     paths.dedup();
-    let mut items = vec![];
-    let (mut used, mut deferred) = (0usize, 0usize);
+    let mut files = vec![];
+    let mut ungraphed = vec![];
     for path in paths {
         let file_id: Option<u64> = sqlx::query_scalar("SELECT id FROM files WHERE run_id=? AND path=? AND status='indexed' ORDER BY id LIMIT 1")
             .bind(&ctx.id).bind(path).fetch_optional(&ctx.pool).await?;
         let Some(file_id) = file_id else {
+            // Silence here would read as "this file has no structure", so the
+            // gap is named instead.
+            ungraphed.push(json!({"path":path,"reason":"not_indexed"}));
             continue;
         };
-        let graph = file(ctx, file_id).await?;
+        let graph = file(ctx, file_id).await?.graph;
         let spans: Vec<_> = evidence
             .iter()
             .filter(|e| &e.path == path)
             .map(|e| (e.start, e.end))
             .collect();
-        for symbol in graph
-            .graph
-            .symbols
-            .iter()
-            .filter(|s| s.kind != "file" && spans.iter().any(|(a, b)| s.span.overlaps(*a, *b)))
-        {
-            let value = json!({"path":path,"symbol":symbol});
-            let size = serde_json::to_vec(&value)?.len();
-            if used + size <= max {
-                used += size;
-                items.push(value);
-            } else {
-                deferred += 1;
-            }
+        let records = records(&graph, &spans);
+        if records.is_empty() {
+            ungraphed.push(json!({"path":path,"reason":if graph.supported {"no_declarations_in_passage"} else {"unsupported_language"}}));
+            continue;
         }
-        for edge in graph
-            .graph
-            .edges
-            .iter()
-            .filter(|e| spans.iter().any(|(a, b)| e.span.overlaps(*a, *b)))
-        {
-            let value = json!({"path":path,"edge":edge});
-            let size = serde_json::to_vec(&value)?.len();
-            if used + size <= max {
-                used += size;
-                items.push(value);
-            } else {
-                deferred += 1;
-            }
-        }
+        files.push((path.clone(), records));
     }
+    let (items, omitted) = ration(&files, max)?;
+    let deferred: usize = omitted
+        .iter()
+        .filter_map(|o| o["omitted_records"].as_u64())
+        .sum::<u64>() as usize;
     Ok(
-        json!({"items":items,"deferred_records":deferred,"semantics":"Syntax only. Resolve candidate connections against supplied original evidence; do not assert runtime order from this graph."}),
+        json!({"items":items,"omitted":omitted,"files_without_graph":ungraphed,"deferred_records":deferred,
+            "semantics":"Syntax only. Resolve candidate connections against supplied original evidence; do not assert runtime order from this graph. `sites` counts branch/returns/error_path/writes/awaits sites inside a symbol: read the supplied passage for the actual conditions rather than treating a count as a described behavior. `omitted` and `files_without_graph` name structure this request could not carry; treat those as unresolved, never as evidence that the code has none."}),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn site_records_fold_targetless_edges_and_drop_storage_only_fields() -> Result<()> {
+        let g = crate::code_graph::parse_test(
+            "fn run(x: i32) -> i32 { if x > 0 { return helper(x); } while x > 1 { break; } 0 }\nfn helper(v: i32) -> i32 { v }\n",
+            "rust",
+        )?
+        .at_path("a.rs");
+        let items = records(&g, &[(1, 99)]);
+        let text = serde_json::to_string(&items)?;
+        assert!(
+            items
+                .iter()
+                .any(|r| r["symbol"] == "run" && r["kind"] == "function")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|r| r["from"] == "run" && r["to"] == "helper")
+        );
+        // Every branch/return site of one symbol becomes a single counted
+        // record instead of one near-empty record per site.
+        let counted = items
+            .iter()
+            .find(|r| r["in"] == "run")
+            .context("run site counts")?;
+        assert!(counted["sites"]["branch"].as_u64().unwrap_or(0) >= 2);
+        assert_eq!(counted["sites"]["returns"], 1);
+        assert_eq!(items.iter().filter(|r| r["in"] == "run").count(), 1);
+        // Symbol ids and byte offsets are storage, not something the reader can
+        // check against a passage.
+        assert!(!text.contains("start_byte"), "{text}");
+        assert!(!text.contains("\"id\""), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn every_file_in_a_request_is_described_and_omissions_are_named() -> Result<()> {
+        let files = vec![
+            (
+                "a.rs".to_string(),
+                vec![
+                    json!({"symbol":"a1"}),
+                    json!({"symbol":"a2"}),
+                    json!({"symbol":"a3"}),
+                ],
+            ),
+            ("b.rs".to_string(), vec![json!({"symbol":"b1"})]),
+        ];
+        let one = serde_json::to_vec(&json!({"path":"a.rs","symbol":"a1"}))?.len() + 1;
+        let (items, omitted) = ration(&files, one * 2)?;
+        // A budget for two records describes both files, not the first twice.
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|r| r["path"] == "b.rs"));
+        assert_eq!(omitted, vec![json!({"path":"a.rs","omitted_records":2})]);
+        // With room for everything nothing is reported as omitted.
+        let (all, none) = ration(&files, one * 10)?;
+        assert_eq!(all.len(), 4);
+        assert!(none.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn graph_order_keeps_connected_chunks_adjacent_and_preserves_isolates() {

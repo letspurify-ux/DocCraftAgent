@@ -62,16 +62,21 @@ fn bounded_text(value: &str, max: usize) -> bool {
 }
 
 /// Resolve only unambiguous prefixes from THIS request, then persist full hashes.
-fn resolve_ids(ids: &mut [String], evidence: &[Evidence], max: usize) -> Result<()> {
+///
+/// `subject` names the finding or section being checked. Every other rule here
+/// says which item broke it; a bare "supply 1-6 evidence_ids" leaves a repair
+/// attempt guessing which of a dozen items was empty, so it repeats the mistake.
+fn resolve_ids(ids: &mut [String], evidence: &[Evidence], max: usize, subject: &str) -> Result<()> {
     ensure!(
         !ids.is_empty() && ids.len() <= max,
-        "Supply 1-{max} evidence_ids"
+        "{subject:?} supplied {} evidence_ids; cite 1-{max} of the evidence IDs in this request, or drop the item when nothing supplied supports it. Names and line numbers from source_graph are not evidence IDs",
+        ids.len()
     );
     let mut seen = HashSet::new();
     for id in ids {
         ensure!(
             id.len() >= 8 && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
-            "Invalid evidence ID: {id}"
+            "{subject:?} cites {id:?}, which is not a supplied evidence ID"
         );
         let matches: Vec<_> = evidence
             .iter()
@@ -79,7 +84,10 @@ fn resolve_ids(ids: &mut [String], evidence: &[Evidence], max: usize) -> Result<
             .collect();
         ensure!(matches.len() == 1, "Unknown or ambiguous evidence ID: {id}");
         *id = matches[0].id.clone();
-        ensure!(seen.insert(id.clone()), "Repeated evidence ID: {id}");
+        ensure!(
+            seen.insert(id.clone()),
+            "{subject:?} repeats evidence ID {id:?}"
+        );
     }
     Ok(())
 }
@@ -128,7 +136,13 @@ pub(crate) fn validate_brief(
             bounded_text(&finding.topic, 300) && bounded_text(&finding.observation, 4000),
             "Invalid source finding text"
         );
-        resolve_ids(&mut finding.evidence_ids, evidence, MAX_EVIDENCE_IDS)?;
+        let subject = finding.topic.clone();
+        resolve_ids(
+            &mut finding.evidence_ids,
+            evidence,
+            MAX_EVIDENCE_IDS,
+            &subject,
+        )?;
         if matches!(finding.kind, FindingKind::Runtime) {
             ensure!(
                 evidence
@@ -239,7 +253,8 @@ pub(crate) fn validate_outline(
                 .is_some_and(|d| d.len() <= 4 && d.iter().all(|s| bounded_text(s, 1500))),
             "Every section needs a bounded diagrams array"
         );
-        resolve_ids(&mut section.evidence_ids, evidence, 8)?;
+        let subject = section.title.clone();
+        resolve_ids(&mut section.evidence_ids, evidence, 8, &subject)?;
     }
     if let Some(error) = outline_diagram_error(outline, maximum) {
         bail!("{error}");
@@ -599,6 +614,25 @@ pub async fn section_evidence(ctx: &RunContext, plan: &SectionPlan) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_uncitable_item_is_named_so_a_repair_knows_which_one_to_fix() -> Result<()> {
+        let source = evidence("/project/main.py", "def process(): return 1");
+        let mut brief: SourceBrief = serde_json::from_value(json!({"findings":[
+            {"topic":"첫 관찰","observation":"근거가 있다","kind":"context","evidence_ids":[source.id]},
+            {"topic":"근거 없는 관찰","observation":"근거가 없다","kind":"context","evidence_ids":[]}
+        ],"uncertainties":[],"followup_queries":[]}))?;
+        let error = validate_brief(&mut brief, std::slice::from_ref(&source), true)
+            .err()
+            .context("an empty citation list must be rejected")?
+            .to_string();
+        // A bare count leaves the next attempt guessing which of a dozen items
+        // was empty, so it repeats the mistake until the retries run out.
+        assert!(error.contains("근거 없는 관찰"), "{error}");
+        assert!(error.contains("supplied 0"), "{error}");
+        assert!(!error.contains("첫 관찰"), "{error}");
+        Ok(())
+    }
 
     fn evidence(path: &str, content: &str) -> Evidence {
         Evidence {

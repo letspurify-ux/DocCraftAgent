@@ -522,7 +522,7 @@ pub async fn context(ctx: &RunContext, evidence: &[Evidence], max: usize) -> Res
         .sum::<u64>() as usize;
     Ok(
         json!({"items":items,"omitted":omitted,"files_without_graph":ungraphed,"deferred_records":deferred,
-            "semantics":"Syntax only. Resolve candidate connections against supplied original evidence; do not assert runtime order from this graph. `sites` counts branch/returns/error_path/writes/awaits sites inside a symbol: read the supplied passage for the actual conditions rather than treating a count as a described behavior. `omitted` and `files_without_graph` name structure this request could not carry; treat those as unresolved, never as evidence that the code has none."}),
+            "semantics":"Syntax only, and never a citation: these records carry names and line numbers, not evidence IDs, so cite the supplied passages instead. Resolve candidate connections against supplied original evidence; do not assert runtime order from this graph. `sites` counts branch/returns/error_path/writes/awaits sites inside a symbol: read the supplied passage for the actual conditions rather than treating a count as a described behavior. `omitted` and `files_without_graph` name structure this request could not carry; treat those as unresolved, never as evidence that the code has none."}),
     )
 }
 

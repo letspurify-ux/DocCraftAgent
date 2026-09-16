@@ -112,6 +112,16 @@ fn recover_output(
                 .iter()
                 .filter_map(|v| serde_json::from_value(v.clone()).ok()),
         );
+    } else {
+        // The response did not parse as a whole - most often it was cut off
+        // inside an observation. Discarding the batch would lose the readings
+        // the model did finish, and a leaf batch is the only place those
+        // passages are ever read.
+        findings.extend(
+            llm::array_prefix(output, "findings")
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok()),
+        );
     }
     salvage(
         SourceBrief {
@@ -697,6 +707,44 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_response_cut_off_mid_observation_keeps_what_it_finished() -> Result<()> {
+        let evidence = Evidence {
+            id: source::hash(b"source"),
+            path: "/project/main.rs".into(),
+            start: 1,
+            end: 1,
+            content: "fn main() {}".into(),
+        };
+        // Two complete findings, then the provider stops inside the third
+        // observation. A leaf batch is the only place these passages are ever
+        // read, so what the response finished has to survive.
+        let cut = format!(
+            concat!(
+                r#"{{"findings":[{{"topic":"entry","observation":"An empty main is defined","kind":"runtime","evidence_ids":["{id}"]}},"#,
+                r#"{{"topic":"scope","observation":"The file declares nothing else","kind":"context","evidence_ids":["{id}"]}},"#,
+                r#"{{"topic":"cut","observation":"The provider stopped here"#
+            ),
+            id = evidence.id
+        );
+        assert!(llm::decode::<serde_json::Value>(&cut).is_err());
+        let recovered = recover_output(
+            &cut,
+            &[],
+            std::slice::from_ref(&evidence),
+            SUMMARY_MAX_BYTES,
+        );
+        assert_eq!(
+            recovered.findings.len(),
+            2,
+            "{:?}",
+            recovered.findings.len()
+        );
+        assert_eq!(recovered.findings[0].topic, "entry");
+        assert_eq!(recovered.findings[1].topic, "scope");
+        Ok(())
+    }
+
     #[test]
     fn malformed_output_remains_unresolved_and_valid_siblings_survive_bad_schema() {
         let evidence = Evidence {

@@ -503,6 +503,65 @@ impl JsonRepair {
     }
 }
 
+/// Elements of a named array that the response actually finished.
+///
+/// A response cut off inside its fourth observation still completed the first
+/// three, and those are as checkable as any other. Parsing the document as a
+/// whole throws them away with the incomplete one.
+pub fn array_prefix(text: &str, field: &str) -> Vec<Value> {
+    let Some(at) = text.find(&format!("\"{field}\"")) else {
+        return vec![];
+    };
+    let rest = &text[at..];
+    let Some(open) = rest.find('[') else {
+        return vec![];
+    };
+    let bytes = rest.as_bytes();
+    let mut elements = vec![];
+    let mut index = open + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b']' => break,
+            b'{' => {
+                let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+                let mut scan = index;
+                let mut end = None;
+                while scan < bytes.len() {
+                    let byte = bytes[scan];
+                    if quoted {
+                        if escaped {
+                            escaped = false;
+                        } else if byte == b'\\' {
+                            escaped = true;
+                        } else if byte == b'"' {
+                            quoted = false;
+                        }
+                    } else if byte == b'"' {
+                        quoted = true;
+                    } else if byte == b'{' {
+                        depth += 1;
+                    } else if byte == b'}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(scan + 1);
+                            break;
+                        }
+                    }
+                    scan += 1;
+                }
+                // Cut off inside this element: everything before it still stands.
+                let Some(end) = end else { break };
+                if let Ok(value) = serde_json::from_str::<Value>(&rest[index..end]) {
+                    elements.push(value);
+                }
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    elements
+}
+
 fn extract_json_object(text: &str) -> Option<&str> {
     let start = text
         .char_indices()

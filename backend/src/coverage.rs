@@ -465,13 +465,22 @@ pub async fn audit(
         ctx.extra_margin.load(std::sync::atomic::Ordering::Relaxed),
         fixed,
     )
-    .min(48_000);
+    .min(64_000);
     ensure!(
         room >= 4096,
         "COVERAGE_AUDIT_INCOMPLETE: insufficient context for original-source omission audit"
     );
     let pages = pages(sections, (room / 2).min(24_000));
     let passage_room = (room / 4).min(8000);
+    // What one request may spend on source. Sizing the batch the same as a
+    // single passage put exactly one passage in it, which is the thing batching
+    // was meant to stop: the document page and the instruction ride along
+    // whether the request carries one obligation or twenty.
+    let page_room = (room / 2).min(24_000);
+    let batch_room = room
+        .saturating_sub(page_room)
+        .saturating_sub(group_size(room) * 300)
+        .max(passage_room);
     ensure!(
         !pages.is_empty(),
         "COVERAGE_AUDIT_INCOMPLETE: empty document"
@@ -588,7 +597,7 @@ pub async fn audit(
                 let fresh = batch
                     .last()
                     .is_none_or(|last| last.evidence.id != evidence.id);
-                if fresh && !batch.is_empty() && bytes + evidence.content.len() > passage_room {
+                if fresh && !batch.is_empty() && bytes + evidence.content.len() > batch_room {
                     break;
                 }
                 if fresh {
@@ -707,7 +716,7 @@ pub async fn audit(
                 db::checkpoint(&ctx.pool,&ctx.id,&format!("coverage:item:{}",source::hash(serde_json::to_vec(group)?.as_slice())),
                         &json!({"scope":scope,"paths":paths(&batch),"passages":batch.iter().map(|p| &p.evidence.id).collect::<Vec<_>>(),"obligations":group,"assessments":results})).await?;
                 progress = json!({"scope":scope,"complete":false,"checked":checked,"covered":covered,"out_of_scope":out_of_scope,"missing":missing,"unresolved":unresolved,"passages":passages,
-                        "chunks":chunks_audited,"total_chunks":total_chunks,"audited_files":audited_files,"unaudited_files":files.len()-audited_files});
+                        "chunks":chunks_audited,"total_chunks":total_chunks,"audited_files":audited_files,"unaudited_files":files.len()-audited_files,"excluded_files":excluded_files});
                 db::checkpoint(&ctx.pool, &ctx.id, "coverage:document", &progress).await?;
                 ctx.event("coverage_audit",json!({"stage":"reviewing","title":"원본·그래프와 문서 누락 대조","paths":paths(&batch),"coverage":progress})).await?;
             }
@@ -761,6 +770,32 @@ mod tests {
         assert!(!source::is_implementation("/project/package.json"));
         assert!(source::is_implementation("/project/run.js"));
         Ok(())
+    }
+
+    #[test]
+    fn a_batch_holds_more_source_than_a_single_passage() {
+        // Sizing the batch like one passage put one passage in it. The request
+        // carries a document page and an instruction either way, so the source
+        // budget has to be what is left over, not what one passage costs.
+        let room = 64_000usize;
+        let page_room = (room / 2).min(24_000);
+        let passage_room = (room / 4).min(8000);
+        let batch_room = room
+            .saturating_sub(page_room)
+            .saturating_sub(group_size(room) * 300)
+            .max(passage_room);
+        assert!(
+            batch_room >= passage_room * 3,
+            "{batch_room} leaves room for {} passages",
+            batch_room / passage_room
+        );
+        // And the whole request still has to clear the gate it was sized from.
+        let c = crate::model::LlmConfig {
+            max_output_tokens: 32_000,
+            ..Default::default()
+        };
+        let serialized = (room as u64 + 21_000) * crate::budget::ESCAPE_EXPANSION_PERCENT / 100;
+        assert!(crate::budget::check(&c, serialized, 0).is_ok());
     }
 
     #[test]

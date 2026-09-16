@@ -40,14 +40,6 @@ type Understanding = {
     unsupported_files: number;
     parse_error_files: number;
   };
-  document_coverage?: {
-    scope?: string;
-    complete: boolean;
-    checked: number;
-    covered: number;
-    out_of_scope: number;
-    missing: number;
-  };
   coverage?: {
     reading_complete?: boolean;
     unresolved_nodes?: number;
@@ -237,7 +229,6 @@ export function Composition({ run }: { run: Run }) {
               key={run.id}
               runId={run.id}
               graph={source.graph}
-              coverage={source.document_coverage}
             />
           )}
           {source.coverage?.additional_reading_unresolved && (

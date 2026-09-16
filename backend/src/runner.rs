@@ -101,26 +101,6 @@ impl RunContext {
         }
         Ok(())
     }
-    /// The largest share of any run budget already committed.
-    ///
-    /// A pass that walks the whole project uses this to stop while there is
-    /// still room to finish the document, instead of being cut off mid-way by
-    /// `check` or `reserve` and leaving the caller unable to say what it did.
-    pub fn budget_spent(&self) -> f64 {
-        let share = |used: f64, limit: f64| if limit > 0.0 { used / limit } else { 0.0 };
-        let elapsed = self
-            .elapsed_before
-            .saturating_add(self.started.elapsed().as_secs());
-        share(
-            self.reserved_tokens.load(Ordering::Relaxed) as f64,
-            self.snapshot.task.max_tokens as f64,
-        )
-        .max(share(elapsed as f64, self.snapshot.task.max_seconds as f64))
-        .max(share(
-            self.reserved_cost.load(Ordering::Relaxed) as f64 / 1_000_000.0,
-            self.snapshot.task.max_cost,
-        ))
-    }
     pub fn reserve(&self, tokens: u64, cost: f64) -> Result<()> {
         let current = self.reserved_tokens.load(Ordering::Relaxed);
         if current
@@ -718,7 +698,6 @@ async fn execute_document(ctx: &RunContext) -> Result<()> {
             }
             issues.extend(validate_document_duplicates(&sections)?);
             issues.extend(review_coherence(ctx, &outline, &sections, iteration).await?);
-            issues.extend(crate::coverage::audit(ctx, SYSTEM, &outline, &sections).await?);
             if sections.len() < outline.sections.len() {
                 issues.push(Issue {
                     severity: "major".into(),
@@ -784,32 +763,6 @@ async fn execute_document(ctx: &RunContext) -> Result<()> {
         }
     }
     warnings.extend(issue_warnings(&last_issues));
-    let coverage = db::load_checkpoint(&ctx.pool, &ctx.id, "coverage:document")
-        .await?
-        .unwrap_or(json!({}));
-    if coverage["complete"] != true || coverage["missing"].as_u64().unwrap_or(1) > 0 {
-        bail!(
-            "COVERAGE_AUDIT_INCOMPLETE: 원본 대조에서 핵심 설명 누락이 {}개 남았습니다. 부분 문서와 검토 기록을 보존했습니다",
-            coverage["missing"].as_u64().unwrap_or(0)
-        );
-    }
-    // Obligations no page could settle are a gap in the audit, not a verdict on
-    // the document. They are reported rather than hidden, and they do not stop a
-    // finished document from being published.
-    if let Some(unresolved) = coverage["unresolved"].as_u64().filter(|n| *n > 0) {
-        warnings.push(format!(
-            "원본 대조에서 {unresolved}개 항목의 판정을 확정하지 못했습니다. 해당 항목은 누락 원장에 남아 있습니다"
-        ));
-    }
-    // A project can be larger than one run's budget. Saying which files were
-    // compared against the original is the difference between a selective audit
-    // and an unstated one.
-    let audited_files = coverage["audited_files"].as_u64().unwrap_or(0);
-    if let Some(unaudited) = coverage["unaudited_files"].as_u64().filter(|n| *n > 0) {
-        warnings.push(format!(
-            "실행 예산 안에서 {audited_files}개 파일을 원본 대조했고 {unaudited}개 파일은 대조하지 못했습니다. 대조한 범위에서는 핵심 누락이 없습니다"
-        ));
-    }
     let indexed = db::load_checkpoint(&ctx.pool, &ctx.id, "indexed")
         .await?
         .unwrap_or(json!({}));
@@ -832,10 +785,7 @@ async fn execute_document(ctx: &RunContext) -> Result<()> {
         .len();
     ctx.event("coverage",json!({"stage":"publishing","indexed_files":total_files,"excluded_files":excluded_files,"skipped_files":skipped_files,"retrieved_files":retrieved_files,"selective_analysis":true})).await?;
     let mut markdown = assemble(ctx, &sections, &warnings);
-    let unaudited_files = coverage["unaudited_files"].as_u64().unwrap_or(0);
-    let audit_excluded = coverage["excluded_files"].as_u64().unwrap_or(0);
-    markdown.push_str(&format!("\n## Analysis coverage\n\nIndexed files: {total_files}. Files included in retrieved evidence: {retrieved_files}. Declarations compared against the original source by the omission audit, in {audited_files} implementation files. Files the audit did not reach within this run's budget: {unaudited_files}. Files with no declaration to audit: {audit_excluded}. The audit checks declarations; individual branches, exits and top-level statements are recorded in the source graph but are not separately compared. Files excluded by configured or built-in rules: {excluded_files}. Unreadable or failed files: {skipped_files}. Analysis is selective and does not imply exhaustive semantic verification of every source line.\n"));
-    markdown.push_str(&format!("\nOriginal-source omission audit: {} obligations inspected; {} supported by document quotations; {} outside the requested scope with recorded reasons; {} missing. This is model-assisted coverage, not a proof of semantic completeness.\n", coverage["checked"], coverage["covered"], coverage["out_of_scope"], coverage["missing"]));
+    markdown.push_str(&format!("\n## Analysis coverage\n\nIndexed files: {total_files}. Files included in retrieved evidence: {retrieved_files}. Files excluded by configured or built-in rules: {excluded_files}. Unreadable or failed files: {skipped_files}. Every claim cites a source passage and each section was reviewed against the passages it cites, but the document is not compared against source it never retrieved: analysis is selective and does not imply exhaustive semantic verification of every source line.\n"));
     publish::save(ctx, &markdown, &warnings).await?;
     Ok(())
 }
@@ -1375,9 +1325,7 @@ const SECTION_BOUNDED_RESERVE_BYTES: usize = 24_000;
 
 fn recoverable_generation_failure(e: &anyhow::Error) -> bool {
     let message = e.to_string();
-    message.contains("API_RETRIES_EXHAUSTED")
-        || message.contains("SECTION_REPAIR_EXHAUSTED")
-        || message.contains("COVERAGE_AUDIT_INCOMPLETE")
+    message.contains("API_RETRIES_EXHAUSTED") || message.contains("SECTION_REPAIR_EXHAUSTED")
 }
 pub(crate) fn fatal(e: &anyhow::Error) -> bool {
     let s = e.to_string();
@@ -1493,7 +1441,7 @@ async fn write_section(
         input["source_graph"] = crate::graph::context(ctx, &evidence, 4000).await?;
         input["preserved_details"] = crate::purpose::section_memory(ctx, &evidence, 6000).await?;
         input["coverage_rules"] = json!(
-            "Use graph sites and preserved details to check that important conditions, alternate/error/cancel exits, state changes and output consumers in this section's scope are explained. The graph is syntax only and details are navigation hints: verify claims against supplied evidence. Never omit an important branch merely to compress the text. Deferred records remain stored and will be independently audited against the complete document."
+            "Use graph sites and preserved details to check that important conditions, alternate/error/cancel exits, state changes and output consumers in this section's scope are explained. The graph is syntax only and details are navigation hints: verify claims against supplied evidence. Never omit an important branch merely to compress the text. Deferred records remain stored in the source graph."
         );
         input["accuracy_rules"] = json!(
             "For externally callable HTTP routes, write the full exposed route including its configured router prefix such as /api/v1; label any prefix-free frontend helper argument as client-relative. Mermaid arrows must follow supported caller/callee, storage, API, or UI handoffs and must not jump directly to a user when an API or frontend mediates the result. Treat fenced code as literal content, not prose or headings. A UI label or help string proves only what the screen says; cite backend implementation before describing that text as runtime behavior. Each citation must itself contain the exact implementation or UI text supporting its attached claim; do not rely on a different nearby evidence item."

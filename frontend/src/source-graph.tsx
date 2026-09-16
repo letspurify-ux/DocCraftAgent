@@ -23,25 +23,10 @@ type Graph = {
   next_cursor: number;
   has_more: boolean;
 };
-type Ledger = {
-  items: {
-    path: string;
-    obligations: { id: string; subject: string }[];
-    assessments: {
-      id: string;
-      status: string;
-      reason: string;
-      quote: string;
-    }[];
-  }[];
-  next_cursor: string;
-  has_more: boolean;
-};
 
 export function SourceGraph({
   runId,
   graph,
-  coverage,
 }: {
   runId: string;
   graph: {
@@ -50,38 +35,20 @@ export function SourceGraph({
     unsupported_files: number;
     parse_error_files: number;
   };
-  coverage?: {
-    scope?: string;
-    complete: boolean;
-    checked: number;
-    covered: number;
-    out_of_scope: number;
-    missing: number;
-  };
 }) {
   const [files, setFiles] = useState<FileList | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [detail, setDetail] = useState<Graph | null>(null);
-  const [ledger, setLedger] = useState<Ledger | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     setFiles(null);
     setDetail(null);
-    setLedger(null);
     setSelected(null);
     setError("");
   }, [runId]);
-  useEffect(() => {
-    setLedger(null);
-  }, [
-    coverage?.scope,
-    coverage?.checked,
-    coverage?.missing,
-    coverage?.complete,
-  ]);
   async function load(
-    kind: "files" | "detail" | "ledger",
+    kind: "files" | "detail",
     next = false,
     fileId = selected,
   ) {
@@ -112,16 +79,6 @@ export function SourceGraph({
             ? [...(previous?.edges ?? []), ...value.edges]
             : value.edges,
         }));
-      } else if (kind === "ledger") {
-        const value: Ledger = await api(
-          `/runs/${runId}/coverage?after=${encodeURIComponent(next ? (ledger?.next_cursor ?? "") : "")}`,
-        );
-        setLedger((previous) => ({
-          ...value,
-          items: next
-            ? [...(previous?.items ?? []), ...value.items]
-            : value.items,
-        }));
       }
     } catch (e) {
       setError((e as Error).message);
@@ -142,24 +99,12 @@ export function SourceGraph({
       {(graph.unsupported_files > 0 || graph.parse_error_files > 0) && (
         <p className="banner">
           구조 분석 미지원 {graph.unsupported_files}개 · 구문 오류{" "}
-          {graph.parse_error_files}개 파일. 원본은 문서 누락 대조에 포함합니다.
-        </p>
-      )}
-      {coverage && (
-        <p className={coverage.missing ? "banner" : undefined}>
-          원본 대조 {coverage.complete ? "완료" : "진행 중"}: {coverage.checked}
-          개 확인 · 설명 확인 {coverage.covered}개 · 범위 밖{" "}
-          {coverage.out_of_scope}개 · 누락 {coverage.missing}개
+          {graph.parse_error_files}개 파일. 해당 원본은 구조 없이 보존합니다.
         </p>
       )}
       <button disabled={busy} onClick={() => void load("files")}>
         파일별 그래프 보기
       </button>{" "}
-      {coverage && (
-        <button disabled={busy} onClick={() => void load("ledger")}>
-          설명 확인·제외 이유 보기
-        </button>
-      )}
       {error && <p role="alert">{error}</p>}
       {files && (
         <ul>
@@ -217,32 +162,6 @@ export function SourceGraph({
             </button>
           )}
         </section>
-      )}
-      {ledger?.items.map((item, i) => (
-        <details key={i}>
-          <summary>{item.path}</summary>
-          <ul>
-            {item.assessments.map((a) => (
-              <li key={a.id}>
-                <strong>
-                  {a.status === "covered"
-                    ? "설명 확인"
-                    : a.status === "out_of_scope"
-                      ? "범위 밖"
-                      : "누락"}
-                </strong>{" "}
-                · {item.obligations.find((o) => o.id === a.id)?.subject}
-                <p>{a.reason}</p>
-                {a.quote && <blockquote>{a.quote}</blockquote>}
-              </li>
-            ))}
-          </ul>
-        </details>
-      ))}
-      {ledger?.has_more && (
-        <button disabled={busy} onClick={() => void load("ledger", true)}>
-          대조 기록 더 보기
-        </button>
       )}
     </details>
   );

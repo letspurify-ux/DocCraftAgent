@@ -4,7 +4,6 @@ mod budget;
 mod code_graph;
 mod composition;
 mod config;
-mod coverage;
 mod db;
 mod editorial;
 mod graph;

@@ -32,7 +32,6 @@ pub async fn understanding(
     let root = db::load_checkpoint(&pool, &id, "understanding:root").await?;
     let purpose = db::load_checkpoint(&pool, &id, "source_understanding").await?;
     let graph = db::load_checkpoint(&pool, &id, "graph:coverage").await?;
-    let document_coverage = db::load_checkpoint(&pool, &id, "coverage:document").await?;
     // Reduction nodes share the key prefix with the leaves this page shows, so a
     // raw page of checkpoints can hold none of them. Keep scanning until the
     // page is full, or the caller sees an empty page that still says has_more.
@@ -63,7 +62,7 @@ pub async fn understanding(
     }
     let counts=sqlx::query("SELECT COUNT(*) total,SUM(status='indexed') indexed,SUM(status='excluded') excluded,SUM(status='skipped') skipped FROM files WHERE run_id=?").bind(&id).fetch_one(&pool).await?;
     Ok(Json(
-        json!({"coverage":coverage,"graph":graph,"document_coverage":document_coverage,"purpose":purpose.map(|v|json!({"brief":v.get("brief"),"validation_unresolved":v.get("validation_unresolved").and_then(Value::as_bool).unwrap_or(false)})),"overview":root.and_then(|v|v.pointer("/discovery/brief").cloned()),"batches":nodes,"next_cursor":cursor,"has_more":has_more,"total_files":counts.try_get::<i64,_>("total")?}),
+        json!({"coverage":coverage,"graph":graph,"purpose":purpose.map(|v|json!({"brief":v.get("brief"),"validation_unresolved":v.get("validation_unresolved").and_then(Value::as_bool).unwrap_or(false)})),"overview":root.and_then(|v|v.pointer("/discovery/brief").cloned()),"batches":nodes,"next_cursor":cursor,"has_more":has_more,"total_files":counts.try_get::<i64,_>("total")?}),
     ))
 }
 
@@ -113,32 +112,6 @@ pub async fn graph(
     ))
 }
 
-#[utoipa::path(get,path="/api/v1/runs/{id}/coverage",params(("id"=String,Path),("after"=Option<String>,Query)),responses((status=200,body=Value)))]
-pub async fn coverage(
-    State(s): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Query(page): Query<Page>,
-) -> Result<Json<Value>, ApiError> {
-    let pool = s.db().await?;
-    let summary = db::load_checkpoint(&pool, &id, "coverage:document")
-        .await?
-        .unwrap_or(json!({}));
-    let scope = summary["scope"].as_str().unwrap_or_default();
-    let rows = sqlx::query("SELECT step,data FROM checkpoints WHERE run_id=? AND step LIKE 'coverage:item:%' AND step>? AND JSON_UNQUOTE(JSON_EXTRACT(data,'$.scope'))=? ORDER BY step LIMIT 21")
-        .bind(&id).bind(page.after.unwrap_or_default()).bind(scope).fetch_all(&pool).await?;
-    let more = rows.len() > 20;
-    let mut cursor = String::new();
-    let mut items = vec![];
-    for row in rows.into_iter().take(20) {
-        cursor = row.try_get("step")?;
-        items.push(serde_json::from_str::<Value>(
-            &row.try_get::<String, _>("data")?,
-        )?);
-    }
-    Ok(Json(
-        json!({"summary":summary,"items":items,"next_cursor":cursor,"has_more":more}),
-    ))
-}
 #[utoipa::path(get,path="/api/v1/runs/{id}/outline",params(("id"=String,Path)),responses((status=200,body=Value)))]
 pub async fn outline(
     State(s): State<Arc<AppState>>,

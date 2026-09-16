@@ -1366,10 +1366,11 @@ async fn review_coherence(
 // the other-section titles and a retained previous_error.
 const REVIEW_REQUEST_OVERHEAD_BYTES: usize = 8_000;
 
-// Instruction and rule blocks (~6 KB), the graph hint (4 KB), preserved details
-// (6 KB), two neighbour digests (4 KB) and, on a continuation, the retained tail
-// and headings (12 KB). The outline is measured separately.
-const SECTION_REQUEST_OVERHEAD_BYTES: usize = 34_000;
+// The parts of a section request whose size does not depend on the document:
+// the instruction and rule blocks (~6 KB), the graph hint (4 KB), the preserved
+// details (6 KB) and, on a continuation, the retained tail and headings (12 KB).
+// Everything that grows with the outline is measured instead.
+const SECTION_BOUNDED_RESERVE_BYTES: usize = 24_000;
 
 fn recoverable_generation_failure(e: &anyhow::Error) -> bool {
     let message = e.to_string();
@@ -1439,13 +1440,18 @@ async fn write_section(
     let mut input_reductions = 0u32;
     let mut retained_evidence = None;
     for attempt in 0..5u32 {
-        // Everything the request carries beside the evidence: the instruction
-        // and rule blocks, the graph hint and preserved details, the neighbour
-        // digests and, on a continuation, the retained tail and headings. The
-        // plan is measured because a long outline dwarfs the rest.
-        let overhead = SECTION_REQUEST_OVERHEAD_BYTES
-            .saturating_add(serde_json::to_vec(outline)?.len())
-            .saturating_add(ctx.snapshot.task.direction.len());
+        // Measure what this request already carries rather than estimating it.
+        // The plan, the outline, the neighbour digests and a correction all grow
+        // with the document, and a single constant covering them drifts out of
+        // date the moment an outline gains sections.
+        let carried = serde_json::to_vec(
+            &json!({"purpose":ctx.snapshot.task.direction,"title":plan.title,
+            "section_plan":plan,"document_plan":outline,"neighbor_drafts":neighbors,
+            "other_sections":outline.sections.iter().map(|s| &s.title).collect::<Vec<_>>(),
+            "correction":&correction,"previous_error":&last}),
+        )?
+        .len();
+        let overhead = carried.saturating_add(SECTION_BOUNDED_RESERVE_BYTES);
         let base = crate::budget::packing_limit(
             &ctx.snapshot.settings.llm,
             ctx.extra_margin.load(Ordering::Relaxed),

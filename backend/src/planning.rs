@@ -445,6 +445,11 @@ pub(crate) fn section_ceiling(branches: Option<usize>) -> usize {
     }
 }
 
+/// Whether descending from `here` to `next` lands closer to `target`.
+fn closer_level(here: usize, next: usize, target: usize) -> bool {
+    next <= target || next - target <= target.saturating_sub(here)
+}
+
 /// How many branches the planner is shown.
 ///
 /// An absolute threshold picked the level wrongly: the tree fans in by four, so
@@ -454,11 +459,6 @@ pub(crate) fn section_ceiling(branches: Option<usize>) -> usize {
 /// one level deeper and could be described by *fewer* branches - 52 leaves
 /// stopped at 13, 520 leaves at 9. The target follows the leaves instead, so
 /// the level chosen widens as the source does.
-/// Whether descending from `here` to `next` lands closer to `target`.
-fn closer_level(here: usize, next: usize, target: usize) -> bool {
-    next <= target || next - target <= target.saturating_sub(here)
-}
-
 fn branch_target(leaves: usize) -> usize {
     (leaves / 4).clamp(8, SECTIONS_MAX)
 }
@@ -470,7 +470,13 @@ const BRANCH_VIEW_BYTES: usize = 24_000;
 /// parts. Reported as unknown, or the ceiling would tighten below where it sat
 /// before the branches were consulted at all.
 fn branch_count(branches: &[serde_json::Value]) -> Option<usize> {
-    (!branches.is_empty()).then_some(branches.len())
+    // The trailing marker that names what could not be shown is not itself a
+    // branch, and a view that is only that marker describes none.
+    let counted = branches
+        .iter()
+        .filter(|b| b.get("branches_not_shown").is_none())
+        .count();
+    (counted > 0).then_some(counted)
 }
 
 /// The reduction tree's branches, as the topics each one covers.
@@ -981,6 +987,9 @@ mod tests {
         let huge: Vec<_> = (0..200).map(|_| branch(3, MAX_FINDINGS)).collect();
         let view = branch_view(&huge);
         assert!(serde_json::to_vec(&view)?.len() <= BRANCH_VIEW_BYTES);
+        // The marker is not a branch, so the ceiling is not raised by it.
+        assert_eq!(branch_count(&view), Some(view.len() - 1));
+        assert_eq!(branch_count(&[json!({"branches_not_shown": 9})]), None);
         let omitted = view
             .last()
             .and_then(|v| v["branches_not_shown"].as_u64())

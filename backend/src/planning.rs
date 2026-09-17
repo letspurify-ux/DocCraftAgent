@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 
-const PLAN_TEMPLATE: &str = "Return JSON {sections:[{title:string,key_points:[string],query:string,evidence_ids:[string],diagrams:[string]}],reader_goal:string,storyline:string}. Organize the code into clear sections and summarize its important behavior according to purpose. source_branches describes the parts the source was read in, each with the topics that part covers and how many files it holds; together they are the scope of this document. Cover every branch, and give a branch with more topics more sections than one with few, so the document grows with what the project does rather than staying a fixed size. Sections come from the branches and their topics, not from a template, and 1 to 32 bounds the result; do not pad thin branches to reach a number, and do not compress a large branch into one section because a smaller number looks tidier. Group related responsibilities and workflows, merging thin or overlapping topics. Do not force one section per file or impose a fixed template. Use an order that makes the actual code easy to follow: establish needed context before explaining processing, outputs and important alternative/error paths. Respect the user's explicit audience, scope, section count and diagram instructions. reader_goal briefly states what the document explains; storyline briefly explains the grouping and order. Each section needs a unique title, 1-12 concrete key_points, a query naming observed files/symbols for deeper reading, 1-{MAX_SECTION_ANCHORS} supplied evidence_ids, and diagrams as an array of diagram objectives (use [] if none). Share source evidence across sections when useful, but avoid repeating the same explanation. source_brief and supporting_findings contain previously checked observations, with uncertainties; use original evidence to resolve contradictions or add connections. Previously_read source anchors may support those existing observations when the original is omitted from this request. Missing excerpts and old uncertainties do not prove absent implementation. Do not invent runtime order, join independent workflows, or turn conditional paths into an unconditional sequence. Outline descriptions guide later writing and are not proof of execution. Keep titles under 300 UTF-8 bytes, each key point under 1500 bytes, query under 2000 bytes, reader_goal under 2000 bytes and storyline under 4000 bytes. Allocate at most 4 diagrams per section and respect max_diagrams across the whole document; do not repeat the overall diagram in each section. Use the requested language. Do not generate reader questions, requirement IDs, ownership tables or mandatory handoffs. Detailed transitions belong in the section prose.";
+const PLAN_TEMPLATE: &str = "Return JSON {sections:[{title:string,key_points:[string],query:string,evidence_ids:[string],diagrams:[string]}],reader_goal:string,storyline:string}. Organize the code into clear sections and summarize its important behavior according to purpose. source_branches describes the parts the source was read in, each with the topics that part covers and how many files it holds; together they are the scope of this document. Cover every branch, and give a branch with more topics more sections than one with few, so the document grows with what the project does rather than staying a fixed size. Sections come from the branches and their topics, not from a template, and section_ceiling bounds the result; do not pad thin branches to reach a number, and do not compress a large branch into one section because a smaller number looks tidier. Group related responsibilities and workflows, merging thin or overlapping topics. Do not force one section per file or impose a fixed template. Use an order that makes the actual code easy to follow: establish needed context before explaining processing, outputs and important alternative/error paths. Respect the user's explicit audience, scope, section count and diagram instructions. reader_goal briefly states what the document explains; storyline briefly explains the grouping and order. Each section needs a unique title, 1-12 concrete key_points, a query naming observed files/symbols for deeper reading, 1-{MAX_SECTION_ANCHORS} supplied evidence_ids, and diagrams as an array of diagram objectives (use [] if none). Share source evidence across sections when useful, but avoid repeating the same explanation. source_brief and supporting_findings contain previously checked observations, with uncertainties; use original evidence to resolve contradictions or add connections. Previously_read source anchors may support those existing observations when the original is omitted from this request. Missing excerpts and old uncertainties do not prove absent implementation. Do not invent runtime order, join independent workflows, or turn conditional paths into an unconditional sequence. Outline descriptions guide later writing and are not proof of execution. Keep titles under 300 UTF-8 bytes, each key point under 1500 bytes, query under 2000 bytes, reader_goal under 2000 bytes and storyline under 4000 bytes. Allocate at most 4 diagrams per section and respect max_diagrams across the whole document; do not repeat the overall diagram in each section. Use the requested language. Do not generate reader questions, requirement IDs, ownership tables or mandatory handoffs. Detailed transitions belong in the section prose.";
 pub(crate) static PLAN: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| with_limits(PLAN_TEMPLATE));
 
@@ -198,10 +198,12 @@ pub(crate) fn validate_outline(
     outline: &mut Outline,
     evidence: &[Evidence],
     maximum: Option<u32>,
+    branches: Option<usize>,
 ) -> Result<()> {
+    let ceiling = section_ceiling(branches);
     ensure!(
-        !outline.sections.is_empty() && outline.sections.len() <= 32,
-        "Supply 1-32 sections"
+        !outline.sections.is_empty() && outline.sections.len() <= ceiling,
+        "Supply 1-{ceiling} sections"
     );
     ensure!(
         bounded_text(&outline.reader_goal, 2000) && bounded_text(&outline.storyline, 4000),
@@ -412,10 +414,41 @@ pub(crate) fn pack_evidence(groups: &[Vec<Evidence>], limit: usize) -> Vec<Evide
     selected
 }
 
-/// How many branches the planner is shown. Descending stops once a level has at
-/// least this many nodes, so a small project keeps its shallow tree and a large
-/// one is described by its parts rather than by one summary of everything.
-const BRANCH_TARGET: usize = 8;
+/// The most sections one document may hold, however large the source.
+///
+/// A file a reader opens has to end somewhere, and past this the answer is more
+/// documents rather than a longer one.
+const SECTIONS_MAX: usize = 64;
+
+/// How many sections this document may hold.
+///
+/// Thirty-two was flat, so a project ten times the size was allowed exactly as
+/// much document, only coarser. The tree's branches are where the source's size
+/// becomes visible, so the ceiling follows them; the floor keeps a small project
+/// from being squeezed, and the model is still told to choose the smallest
+/// useful number, so this bounds the answer rather than setting it.
+/// `None` where the branches are not known - re-validating a stored outline,
+/// say. An unknown count must not mean a small one, or an outline that was
+/// valid when planned would be rejected the next time it is read.
+pub(crate) fn section_ceiling(branches: Option<usize>) -> usize {
+    match branches {
+        Some(n) => n.saturating_mul(3).clamp(12, SECTIONS_MAX),
+        None => SECTIONS_MAX,
+    }
+}
+
+/// How many branches the planner is shown.
+///
+/// An absolute threshold picked the level wrongly: the tree fans in by four, so
+/// the levels below the root measure roughly 1, 4, 16, 64 whatever the source,
+/// and the first level past a fixed eight lands somewhere in [8, 32) with no
+/// relation to how much was read. A source ten times larger only made the tree
+/// one level deeper and could be described by *fewer* branches - 52 leaves
+/// stopped at 13, 520 leaves at 9. The target follows the leaves instead, so
+/// the level chosen widens as the source does.
+fn branch_target(leaves: usize) -> usize {
+    (leaves / 4).clamp(8, SECTIONS_MAX)
+}
 /// Bytes the branch view may spend. Split evenly, so more branches each say
 /// less rather than the last ones saying nothing.
 const BRANCH_VIEW_BYTES: usize = 24_000;
@@ -438,9 +471,15 @@ pub(crate) async fn branch_topics(ctx: &RunContext) -> Result<Vec<serde_json::Va
         return Ok(vec![]);
     };
     let root: crate::understanding::Node = serde_json::from_value(root)?;
+    let leaves: Vec<String> = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:leaves")
+        .await?
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    let target = branch_target(leaves.len());
     let mut level = vec![root];
     loop {
-        if level.len() >= BRANCH_TARGET {
+        if level.len() >= target {
             break;
         }
         let mut next = vec![];
@@ -551,7 +590,7 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
             let mut input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
             "source_brief":brief,"supporting_findings":crate::purpose::context(&discovery),"source_branches":branches,"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"project_overview":inventory,"feedback":feedback,"revision":revision,
             "evidence":evidence,"max_diagrams":ctx.snapshot.task.max_diagrams,
-            "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{} Respect user feedback and preserve valid existing section IDs when supplied.", *PLAN)});
+            "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{} At most {} sections for this document. Respect user feedback and preserve valid existing section IDs when supplied.", *PLAN, section_ceiling(Some(branches.len())))});
             repair.apply(&mut input);
             if let Some(response) = &repair.response {
                 input["previous_section_dependencies"] = dependency_repair_context(response);
@@ -563,6 +602,7 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
                     &mut plan,
                     &discovery.evidence,
                     ctx.snapshot.task.max_diagrams,
+                    Some(branches.len()),
                 )?;
                 Ok(plan)
             });
@@ -734,6 +774,29 @@ pub async fn section_evidence(ctx: &RunContext, plan: &SectionPlan) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_document_widens_with_the_source_rather_than_a_fixed_ceiling() {
+        // The tree fans in by four, so a larger source only deepens it. Picking
+        // the branch level by an absolute threshold therefore described 520
+        // leaves with fewer branches than 52; the target follows the leaves.
+        assert!(branch_target(520) > branch_target(52));
+        assert!(branch_target(5200) >= branch_target(520));
+        // A small project is not squeezed by the same rule.
+        assert_eq!(branch_target(4), 8);
+        // Sections follow the branches, with a floor for a small project and an
+        // absolute limit because one file has to end somewhere.
+        assert!(
+            section_ceiling(Some(branch_target(520))) > section_ceiling(Some(branch_target(52)))
+        );
+        assert_eq!(section_ceiling(Some(0)), 12);
+        assert_eq!(section_ceiling(Some(usize::MAX)), SECTIONS_MAX);
+        // The old flat ceiling is no longer the answer for a large source.
+        assert!(section_ceiling(Some(branch_target(5200))) > 32);
+        // An outline re-read without its branches keeps the widest bound, or one
+        // that was valid when planned would be rejected on the next read.
+        assert_eq!(section_ceiling(None), SECTIONS_MAX);
+    }
 
     #[test]
     fn a_branch_view_describes_every_branch_inside_one_budget() -> Result<()> {
@@ -914,7 +977,7 @@ mod tests {
         assert_eq!(plan.sections[1].depends_on, vec![0]);
         assert_eq!(plan.sections[30].depends_on, vec![29]);
         assert_eq!(plan.sections[31].depends_on, vec![0, 30]);
-        validate_outline(&mut plan, &[source], Some(0))?;
+        validate_outline(&mut plan, &[source], Some(0), None)?;
         let stored = serde_json::to_value(&plan)?;
         assert!(stored["sections"][31].get("prerequisite_titles").is_none());
         assert_eq!(stored["sections"][31]["depends_on"], json!([0, 30]));
@@ -968,14 +1031,14 @@ mod tests {
         let mut plan =
             decode_generated_outline(&value.to_string(), &mut llm::JsonRepair::default())?;
         assert_eq!(plan.sections[1].depends_on, vec![0]);
-        validate_outline(&mut plan, std::slice::from_ref(&source), Some(0))?;
+        validate_outline(&mut plan, std::slice::from_ref(&source), Some(0), None)?;
         for (reference, reason) in [
             (1, "a self-reference"),
             (2, "a forward reference"),
             (3, "outside the section array"),
         ] {
             plan.sections[1].depends_on = vec![reference];
-            let error = validate_outline(&mut plan, std::slice::from_ref(&source), Some(0))
+            let error = validate_outline(&mut plan, std::slice::from_ref(&source), Some(0), None)
                 .err()
                 .context("an invalid dependency must be rejected")?
                 .to_string();
@@ -1009,27 +1072,28 @@ mod tests {
                 {"title":"Interpret the result","query":"finish","reader_question":"What does the result mean?","handoff":"","diagrams":[],"depends_on":[0],"evidence_ids":[&source.id[..8]]}
             ]
         }))?;
-        validate_outline(&mut plan, std::slice::from_ref(&source), Some(0))?;
+        validate_outline(&mut plan, std::slice::from_ref(&source), Some(0), None)?;
         assert_eq!(plan.sections[0].evidence_ids, vec![source.id.clone()]);
         plan.sections[0].depends_on = vec![1];
-        assert!(validate_outline(&mut plan, std::slice::from_ref(&source), None).is_err());
+        assert!(validate_outline(&mut plan, std::slice::from_ref(&source), None, None).is_err());
         plan.sections[0].depends_on.clear();
         plan.sections[0].handoff.clear();
-        validate_outline(&mut plan, std::slice::from_ref(&source), None)?;
+        validate_outline(&mut plan, std::slice::from_ref(&source), None, None)?;
         plan.sections[0].handoff = "Valid input".into();
         plan.sections[1].title = "  Prepare   INPUT  ".into();
-        assert!(validate_outline(&mut plan, std::slice::from_ref(&source), None).is_err());
+        assert!(validate_outline(&mut plan, std::slice::from_ref(&source), None, None).is_err());
         plan.sections[1].title = "Interpret result".into();
         plan.sections[1].reader_question = "What does the result mean?".into();
         plan.sections[1].evidence_ids.clear();
-        assert!(validate_outline(&mut plan, &[source], None).is_err());
+        assert!(validate_outline(&mut plan, &[source], None, None).is_err());
         Ok(())
     }
 
     #[test]
-    fn outline_accepts_small_and_32_section_plans_but_rejects_33() -> Result<()> {
+    fn an_outline_is_bounded_by_the_branches_it_was_planned_from() -> Result<()> {
         let source = evidence("/project/a.py", "def process(): return 1");
-        for count in [0, 1, 8, 9, 16, 32, 33] {
+        // Read back without its branches, an outline keeps the widest bound.
+        for count in [0, 1, 8, 9, 16, 32, SECTIONS_MAX, SECTIONS_MAX + 1] {
             let sections = (0..count)
                 .map(|index| {
                     json!({
@@ -1045,11 +1109,20 @@ mod tests {
                 "reader_goal":"Understand processing","storyline":"Follow distinct steps",
                 "terminology":[],"sections":sections
             }))?;
-            let result = validate_outline(&mut plan, std::slice::from_ref(&source), Some(0));
+            let result = validate_outline(&mut plan, std::slice::from_ref(&source), Some(0), None);
             assert_eq!(
                 result.is_ok(),
-                (1..=32).contains(&count),
+                (1..=SECTIONS_MAX).contains(&count),
                 "section count {count}: {result:?}"
+            );
+            // Planned from four branches, the same outline is held to twelve:
+            // sections follow what the source was read in, not a flat number.
+            let narrow =
+                validate_outline(&mut plan, std::slice::from_ref(&source), Some(0), Some(4));
+            assert_eq!(
+                narrow.is_ok(),
+                (1..=12).contains(&count),
+                "narrow section count {count}: {narrow:?}"
             );
         }
         Ok(())
@@ -1066,7 +1139,7 @@ mod tests {
                     "owns_requirement_ids":"obsolete metadata"})).collect::<Vec<_>>()});
             let mut plan =
                 decode_generated_outline(&response.to_string(), &mut llm::JsonRepair::default())?;
-            validate_outline(&mut plan, std::slice::from_ref(&e), Some(0))?;
+            validate_outline(&mut plan, std::slice::from_ref(&e), Some(0), None)?;
             assert!(plan.requirements.is_empty());
             assert!(plan.sections.iter().all(|s| s.reader_question.is_empty()
                 && s.handoff.is_empty()

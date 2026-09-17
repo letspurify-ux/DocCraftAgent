@@ -212,7 +212,7 @@ async fn revise_inner(s: Arc<AppState>, id: String, edit: Revision) -> Result<Va
                 .await?
                 .context("원본 근거가 없는 과거 실행은 피드백으로 목차를 다시 생성하세요")?,
         )?;
-        planning::validate_outline(plan, &discovery.evidence, snapshot.task.max_diagrams)?;
+        planning::validate_outline(plan, &discovery.evidence, snapshot.task.max_diagrams, None)?;
     } else {
         ensure!(
             edit.feedback.as_ref().is_some_and(|v| !v.trim().is_empty()),

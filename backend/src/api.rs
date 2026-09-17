@@ -127,6 +127,7 @@ pub struct Cursor {
         RunId,
         EventView,
         SectionPlan,
+        BranchExclusion,
         Outline,
         Issue
     ))

@@ -2,7 +2,7 @@
 //! Preserve detailed observations and originals without inventing a question list.
 use crate::{
     db, editorial, llm,
-    model::{Evidence, TaskConfig},
+    model::{Evidence, Outline, TaskConfig},
     planning::{Discovery, Finding, SourceBrief, evidence_budget, pack_evidence, validate_brief},
     runner::{RunContext, fatal, is_budget},
     source,
@@ -224,9 +224,9 @@ async fn read_sources(
         let evidence = pack_evidence(&groups, limit);
         let available = merge_evidence(&[evidence.clone(), prior.evidence.clone()]);
         let mut input = json!({"phase":"purpose_reading","purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
-            "verified_overview":prior.brief,"supporting_findings":context(prior),
-            "source_anchors":prior.evidence.iter().map(|e|json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),
-            "evidence":evidence,"evidence_classes":available.iter().map(|e|json!({"id":e.id,"path":e.path,"runtime_allowed":source::is_implementation(&e.path)})).collect::<Vec<_>>(),
+            "verified_overview":prior.brief,"supporting_findings":context(prior, true),
+            "source_anchors":crate::planning::anchors(&prior.evidence, &evidence),
+            "evidence":crate::planning::classified(&evidence),
             "open_questions":prior.brief.uncertainties,"final_pass":final_pass,"attempt":attempt+1,"previous_error":error,
             "finding_kind_policy":crate::planning::FINDING_KIND_POLICY,"instruction":READ.as_str()});
         repair.apply(&mut input);
@@ -345,11 +345,15 @@ pub(crate) fn pack(discovery: &Discovery, limit: usize) -> Vec<Evidence> {
 }
 
 /// Bounded view only. Keep full detailed observations and their originals stored.
-pub(crate) fn context(discovery: &Discovery) -> Vec<Value> {
+/// A request that never cites a passage is sent the observations without ids.
+pub(crate) fn context(discovery: &Discovery, with_ids: bool) -> Vec<Value> {
     let mut result = vec![];
     let per = 20_000 / discovery.details.len().max(1);
     for f in &discovery.details {
         let mut view = json!(f);
+        if !with_ids && let Some(object) = view.as_object_mut() {
+            object.remove("evidence_ids");
+        }
         let overhead = view.to_string().len().saturating_sub(f.observation.len()) + 40;
         let limit = per.saturating_sub(overhead);
         view["observation"] = json!(editorial::excerpt(&f.observation, limit));
@@ -366,28 +370,16 @@ pub(crate) async fn section_memory(
     evidence: &[Evidence],
     limit: usize,
 ) -> Result<Value> {
-    let leaves: Vec<String> = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:leaves")
-        .await?
-        .map(serde_json::from_value)
-        .transpose()?
-        .unwrap_or_default();
+    let tree = crate::understanding::tree(ctx).await?;
     let (mut used, mut deferred) = (0usize, 0usize);
     let mut findings = vec![];
     let mut seen = HashSet::new();
-    for key in leaves {
-        ctx.check()?;
-        let Some(value) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? else {
+    for key in &tree.leaves {
+        let Some(node) = tree.nodes.get(key) else {
             continue;
         };
-        let node: Node = serde_json::from_value(value)?;
-        for finding in node
-            .discovery
-            .brief
-            .findings
-            .iter()
-            .chain(&node.discovery.details)
-        {
-            let matches = node.discovery.evidence.iter().any(|original| {
+        for finding in node.observations() {
+            let matches = node.spans.iter().any(|original| {
                 finding.evidence_ids.contains(&original.id)
                     && evidence.iter().any(|e| {
                         e.path == original.path
@@ -414,6 +406,210 @@ pub(crate) async fn section_memory(
     Ok(
         json!({"findings":findings,"deferred_findings":deferred,"policy":"Preserved observations for navigation. Cite only original evidence supplied to this writing request after verifying each claim."}),
     )
+}
+
+/// The leaves of this section's branches that it explains, most relevant first,
+/// and how many it leaves to other sections.
+///
+/// Sections that share a branch used to receive the same observations - the
+/// first of each leaf, in reading order, up to one request's budget - so the
+/// rest of a large branch reached none of them. A leaf several sections can
+/// reach now goes to the one whose title, key points and query it matches best;
+/// ties are spread by reading order so that no section takes them all. Every
+/// section computes the same assignment, so each leaf has exactly one owner.
+pub(crate) fn assign_leaves(
+    tree: &crate::understanding::TreeIndex,
+    outline: &Outline,
+    index: usize,
+    mine: &[String],
+) -> (Vec<String>, usize) {
+    // Every section's claims, not only this one's: a tie is broken by how many
+    // ties each section has already won, and that count has to come out the
+    // same whichever section is asking.
+    let mut claims: HashMap<&str, Vec<usize>> = HashMap::new();
+    let reached: Vec<Vec<String>> = outline
+        .sections
+        .iter()
+        .map(|section| {
+            if section.branches.is_empty() {
+                vec![]
+            } else {
+                tree.leaves_under(&section.branches)
+            }
+        })
+        .collect();
+    for (section, leaves) in reached.iter().enumerate() {
+        for leaf in leaves {
+            claims.entry(leaf.as_str()).or_default().push(section);
+        }
+    }
+    let terms: Vec<Vec<String>> = outline
+        .sections
+        .iter()
+        .map(|s| {
+            source::search_terms(&format!(
+                "{} {} {}",
+                s.title,
+                s.key_points.join(" "),
+                s.query
+            ))
+        })
+        .collect();
+    let text = |leaf: &str| {
+        tree.nodes.get(leaf).map_or(String::new(), |node| {
+            node.observations()
+                .map(|f| format!("{} {}", f.topic, f.observation))
+                .chain(node.spans.iter().map(|s| s.path.clone()))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        })
+    };
+    let score = |text: &str, section: usize| {
+        terms[section]
+            .iter()
+            .filter(|term| text.contains(term.as_str()))
+            .count()
+    };
+    let mut owner: HashMap<&str, usize> = HashMap::new();
+    let mut won = vec![0usize; outline.sections.len()];
+    for leaf in &tree.leaves {
+        let Some(candidates) = claims.get(leaf.as_str()) else {
+            continue;
+        };
+        if candidates.len() < 2 {
+            continue;
+        }
+        let text = text(leaf);
+        let scores: Vec<usize> = candidates.iter().map(|c| score(&text, *c)).collect();
+        let best = scores.iter().copied().max().unwrap_or(0);
+        let chosen = candidates
+            .iter()
+            .zip(&scores)
+            .filter(|(_, s)| **s == best)
+            .map(|(c, _)| *c)
+            .min_by_key(|c| (won[*c], *c))
+            .unwrap_or(candidates[0]);
+        won[chosen] += 1;
+        owner.insert(leaf.as_str(), chosen);
+    }
+    let mut kept = vec![];
+    let mut elsewhere = 0;
+    for leaf in mine {
+        if owner.get(leaf.as_str()).is_some_and(|o| *o != index) {
+            elsewhere += 1;
+            continue;
+        }
+        kept.push((score(&text(leaf), index), leaf.clone()));
+    }
+    // Most relevant first; the sort is stable, so reading order breaks ties.
+    kept.sort_by(|a, b| b.0.cmp(&a.0));
+    (kept.into_iter().map(|(_, leaf)| leaf).collect(), elsewhere)
+}
+
+/// The readings of the source a section was planned to cover, and the passages
+/// they rest on.
+///
+/// Whole-source reading visits every passage, but a writer used to see only the
+/// observations that overlapped what its search happened to retrieve, so the
+/// reading could not tell it what the search had missed. A section that names
+/// its branches gets their leaf observations as the list of behavior in its
+/// scope - one observation from every leaf before a second from any, so a large
+/// branch is described across its whole breadth - and the passages behind the
+/// shown observations as evidence it may pack.
+pub(crate) async fn branch_memory(
+    ctx: &RunContext,
+    outline: &Outline,
+    index: usize,
+    limit: usize,
+) -> Result<(Value, Vec<Evidence>)> {
+    let Some(plan) = outline.sections.get(index) else {
+        return Ok((Value::Null, vec![]));
+    };
+    if plan.branches.is_empty() {
+        return Ok((Value::Null, vec![]));
+    }
+    let tree = crate::understanding::tree(ctx).await?;
+    let mine = tree.leaves_under(&plan.branches);
+    let (leaves, elsewhere) = assign_leaves(&tree, outline, index, &mine);
+    let roots = &ctx.snapshot.task.sources;
+    let relative = |path: &str| {
+        roots
+            .iter()
+            .filter_map(|root| path.strip_prefix(&format!("{}/", root.trim_end_matches('/'))))
+            .min_by_key(|rest| rest.len())
+            .unwrap_or(path)
+            .to_string()
+    };
+    let mut shown = vec![];
+    let mut cited: Vec<(String, String)> = vec![];
+    let (mut used, mut deferred) = (0usize, 0usize);
+    let deepest = leaves
+        .iter()
+        .filter_map(|key| tree.nodes.get(key))
+        .map(|node| node.observations().count())
+        .max()
+        .unwrap_or(0);
+    for round in 0..deepest {
+        for key in &leaves {
+            let Some(node) = tree.nodes.get(key) else {
+                continue;
+            };
+            let Some(finding) = node.observations().nth(round) else {
+                continue;
+            };
+            let sources: Vec<String> = node
+                .spans
+                .iter()
+                .filter(|span| finding.evidence_ids.contains(&span.id))
+                .map(|span| format!("{}:{}-{}", relative(&span.path), span.start, span.end))
+                .collect();
+            let record = json!({"topic":finding.topic,
+                "observation":editorial::excerpt(&finding.observation, 900),
+                "kind":finding.kind,"sources":sources});
+            let size = serde_json::to_vec(&record)?.len();
+            if used + size > limit {
+                deferred += 1;
+                continue;
+            }
+            used += size;
+            shown.push(record);
+            cited.extend(
+                finding
+                    .evidence_ids
+                    .iter()
+                    .map(|id| (key.clone(), id.clone())),
+            );
+        }
+    }
+    // Only the leaves that contributed a shown observation are opened for text.
+    let mut opened: HashMap<String, Vec<Evidence>> = HashMap::new();
+    let mut evidence = vec![];
+    let mut seen = HashSet::new();
+    for (key, id) in cited {
+        if !opened.contains_key(&key) {
+            ctx.check()?;
+            let passages = db::load_checkpoint(&ctx.pool, &ctx.id, &key)
+                .await?
+                .and_then(|value| serde_json::from_value::<Node>(value).ok())
+                .map(|node| node.discovery.evidence)
+                .unwrap_or_default();
+            opened.insert(key.clone(), passages);
+        }
+        if let Some(passage) = opened
+            .get(&key)
+            .and_then(|passages| passages.iter().find(|e| e.id == id))
+            && seen.insert(id)
+        {
+            evidence.push(passage.clone());
+        }
+    }
+    Ok((
+        json!({"findings":shown,"deferred_findings":deferred,"leaves":leaves.len(),
+            "leaves_left_to_other_sections":elsewhere,
+            "policy":"What the whole-source reading found in the parts of the source this section covers, one observation per leaf before a second from any. It is the checklist of behavior in scope, not evidence: cite supplied passages."}),
+        evidence,
+    ))
 }
 
 #[cfg(test)]

@@ -108,7 +108,10 @@ impl TestRun {
                 extra_margin: AtomicU32::new(0),
                 graph_index: tokio::sync::OnceCell::new(),
                 cross_links: tokio::sync::OnceCell::new(),
+                tree_index: tokio::sync::OnceCell::new(),
                 json_mode_off: std::sync::atomic::AtomicBool::new(false),
+                density_samples: AtomicU32::new(0),
+                density_floor: AtomicU32::new(0),
             },
             _data: data,
         })

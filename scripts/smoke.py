@@ -1,11 +1,29 @@
 #!/usr/bin/env python3
 """Real local MariaDB + fault-injecting OpenAI mock. Never touches non-app databases."""
-import os, json, time, threading, subprocess, tempfile, pathlib, shutil, urllib.request, urllib.error, http.cookiejar, http.server, socket, socketserver, select
+import os, re, json, time, threading, subprocess, tempfile, pathlib, shutil, urllib.request, urllib.error, http.cookiejar, http.server, socket, socketserver, select
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 BINARY=ROOT/('target/debug/doccraft-agent.exe' if os.name=='nt' else 'target/debug/doccraft-agent')
 PORT=18765
 MOCK=18767
 requests=[]
+PASSAGE=re.compile(r'<passage id="([^"]*)"([^>]*)>\n(.*?)\n</passage id="\1">',re.S)
+def parse_request(content):
+    """The JSON a request was built from, with passage text put back in place."""
+    head,_,rest=content.partition('\n\n')
+    data=json.loads(head)
+    passages={}
+    for match in PASSAGE.finditer(rest):
+        attrs=dict(re.findall(r' (\w+)="([^"]*)"',match.group(2)))
+        attrs={k:v.replace('&quot;','"').replace('&amp;','&') for k,v in attrs.items()}
+        start,_,end=attrs.get('lines','0-0').partition('-')
+        passages[match.group(1)]={'id':match.group(1),'path':attrs.get('path'),'start':int(start or 0),'end':int(end or 0),'content':match.group(3),'runtime_allowed':attrs.get('runtime_allowed')=='true'}
+    def restore(value):
+        if isinstance(value,dict):
+            if isinstance(value.get('passage'),str) and value['passage'] in passages:return passages[value['passage']]
+            return {k:restore(v) for k,v in value.items()}
+        if isinstance(value,list):return [restore(v) for v in value]
+        return value
+    return restore(data)
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self,*args): pass
     def do_POST(self):
@@ -20,7 +38,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         content=payload['messages'][-1]['content']
         if content=='Reply with OK only.': result='OK'
         else:
-            data=json.loads(content)
+            data=parse_request(content)
             instruction=data.get('instruction','')
             if model=='restart-review' and data.get('correction') and data.get('title')=='오류와 제약' and not getattr(self.server,'repair_delayed',False):
                 self.server.repair_delayed=True;time.sleep(4)
@@ -243,7 +261,7 @@ def main():
                 if model=='review-once':assert r['tokens']>=1800,r
                 text=(out/(model+'.md')).read_text();assert 'Source references' in text and '```mermaid' in text
                 if model in ['normal','planning-followup','planning-citation-once','planning-dependency-once','simple-outline']:
-                    data=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and x['messages'][-1]['content']!='Reply with OK only.']
+                    data=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']==model and x['messages'][-1]['content']!='Reply with OK only.']
                     readings=[x for x in data if 'Read source evidence before planning' in x.get('instruction','')]
                     plans=[x for x in data if 'sections:[{title' in x.get('instruction','')]
                     writes=[x for x in data if 'Write only Markdown' in x.get('instruction','')]
@@ -265,14 +283,14 @@ def main():
                         assert len(plans)==1 and all(x.get('phase')!='document_intent' for x in data)
                         assert all(not w['section_plan']['owns_requirement_ids'] and not w['section_plan']['reader_question'] for w in writes)
                 if model=='section-parts':
-                    writes=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
+                    writes=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
                     assert len(writes)==6 and sum(bool(x.get('continuation')) for x in writes)==3
                     assert '<!-- DOCCRAFT_SECTION_MORE -->' not in text
                     assert '### 입력 확인' in text and '### 결과 확인' in text
                 if model in ['invalid-once','truncate-once','mermaid-once']:
-                    writes=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
+                    writes=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
                     assert writes[0]['evidence']==writes[1]['evidence'], 'Repair discarded evidence'
-                    assert len(writes[0]['other_sections'])==2
+                    assert len(writes[0]['document_plan']['sections'])==3 and sum(bool(x.get('this_request')) for x in writes[0]['document_plan']['sections'])==1
                     if model=='invalid-once':
                         assert writes[1]['correction']['previous']=='Unsupported claim [E:999999999]'
                         assert 'There is no fixed word-count ceiling' in writes[1]['instruction']
@@ -285,7 +303,7 @@ def main():
                         assert writes[1]['instruction']==writes[0]['instruction']
                         assert 'There is no fixed word-count ceiling' in writes[1]['instruction']
                 if model=='coherence-once':
-                    data=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model]
+                    data=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']==model]
                     reviews=[x for x in data if 'Review the whole document' in x.get('instruction','')]
                     assert len(reviews)==2, 'Global review did not trigger another iteration'
                     edits=[x for x in data if 'Write only Markdown' in x.get('instruction','') and x.get('correction')]
@@ -295,12 +313,12 @@ def main():
                     assert all('excerpted' in x for x in reviews[0]['sections'])
                     assert '[^s1]' in text and '[E:' not in text
                 if model=='diagram-overflow-once':
-                    writes=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
+                    writes=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Write only Markdown' in x['messages'][-1]['content']]
                     assert text.count('```mermaid')==3
                     assert len(writes)==3
                     assert 'contains 2' not in text
                 if model=='coherence-format-once':
-                    reviews=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Review the whole document' in x['messages'][-1]['content']]
+                    reviews=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Review the whole document' in x['messages'][-1]['content']]
                     assert len(reviews)==2 and 'Invalid review JSON' in reviews[1]['previous_error']
                     assert reviews[1]['valid_sections'][0]['index']==0
                 if model=='headings':
@@ -313,12 +331,12 @@ def main():
                     assert text.count('문서 생성기는 소스 근거를 검색하고 선택된 근거만 사용하여')==1
                     assert 'substantially duplicates' not in text
                 if model=='section-review-format-once':
-                    reviews=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Review this section' in x['messages'][-1]['content']]
+                    reviews=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']==model and 'Review this section' in x['messages'][-1]['content']]
                     assert len(reviews)>=2 and 'Invalid review JSON' in reviews[1]['previous_error']
                 print('PASS generation / repair:',model,flush=True)
             configure('planning-invalid');t=task('planning-invalid');rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
             assert r['status']=='failed' and not (out/'planning-invalid.md').exists(),r
-            invalid_requests=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='planning-invalid']
+            invalid_requests=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']=='planning-invalid']
             assert sum(x.get('phase')=='understanding_batch' for x in invalid_requests)==3
             assert not any('Write only Markdown' in x.get('instruction','') for x in invalid_requests)
             print('PASS invalid source understanding cannot fall back to a filename-only outline',flush=True)
@@ -326,7 +344,7 @@ def main():
             rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
             assert r['status']=='completed',r
             assert (out/'outline-overflow-once.md').read_text().count('```mermaid')==2
-            plans=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='outline-overflow-once' and 'sections:[{title' in x['messages'][-1]['content']]
+            plans=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']=='outline-overflow-once' and 'sections:[{title' in x['messages'][-1]['content']]
             assert len(plans)==2 and 'allocates 3' in plans[1]['previous_error']
             print('PASS outline total diagram cap and corrected re-planning',flush=True)
             configure('tight-budget')
@@ -358,7 +376,7 @@ def main():
             configure('draft-restructure');t=task('draft-restructure');t['max_iterations']=3;api('/tasks','POST',t)
             rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid);assert r['status']=='completed',r
             assert api(f'/runs/{rid}/outline')['outline']['revision']==2
-            global_reviews=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='draft-restructure' and 'Review the whole document' in x['messages'][-1]['content']]
+            global_reviews=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']=='draft-restructure' and 'Review the whole document' in x['messages'][-1]['content']]
             assert len(global_reviews)<=3 and len(global_reviews)>=2
             print('PASS draft restructuring stays within the shared three-iteration limit',flush=True)
             configure('quota-partial');t=task('quota-partial');rid=api(f"/tasks/{t['id']}/run",'POST')['id'];r=poll(rid)
@@ -410,7 +428,7 @@ def main():
             configure('restart-discovery');t=task('restart-discovery');rid=api(f"/tasks/{t['id']}/run",'POST')['id']
             end=time.monotonic()+30
             while time.monotonic()<end:
-                readings=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='restart-discovery']
+                readings=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']=='restart-discovery']
                 if any(x.get('final_pass') and x.get('phase')=='purpose_reading' for x in readings):break
                 time.sleep(.05)
             else:raise AssertionError('Follow-up source reading not reached')
@@ -419,14 +437,14 @@ def main():
                 try:api('/session');break
                 except Exception:time.sleep(.1)
             r=poll(rid);assert r['status']=='completed',r
-            readings=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='restart-discovery' and 'Read source evidence before planning' in x['messages'][-1]['content']]
+            readings=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']=='restart-discovery' and 'Read source evidence before planning' in x['messages'][-1]['content']]
             assert sum(x.get('phase')=='understanding_batch' for x in readings)==1, 'Completed whole-source batch repeated after restart'
             assert sum(x.get('phase')=='purpose_reading' and not x['final_pass'] for x in readings)==1
             print('PASS source-understanding restart retains initial reading and resumes missing-link research',flush=True)
             configure('restart-review');t=task('restart-review');rid=api(f"/tasks/{t['id']}/run",'POST')['id']
             end=time.monotonic()+30
             while time.monotonic()<end:
-                repairs=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='restart-review' and 'Write only Markdown' in x['messages'][-1]['content'] and json.loads(x['messages'][-1]['content']).get('correction')]
+                repairs=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']=='restart-review' and 'Write only Markdown' in x['messages'][-1]['content'] and parse_request(x['messages'][-1]['content']).get('correction')]
                 if len(repairs)>=2:break
                 time.sleep(.05)
             else:raise AssertionError('Repair phase not reached')
@@ -436,7 +454,7 @@ def main():
                 except Exception:time.sleep(.1)
             r=poll(rid);assert r['status']=='completed',r
             assert (out/'restart-review.md').read_text().count('빈 이름의 오류 조건')==3, 'Recovery lost pending review corrections'
-            repairs=[json.loads(x['messages'][-1]['content']) for x in requests if x['model']=='restart-review' and 'Write only Markdown' in x['messages'][-1]['content'] and json.loads(x['messages'][-1]['content']).get('correction')]
+            repairs=[parse_request(x['messages'][-1]['content']) for x in requests if x['model']=='restart-review' and 'Write only Markdown' in x['messages'][-1]['content'] and parse_request(x['messages'][-1]['content']).get('correction')]
             assert sum(x['title']=='기능 개요' for x in repairs)==1, 'Committed repair repeated'
             print('PASS review-phase restart retains issues and skips committed repairs',flush=True)
             proxy=DbProxy(('127.0.0.1',18769));threading.Thread(target=proxy.serve_forever,daemon=True).start()
@@ -477,7 +495,7 @@ def main():
                 after=page['files'][-1]['id']
             assert seen==expected,(len(seen),len(expected))
             coverage=api(f'/runs/{rid}/understanding')['coverage'];assert coverage['read_files']==512 and coverage['complete'],coverage
-            read_names={pathlib.Path(e['path']).name for x in requests if x['model']=='unlimited-files' for d in [json.loads(x['messages'][-1]['content'])] if d.get('phase')=='understanding_batch' for e in d['evidence']}
+            read_names={pathlib.Path(e['path']).name for x in requests if x['model']=='unlimited-files' for d in [parse_request(x['messages'][-1]['content'])] if d.get('phase')=='understanding_batch' for e in d['evidence']}
             assert read_names==expected, 'Some files were indexed but never read by the model'
             shutil.rmtree(many)
             print('PASS 512 long-path files: complete listing and complete source reading despite legacy max_files=1',flush=True)

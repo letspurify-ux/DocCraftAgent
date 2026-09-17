@@ -55,11 +55,238 @@ fn payload(c: &LlmConfig, messages: Value) -> Value {
     }
     p
 }
-fn prepared_request(c: &LlmConfig, system: &str, mut input: Value) -> Result<(Value, String)> {
+/// Request fields that read the same on every call of a kind, sent first so a
+/// provider that caches prompt prefixes can reuse them across calls.
+const STABLE_FIELDS: [&str; 12] = [
+    "instruction",
+    "passages",
+    "finding_kind_policy",
+    "classification_policy",
+    "preservation_policy",
+    "coverage_rules",
+    "accuracy_rules",
+    "review_accuracy_rules",
+    "structure_review",
+    "section_output_policy",
+    "phase",
+    "language",
+];
+
+const PASSAGE_NOTE: &str = "Passage text is not inside this JSON. Each {passage: ID} stands for the <passage id=ID> block after the JSON, which carries that passage's path, line range and verbatim source text. The ID is the evidence ID to cite; a passage has no other number.";
+
+/// Serialize a request with the fields that do not change between calls of a
+/// kind ahead of the ones that do. The model reads the same request; only the
+/// order moves. Written out by hand because a JSON map sorts its keys, which put
+/// `evidence` ahead of `instruction` and gave every call a different prefix.
+fn stable_first(input: &Value) -> String {
+    let Some(map) = input.as_object() else {
+        return input.to_string();
+    };
+    let mut keys: Vec<&String> = STABLE_FIELDS
+        .iter()
+        .filter_map(|key| map.get_key_value(*key).map(|(name, _)| name))
+        .collect();
+    keys.extend(
+        map.keys()
+            .filter(|name| !STABLE_FIELDS.contains(&name.as_str())),
+    );
+    let fields: Vec<String> = keys
+        .into_iter()
+        .map(|name| format!("{}:{}", Value::String(name.clone()), map[name]))
+        .collect();
+    format!("{{{}}}", fields.join(","))
+}
+
+/// Show paths against the source the task named. Every passage, anchor and
+/// graph record repeated the absolute root; the reader already knows it.
+fn relative_paths(value: &mut Value, roots: &[String]) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if key == "path"
+                    && let Value::String(path) = value
+                    && let Some(rest) = roots
+                        .iter()
+                        .filter_map(|root| {
+                            path.strip_prefix(&format!("{}/", root.trim_end_matches('/')))
+                        })
+                        .min_by_key(|rest| rest.len())
+                {
+                    *path = rest.to_string();
+                } else if key != "content" {
+                    relative_paths(value, roots);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                relative_paths(value, roots);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Move passage text out of the JSON and into blocks after it.
+///
+/// Source inside a JSON string reaches the model with every newline, quote and
+/// backslash escaped - one long line of `\n` and `\"` that costs bytes and
+/// reads worse than the code itself. Each passage object keeps its place in the
+/// JSON as `{passage: id}`; its text follows verbatim, once per id. The id is
+/// the only name a passage has: numbering the blocks gave a model a second
+/// name to cite, and it cited it. The closing tag repeats the id, which is a
+/// hash of the text it closes, so source cannot end its own block early.
+fn detach_passages(
+    value: &mut Value,
+    blocks: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    match value {
+        Value::Object(map) => {
+            let is_passage = ["id", "path", "content"]
+                .iter()
+                .all(|key| map.get(*key).is_some_and(Value::is_string))
+                && map.contains_key("start")
+                && map.contains_key("end");
+            if is_passage {
+                let text = |key: &str| map.get(key).and_then(Value::as_str).unwrap_or_default();
+                let attribute = |text: &str| text.replace('&', "&amp;").replace('"', "&quot;");
+                let id = text("id").to_string();
+                if !seen.insert(id.clone()) {
+                    *value = json!({"passage":id});
+                    return;
+                }
+                let mut header = format!(
+                    "<passage id=\"{}\" path=\"{}\" lines=\"{}-{}\"",
+                    attribute(&id),
+                    attribute(text("path")),
+                    map.get("start").map(Value::to_string).unwrap_or_default(),
+                    map.get("end").map(Value::to_string).unwrap_or_default(),
+                );
+                for (key, value) in map.iter() {
+                    if !["id", "path", "content", "start", "end"].contains(&key.as_str())
+                        && let Some(scalar) = match value {
+                            Value::Bool(b) => Some(b.to_string()),
+                            Value::Number(n) => Some(n.to_string()),
+                            Value::String(s) => Some(attribute(s)),
+                            _ => None,
+                        }
+                    {
+                        header.push_str(&format!(" {key}=\"{scalar}\""));
+                    }
+                }
+                blocks.push(format!(
+                    "{header}>\n{}\n</passage id=\"{}\">",
+                    text("content"),
+                    attribute(&id)
+                ));
+                *value = json!({"passage":id});
+                return;
+            }
+            for value in map.values_mut() {
+                detach_passages(value, blocks, seen);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                detach_passages(value, blocks, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The user message a request is sent as.
+fn render_input(mut input: Value, roots: &[String]) -> String {
     crate::editorial::compact_evidence_ids(&mut input);
+    relative_paths(&mut input, roots);
+    let mut blocks = vec![];
+    detach_passages(
+        &mut input,
+        &mut blocks,
+        &mut std::collections::HashSet::new(),
+    );
+    if !blocks.is_empty()
+        && let Some(map) = input.as_object_mut()
+    {
+        map.insert("passages".into(), json!(PASSAGE_NOTE));
+    }
+    let mut content = stable_first(&input);
+    for block in blocks {
+        content.push_str("\n\n");
+        content.push_str(&block);
+    }
+    content
+}
+
+/// The JSON a rendered user message was built from, with passage text restored.
+/// For tests and mock providers that inspect what a request carried.
+#[cfg(test)]
+pub fn restore_input(content: &str) -> Result<Value> {
+    let (head, rest) = content.split_once("\n\n").unwrap_or((content, ""));
+    let mut value: Value = serde_json::from_str(head)?;
+    let mut passages = std::collections::HashMap::new();
+    let mut rest = rest;
+    while let Some(open) = rest.find("<passage id=\"") {
+        let header_end = rest[open..].find(">\n").context("passage header")? + open;
+        let header = &rest[open..header_end];
+        let attribute = |name: &str| -> Option<String> {
+            let start = header.find(&format!(" {name}=\""))? + name.len() + 3;
+            let end = header[start..].find('"')? + start;
+            Some(
+                header[start..end]
+                    .replace("&quot;", "\"")
+                    .replace("&amp;", "&"),
+            )
+        };
+        let id = attribute("id").context("passage id")?;
+        let close = format!("\n</passage id=\"{}\">", id.replace('"', "&quot;"));
+        let body_start = header_end + 2;
+        let body_end = rest[body_start..].find(&close).context("passage close")? + body_start;
+        let lines = attribute("lines").unwrap_or_default();
+        let (start, end) = lines.split_once('-').unwrap_or(("0", "0"));
+        passages.insert(
+            id.clone(),
+            json!({"id":id,"path":attribute("path"),"start":start.parse::<u64>().unwrap_or(0),
+                "end":end.parse::<u64>().unwrap_or(0),"content":&rest[body_start..body_end],
+                "runtime_allowed":attribute("runtime_allowed").map(|v| v == "true")}),
+        );
+        rest = &rest[body_end + close.len()..];
+    }
+    fn restore(value: &mut Value, passages: &std::collections::HashMap<String, Value>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(id) = map.get("passage").and_then(Value::as_str)
+                    && let Some(passage) = passages.get(id)
+                {
+                    *value = passage.clone();
+                    return;
+                }
+                for value in map.values_mut() {
+                    restore(value, passages);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    restore(value, passages);
+                }
+            }
+            _ => {}
+        }
+    }
+    restore(&mut value, &passages);
+    Ok(value)
+}
+
+fn prepared_request(
+    c: &LlmConfig,
+    system: &str,
+    input: Value,
+    roots: &[String],
+) -> Result<(Value, String)> {
     let request = payload(
         c,
-        json!([{"role":"system","content":system},{"role":"user","content":input.to_string()}]),
+        json!([{"role":"system","content":system},{"role":"user","content":render_input(input, roots)}]),
     );
     let cache_key = hash(
         serde_json::to_string(&json!({"version":2,"endpoint":c.base_url,"request":request}))?
@@ -72,7 +299,12 @@ fn prepared_request(c: &LlmConfig, system: &str, mut input: Value) -> Result<(Va
 /// The next attempt or checkpoint resume must ask the provider again instead of
 /// deterministically replaying a poisoned cache entry.
 pub async fn forget(ctx: &RunContext, system: &str, input: Value) -> Result<()> {
-    let (_, cache_key) = prepared_request(&ctx.snapshot.settings.llm, system, input)?;
+    let (_, cache_key) = prepared_request(
+        &ctx.snapshot.settings.llm,
+        system,
+        input,
+        &ctx.snapshot.task.sources,
+    )?;
     sqlx::query("DELETE FROM llm_cache WHERE hash=?")
         .bind(cache_key)
         .execute(&ctx.pool)
@@ -130,7 +362,12 @@ async fn call_with(ctx: &RunContext, system: &str, mut input: Value, json: bool)
     let c = &ctx.snapshot.settings.llm;
     // The cache key is taken before this, so turning JSON mode on or off never
     // invalidates a cached answer or moves the key `forget` computes.
-    let (mut request, cache_key) = prepared_request(c, system, std::mem::take(&mut input))?;
+    let (mut request, cache_key) = prepared_request(
+        c,
+        system,
+        std::mem::take(&mut input),
+        &ctx.snapshot.task.sources,
+    )?;
     if json && !ctx.json_mode_off.load(std::sync::atomic::Ordering::Relaxed) {
         request["response_format"] = json!({"type": "json_object"});
     }
@@ -143,10 +380,11 @@ async fn call_with(ctx: &RunContext, system: &str, mut input: Value, json: bool)
             .await?;
         return Ok(row.try_get("data")?);
     }
+    let request_bytes = budget::estimate(&request)?;
     let estimated = if c.token_mode == "server" {
         count_tokens(ctx, &request).await?
     } else {
-        budget::estimate(&request)?
+        budget::estimate_at(&request, ctx.density())?
     };
     let b = budget::check(
         c,
@@ -275,7 +513,14 @@ async fn call_with(ctx: &RunContext, system: &str, mut input: Value, json: bool)
                     ctx.usage(input_tokens.saturating_add(output_tokens), actual_cost)
                         .await?;
                     ctx.event("llm_response",json!({"stage":"llm","input_tokens":input_tokens,"output_tokens":output_tokens,"reasoning_tokens":reasoning,"reservation_released":released,"usage_estimated":usage.get("prompt_tokens").and_then(Value::as_u64).is_none() || usage.get("completion_tokens").and_then(Value::as_u64).is_none(),"elapsed_ms":start.elapsed().as_millis() as u64,"cost":actual_cost})).await?;
-                    if input_tokens > b.input {
+                    // Measured usage teaches the run how dense its requests
+                    // are. A calibrated run that underestimated learns the
+                    // denser sample instead of widening every later margin.
+                    let calibrated = ctx.density() > budget::UNCALIBRATED_DENSITY;
+                    let sampled = c.token_mode != "server"
+                        && usage.get("prompt_tokens").and_then(Value::as_u64).is_some()
+                        && ctx.record_density(request_bytes, input_tokens);
+                    if input_tokens > b.input && !(calibrated && sampled) {
                         ctx.extra_margin
                             .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -308,6 +553,19 @@ async fn call_with(ctx: &RunContext, system: &str, mut input: Value, json: bool)
                     if output.trim().is_empty() {
                         bail!("API returned empty output");
                     }
+                    if usage
+                        .get("completion_tokens")
+                        .and_then(Value::as_u64)
+                        .is_some()
+                        && content_dropped(output.len(), output_tokens, reasoning)
+                    {
+                        ctx.event("content_dropped",json!({"stage":"llm","output_tokens":output_tokens,"reasoning_tokens":reasoning,"visible_bytes":output.len(),"title":"공급자가 응답 본문 일부를 제거했습니다. 캐시하지 않고 다시 요청합니다"})).await?;
+                        bail!(
+                            "PROVIDER_CONTENT_DROPPED: the provider billed {} visible output tokens but delivered only {} bytes, so part of the previous response was removed before it arrived - most often everything after a literal reasoning tag. Never write reasoning or chat-template tags with angle brackets (think, /think, im_start and the like); name them in words or in backticks without the brackets, such as the `think` tag",
+                            output_tokens.saturating_sub(reasoning.unwrap_or(0)),
+                            output.len()
+                        );
+                    }
                     sqlx::query("INSERT INTO llm_cache(hash,data) VALUES(?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)").bind(&cache_key).bind(&output).execute(&ctx.pool).await?;
                     return Ok(output);
                 }
@@ -331,6 +589,9 @@ async fn call_with(ctx: &RunContext, system: &str, mut input: Value, json: bool)
                 {
                     ctx.extra_margin
                         .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+                    // The request was packed at the calibrated density; the
+                    // provider disagrees, so the rest of the run stops trusting it.
+                    ctx.distrust_density();
                     bail!("CONTEXT_BUDGET: server requires smaller input");
                 }
                 if !retryable_status(status) {
@@ -485,6 +746,24 @@ pub async fn test(c: &LlmConfig) -> Result<Value> {
         json!({"ok":true,"latency_ms":start.elapsed().as_millis() as u64,"finish_reason":body.pointer("/choices/0/finish_reason"),"usage":body.get("usage"),"token_mode":c.token_mode,"note":"Probe validates connectivity and parameter acceptance; it cannot prove server token accounting."}),
     )
 }
+/// Whether a finished response lost most of its visible text on the way.
+///
+/// A provider that parses reasoning out of the completion treats a literal
+/// reasoning tag in the answer as the start of reasoning and removes everything
+/// after it, while still billing it as output. A section that explained a
+/// parser for those tags arrived cut at the tag - a thousand tokens of text
+/// against four thousand billed - and passed as finished. Text of any language
+/// carries well over a byte a token, so far less than that means text is
+/// missing. Only judged when the provider reports reasoning separately; where
+/// it does not, hidden reasoning would look the same.
+fn content_dropped(visible_bytes: usize, output_tokens: u64, reasoning: Option<u64>) -> bool {
+    let Some(reasoning) = reasoning else {
+        return false;
+    };
+    let visible = output_tokens.saturating_sub(reasoning);
+    visible >= 1_000 && (visible_bytes as u64).saturating_mul(10) < visible.saturating_mul(12)
+}
+
 fn reasoning_dominated(output: u64, reasoning: Option<u64>) -> bool {
     output > 0 && reasoning.is_some_and(|r| r.saturating_mul(100) / output >= 75)
 }
@@ -511,13 +790,118 @@ pub fn decode<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
         })?;
         Ok(value)
     }
-    match parse(trimmed) {
-        Ok(value) => Ok(value),
-        Err(original) => match extract_json_object(trimmed) {
-            Some(object) if object != trimmed => parse(object),
-            _ => Err(original),
-        },
+    let original = match parse(trimmed) {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    // A model quoting code often leaves a double quote bare inside a string,
+    // or copies a newline or a LaTeX backslash into it. Whole readings were
+    // being lost to one such character, so the text is repaired before the
+    // enclosing object is searched for.
+    let repaired = repair_json_strings(trimmed);
+    if let Some(repaired) = &repaired
+        && let Ok(value) = parse(repaired)
+    {
+        return Ok(value);
     }
+    for candidate in std::iter::once(trimmed).chain(repaired.as_deref()) {
+        if let Some(object) = extract_json_object(candidate)
+            && object != candidate
+            && let Ok(value) = parse(object)
+        {
+            return Ok(value);
+        }
+    }
+    Err(original)
+}
+
+/// Whether a double quote followed by `rest` ends a JSON string: what comes
+/// after it has to be what JSON allows after a string, one step further than
+/// the next character, so prose such as `{type: "math"} and` is not mistaken
+/// for the end of an object.
+fn closes_string(rest: &str) -> bool {
+    let mut next = rest.chars().filter(|c| !c.is_whitespace());
+    match next.next() {
+        None => true,
+        Some(':') => next.next().is_some_and(|c| {
+            matches!(c, '"' | '{' | '[' | '-' | 't' | 'f' | 'n') || c.is_ascii_digit()
+        }),
+        Some(',') => next.next().is_some_and(|c| matches!(c, '"' | '{' | '[')),
+        Some('}' | ']') => {
+            let mut after = next.next();
+            while matches!(after, Some('}' | ']')) {
+                after = next.next();
+            }
+            after.is_none_or(|c| c == ',')
+        }
+        _ => false,
+    }
+}
+
+/// Repair what models most often break inside JSON strings, or `None` when
+/// nothing needed repair.
+///
+/// A double quote inside a string closes it only when the next non-blank
+/// character is one that may follow a string - `,`, `:`, `}` or `]` - or the
+/// text ends; any other quote was meant as text and is escaped. Raw control
+/// characters are escaped, and a backslash that starts no valid escape is
+/// doubled. Valid JSON comes back unchanged.
+pub fn repair_json_strings(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut changed = false;
+    let mut in_string = false;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if !in_string {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+            continue;
+        }
+        match ch {
+            '\\' => match chars.peek().map(|(_, next)| *next) {
+                Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') => {
+                    out.push(ch);
+                    if let Some((_, next)) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                _ => {
+                    out.push_str("\\\\");
+                    changed = true;
+                }
+            },
+            '"' => {
+                let closes = closes_string(&text[index + 1..]);
+                if closes {
+                    in_string = false;
+                    out.push(ch);
+                } else {
+                    out.push_str("\\\"");
+                    changed = true;
+                }
+            }
+            '\n' => {
+                out.push_str("\\n");
+                changed = true;
+            }
+            '\r' => {
+                out.push_str("\\r");
+                changed = true;
+            }
+            '\t' => {
+                out.push_str("\\t");
+                changed = true;
+            }
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+                changed = true;
+            }
+            c => out.push(c),
+        }
+    }
+    changed.then_some(out)
 }
 
 /// Carry a bounded failed response into the caller's existing retry loop.
@@ -738,6 +1122,21 @@ mod quota_tests {
     }
 
     #[test]
+    fn a_response_that_lost_its_text_after_a_tag_is_not_accepted() {
+        // The measured case: 4,323 tokens billed, 118 of them reasoning, and
+        // 3,373 bytes of section delivered.
+        assert!(content_dropped(3_373, 4_323, Some(118)));
+        // Whole sections from the same run - Korean prose, code and citations -
+        // carried about 2.9 bytes a token and are kept.
+        assert!(!content_dropped(10_656, 3_708, Some(0)));
+        assert!(!content_dropped(9_498, 3_256, Some(157)));
+        // Short answers and providers that fold reasoning into output are not
+        // judged: there hidden reasoning would look like lost text.
+        assert!(!content_dropped(40, 300, Some(0)));
+        assert!(!content_dropped(2_000, 20_000, None));
+    }
+
+    #[test]
     fn exhausted_quota_is_distinct_from_transient_rate_limits() {
         assert!(reasoning_dominated(8192, Some(7712)));
         assert!(!reasoning_dominated(8192, None));
@@ -769,13 +1168,75 @@ mod quota_tests {
             base_url: "http://x/v1".into(),
             ..Default::default()
         };
-        let (request, key) = prepared_request(&c, "sys", json!({"a":1}))?;
+        let (request, key) = prepared_request(&c, "sys", json!({"a":1}), &[])?;
         // The field is attached by the caller, after the key is taken. Moving it
         // into the payload would change every key, stranding the whole cache and
         // making `forget` compute a different key than the call it must evict.
         assert!(request.get("response_format").is_none(), "{request}");
-        let (_, again) = prepared_request(&c, "sys", json!({"a":1}))?;
+        let (_, again) = prepared_request(&c, "sys", json!({"a":1}), &[])?;
         assert_eq!(key, again);
+        Ok(())
+    }
+
+    #[test]
+    fn passages_travel_as_verbatim_blocks_and_nothing_is_lost() -> Result<()> {
+        let code =
+            "fn main() {\n    println!(\"a \\\\ b\");\n}\n// </passage n=\"1\" id=\"deadbeef\">\n";
+        let id = crate::source::hash(code.as_bytes());
+        let other = crate::source::hash(b"other");
+        let input = json!({"phase":"understanding_batch","purpose":"p",
+            "evidence":[{"id":id,"path":"/work/project/src/main.rs","start":3,"end":6,"content":code,"runtime_allowed":true}],
+            "source_anchors":[{"id":other,"path":"/work/project/src/lib.rs","previously_read":true}],
+            "instruction":"Read ALL supplied passages."});
+        let roots = vec!["/work/project".to_string()];
+        let content = render_input(input.clone(), &roots);
+        // Stable instructions lead, so calls of a kind share a prefix.
+        assert!(
+            content.starts_with(r#"{"instruction":"Read ALL supplied passages.","passages":"#),
+            "{content}"
+        );
+        // The code is not escaped into the JSON: it follows as written.
+        let (head, _) = content.split_once("\n\n").context("blocks")?;
+        assert!(!head.contains("println"));
+        assert!(content.contains(code));
+        assert!(
+            content.contains(r#"path="src/main.rs" lines="3-6" runtime_allowed="true""#),
+            "{content}"
+        );
+        // A passage has one name, the id it is cited by, and no number.
+        assert!(!content.contains("<passage n="), "{content}");
+        // A passage that contains something shaped like a closing tag cannot end
+        // its own block: the real closing tag names the id, a hash of the text.
+        let restored = restore_input(&content)?;
+        let short = &restored["evidence"][0]["id"];
+        assert!(id.starts_with(short.as_str().context("alias")?));
+        assert_eq!(restored["evidence"][0]["content"], code);
+        assert_eq!(restored["evidence"][0]["path"], "src/main.rs");
+        assert_eq!(restored["evidence"][0]["start"], 3);
+        assert_eq!(restored["source_anchors"][0]["path"], "src/lib.rs");
+        assert_eq!(restored["purpose"], "p");
+        // Fewer bytes on the wire than the escaped form, once a passage is the
+        // size of a real one.
+        let body =
+            "    if value == \"x\" {\n        return Err(\"bad\".into());\n    }\n".repeat(200);
+        let passage =
+            json!({"evidence":[{"id":id,"path":"src/main.rs","start":1,"end":600,"content":body}]});
+        let mut escaped = passage.clone();
+        crate::editorial::compact_evidence_ids(&mut escaped);
+        let old = json!([{"role":"user","content":escaped.to_string()}]).to_string();
+        let new = json!([{"role":"user","content":render_input(passage, &roots)}]).to_string();
+        assert!(
+            new.len() * 100 < old.len() * 95,
+            "{} vs {}",
+            new.len(),
+            old.len()
+        );
+        // A request without passages is plain JSON, as before.
+        let plain = render_input(json!({"b":1,"instruction":"x"}), &roots);
+        assert_eq!(
+            serde_json::from_str::<Value>(&plain)?,
+            json!({"instruction":"x","b":1})
+        );
         Ok(())
     }
 
@@ -827,6 +1288,27 @@ mod quota_tests {
                 .as_str()
                 .is_some_and(|text| text.contains("untrusted"))
         );
+    }
+
+    #[test]
+    fn a_reading_with_a_bare_quote_or_backslash_is_repaired_not_lost() -> Result<()> {
+        // What a model wrote while quoting JavaScript and LaTeX: a bare quote
+        // pair, a raw newline and a backslash that starts no JSON escape.
+        let broken = "{\n  \"findings\": [\n    {\n      \"topic\": \"렌더링\",\n      \"observation\": \"calls render(\"text\") with {type: \"math\"} and \\( x \\)\nthen returns\",\n      \"kind\": \"runtime\",\n      \"evidence_ids\": [\"abcdef12\"]\n    }\n  ],\n  \"uncertainties\": [],\n  \"followup_queries\": []\n}";
+        assert!(serde_json::from_str::<Value>(broken).is_err());
+        let value: Value = decode(broken)?;
+        assert_eq!(
+            value["findings"][0]["observation"],
+            "calls render(\"text\") with {type: \"math\"} and \\( x \\)\nthen returns"
+        );
+        assert_eq!(value["findings"][0]["evidence_ids"][0], "abcdef12");
+        // Valid JSON is left exactly as it was, escapes included.
+        let valid = r#"{"a":"quote \" slash \\ tab \t","b":["x", "y"],"c":{"d":"e"}}"#;
+        assert_eq!(repair_json_strings(valid), None);
+        assert_eq!(decode::<Value>(valid)?["a"], "quote \" slash \\ tab \t");
+        // Something that is not JSON stays an error.
+        assert!(decode::<Value>("no json here").is_err());
+        Ok(())
     }
 
     #[test]

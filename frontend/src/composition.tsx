@@ -15,6 +15,7 @@ function normalizePlan(p: components["schemas"]["Outline"]): Outline {
     terminology: p.terminology ?? [],
     revision: p.revision ?? 0,
     requirements: p.requirements ?? [],
+    excluded_branches: p.excluded_branches ?? [],
     sections: p.sections.map((s) => ({
       ...s,
       id: s.id ?? "",
@@ -26,6 +27,7 @@ function normalizePlan(p: components["schemas"]["Outline"]): Outline {
       owns_requirement_ids: s.owns_requirement_ids ?? [],
       key_points: s.key_points ?? [],
       out_of_scope: s.out_of_scope ?? [],
+      branches: s.branches ?? [],
     })),
   };
 }
@@ -146,7 +148,7 @@ export function Composition({ run }: { run: Run }) {
     });
   }
   function add() {
-    if (!plan || plan.sections.length >= 32) return;
+    if (!plan || plan.sections.length >= 256) return;
     dirty.current = true;
     const section: Section = {
       id: crypto.randomUUID(),
@@ -156,10 +158,15 @@ export function Composition({ run }: { run: Run }) {
       handoff: "",
       diagrams: [],
       depends_on: [],
-      evidence_ids: plan.sections[0]?.evidence_ids ?? [],
+      // A section planned from source branches may carry no anchor, and a
+      // new one has no branch, so it borrows the first anchors it can find.
+      evidence_ids:
+        plan.sections.find((s) => s.evidence_ids.length > 0)?.evidence_ids ??
+        [],
       owns_requirement_ids: [],
       key_points: [],
       out_of_scope: [],
+      branches: [],
     };
     setPlan({ ...plan, sections: [...plan.sections, section] });
   }
@@ -383,7 +390,7 @@ export function Composition({ run }: { run: Run }) {
           ))}
           <div className="card-actions">
             <button
-              disabled={active || saving || plan.sections.length >= 32}
+              disabled={active || saving || plan.sections.length >= 256}
               onClick={add}
             >
               섹션 추가

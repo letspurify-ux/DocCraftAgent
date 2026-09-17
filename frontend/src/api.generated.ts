@@ -36,22 +36,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/runs/{id}/coverage": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["coverage"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/runs/{id}/graph": {
         parameters: {
             query?: never;
@@ -220,6 +204,11 @@ export interface components {
             /** Format: int32 */
             revision: number;
         };
+        /** @description A part of the source the plan deliberately leaves out, and why. */
+        BranchExclusion: {
+            branch: string;
+            reason: string;
+        };
         DbConfig: {
             /** @default doccraft_agent */
             database: string;
@@ -343,6 +332,11 @@ export interface components {
             tpm: number;
         };
         Outline: {
+            /**
+             * @description Parts of the source the purpose does not need, named so an omission and a
+             *     decision can be told apart.
+             */
+            excluded_branches?: components["schemas"]["BranchExclusion"][];
             reader_goal?: string;
             requirements?: components["schemas"]["Requirement"][];
             /** Format: int32 */
@@ -379,6 +373,8 @@ export interface components {
             updated_at: string;
         };
         SectionPlan: {
+            /** @description Parts of the source read tree this section covers, by node key. */
+            branches?: string[];
             /** @description Reading prerequisites, expressed as earlier zero-based section indices. */
             depends_on?: number[];
             diagrams?: string[] | null;
@@ -550,29 +546,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
-            };
-        };
-    };
-    coverage: {
-        parameters: {
-            query?: {
-                after?: string;
-            };
-            header?: never;
-            path: {
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
             };
         };
     };

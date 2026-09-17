@@ -196,8 +196,19 @@ fn markdown_headings(markdown: &str) -> Vec<&str> {
 }
 
 pub fn digest(sections: &[Section], byte_budget: usize) -> Vec<Value> {
-    let per = byte_budget / sections.len().max(1);
-    sections.iter().enumerate().map(|(index, section)| {
+    digest_range(sections, 0..sections.len(), byte_budget)
+}
+
+/// A digest of some of the sections, numbered as they sit in the whole
+/// document so a review of one stretch still names the section it means.
+pub fn digest_range(
+    sections: &[Section],
+    range: std::ops::Range<usize>,
+    byte_budget: usize,
+) -> Vec<Value> {
+    let range = range.start.min(sections.len())..range.end.min(sections.len());
+    let per = byte_budget / range.len().max(1);
+    sections[range.clone()].iter().zip(range).map(|(section, index)| {
         let mut text = section.markdown.clone();
         for e in &section.evidence { text = replace_citation(&text, &e.id, "[source]"); }
         let headings = markdown_headings(&text);

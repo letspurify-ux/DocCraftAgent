@@ -65,7 +65,7 @@ fn summary_compression_keeps_distinct_details_and_replaces_corrected_topics() ->
     assert_eq!(retained.details.len(), 1);
     assert_eq!(retained.details[0].topic, "cancel");
     let stored = serde_json::to_value(&retained)?;
-    let _ = context(&retained);
+    let _ = context(&retained, true);
     let _ = pack(&retained, 1024);
     assert_eq!(stored, serde_json::to_value(&retained)?);
     Ok(())
@@ -88,6 +88,72 @@ fn evidence_packing_balances_files_without_dropping_stored_originals() {
     assert_eq!(d.evidence.len(), 3);
 }
 
+#[test]
+fn sections_sharing_a_branch_split_its_leaves_instead_of_repeating_the_first() -> Result<()> {
+    use crate::understanding::{TreeIndex, TreeNode};
+    let leaf = |topic: &str| TreeNode {
+        files: vec![],
+        children: vec![],
+        findings: vec![Finding {
+            topic: topic.into(),
+            observation: format!("{topic} 처리를 설명한다"),
+            kind: FindingKind::Runtime,
+            evidence_ids: vec![],
+        }],
+        details: vec![],
+        spans: vec![],
+    };
+    let mut nodes = std::collections::HashMap::new();
+    let topics = ["취소", "재시도", "캐시", "인증", "취소 복구", "로그"];
+    let leaves: Vec<String> = (0..topics.len()).map(|i| format!("leaf{i}")).collect();
+    for (key, topic) in leaves.iter().zip(topics) {
+        nodes.insert(key.clone(), leaf(topic));
+    }
+    nodes.insert(
+        "branch".into(),
+        TreeNode {
+            children: leaves.clone(),
+            ..leaf("branch")
+        },
+    );
+    let tree = TreeIndex {
+        root: Some("branch".into()),
+        leaves: leaves.clone(),
+        nodes,
+    };
+    let outline: crate::model::Outline = serde_json::from_value(json!({"sections":[
+        {"title":"취소 흐름","query":"cancel","key_points":["취소와 복구"],"branches":["branch"]},
+        {"title":"인증과 캐시","query":"auth","key_points":["인증","캐시"],"branches":["branch"]},
+        {"title":"다른 절","query":"x","key_points":["x"],"branches":[]}
+    ]}))?;
+    let mine = tree.leaves_under(&["branch".to_string()]);
+    let (first, left_first) = assign_leaves(&tree, &outline, 0, &mine);
+    let (second, left_second) = assign_leaves(&tree, &outline, 1, &mine);
+    // Each leaf has exactly one owner among the sections that share the branch.
+    let mut all: Vec<&String> = first.iter().chain(&second).collect();
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), leaves.len());
+    assert_eq!(first.len() + second.len(), leaves.len());
+    assert_eq!(left_first, second.len());
+    assert_eq!(left_second, first.len());
+    // Matching leaves go to the section they match, most relevant first.
+    assert!(first.contains(&"leaf0".to_string()) && first.contains(&"leaf4".to_string()));
+    assert!(second.contains(&"leaf2".to_string()) && second.contains(&"leaf3".to_string()));
+    // Leaves neither matches are spread rather than all given to one section.
+    let unmatched = ["leaf1", "leaf5"];
+    assert!(
+        unmatched.iter().any(|l| first.contains(&l.to_string()))
+            && unmatched.iter().any(|l| second.contains(&l.to_string()))
+    );
+    // A branch nobody else names keeps all of its leaves.
+    let alone: crate::model::Outline = serde_json::from_value(
+        json!({"sections":[{"title":"전부","query":"q","key_points":[],"branches":["branch"]}]}),
+    )?;
+    assert_eq!(assign_leaves(&tree, &alone, 0, &mine), (mine.clone(), 0));
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires DOCCRAFT_TEST_DB_PORT pointing to a disposable MariaDB"]
 async fn summary_pipeline_skips_questions_recovers_and_reuses_general_reading() -> Result<()> {
@@ -97,7 +163,7 @@ async fn summary_pipeline_skips_questions_recovers_and_reuses_general_reading() 
     type Requests = Arc<Mutex<Vec<Value>>>;
     async fn respond(State(requests): State<Requests>, Json(payload): Json<Value>) -> Json<Value> {
         let data: Value =
-            serde_json::from_str(payload["messages"][1]["content"].as_str().unwrap_or("{}"))
+            crate::llm::restore_input(payload["messages"][1]["content"].as_str().unwrap_or("{}"))
                 .unwrap_or(json!({}));
         requests.lock().await.push(data.clone());
         let result = match data["phase"].as_str() {

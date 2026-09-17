@@ -51,42 +51,6 @@
         }
       }
     },
-    "/api/v1/runs/{id}/coverage": {
-      "get": {
-        "tags": [
-          "crate::composition"
-        ],
-        "operationId": "coverage",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "after",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/runs/{id}/graph": {
       "get": {
         "tags": [
@@ -492,6 +456,22 @@
           }
         }
       },
+      "BranchExclusion": {
+        "type": "object",
+        "description": "A part of the source the plan deliberately leaves out, and why.",
+        "required": [
+          "branch",
+          "reason"
+        ],
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
       "DbConfig": {
         "type": "object",
         "properties": {
@@ -711,6 +691,13 @@
           "sections"
         ],
         "properties": {
+          "excluded_branches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BranchExclusion"
+            },
+            "description": "Parts of the source the purpose does not need, named so an omission and a\ndecision can be told apart."
+          },
           "reader_goal": {
             "type": "string"
           },
@@ -854,6 +841,13 @@
           "query"
         ],
         "properties": {
+          "branches": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Parts of the source read tree this section covers, by node key."
+          },
           "depends_on": {
             "type": "array",
             "items": {

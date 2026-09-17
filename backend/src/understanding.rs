@@ -8,6 +8,7 @@ use crate::{
     source,
 };
 use anyhow::{Result, ensure};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
@@ -41,8 +42,8 @@ const SOURCE_INPUT_MAX_BYTES: usize = 96_000;
 // the next batch more source to read; tying the two together meant the cap
 // could not be raised without also enlarging every request.
 const MAX_BATCH_PASSAGES: usize = 36;
-// Instructions, policies and the per-evidence class table that ride along with
-// every understanding request. The structural hint is not in here: it scales
+// Instructions, policies and the source anchors that ride along with every
+// understanding request. The structural hint is not in here: it scales
 // with the request instead, so a small context window still leaves room to read
 // source rather than reserving a fixed block it cannot afford.
 const REQUEST_OVERHEAD_BYTES: usize = 16_000;
@@ -63,6 +64,167 @@ pub struct Node {
     pub unverified_brief: Option<SourceBrief>,
     #[serde(default)]
     pub unverified_output: Option<String>,
+}
+
+/// Where a finding's passage sits, without its text.
+#[derive(Clone, Deserialize)]
+pub(crate) struct Span {
+    pub id: String,
+    pub path: String,
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Deserialize)]
+struct LightDiscovery {
+    brief: SourceBrief,
+    #[serde(default)]
+    details: Vec<crate::planning::Finding>,
+    #[serde(default)]
+    evidence: Vec<Span>,
+}
+
+#[derive(Deserialize)]
+struct LightNode {
+    key: String,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    children: Vec<String>,
+    discovery: LightDiscovery,
+}
+
+/// One node of the reading tree, without the source text its checkpoint holds.
+pub(crate) struct TreeNode {
+    pub files: Vec<String>,
+    pub children: Vec<String>,
+    /// The node's own summary.
+    pub findings: Vec<crate::planning::Finding>,
+    /// Valid observations a failed validation kept beside the summary.
+    pub details: Vec<crate::planning::Finding>,
+    pub spans: Vec<Span>,
+}
+
+impl TreeNode {
+    /// Everything the node observed, its summary first.
+    pub fn observations(&self) -> impl Iterator<Item = &crate::planning::Finding> {
+        self.findings.iter().chain(&self.details)
+    }
+}
+
+/// The whole reading tree, read once per run.
+///
+/// Planning and every section request used to walk the tree by loading node
+/// checkpoints, each of which carries the full text of the passages it read, so
+/// a section on a large source parsed the whole source again to find a handful
+/// of observations.
+pub(crate) struct TreeIndex {
+    pub root: Option<String>,
+    /// Leaves in reading order.
+    pub leaves: Vec<String>,
+    pub nodes: HashMap<String, TreeNode>,
+}
+
+impl TreeIndex {
+    /// Levels from the root down, each covering the whole source: a node with
+    /// no children (a leaf passed through a reduction level) stays in the
+    /// levels below it rather than dropping out of them.
+    pub fn levels(&self) -> Vec<Vec<String>> {
+        let Some(root) = self.root.clone() else {
+            return vec![];
+        };
+        let mut levels = vec![vec![root]];
+        while let Some(level) = levels.last() {
+            let next: Vec<String> = level
+                .iter()
+                .flat_map(|key| match self.nodes.get(key) {
+                    Some(node) if !node.children.is_empty() => node
+                        .children
+                        .iter()
+                        .filter(|child| self.nodes.contains_key(*child))
+                        .cloned()
+                        .collect(),
+                    Some(_) => vec![key.clone()],
+                    None => vec![],
+                })
+                .collect();
+            if next.len() <= level.len() {
+                break;
+            }
+            levels.push(next);
+        }
+        levels
+    }
+
+    /// The leaves under `keys`, in reading order and each once.
+    pub fn leaves_under(&self, keys: &[String]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut result = vec![];
+        let mut pending: Vec<String> = keys.iter().rev().cloned().collect();
+        while let Some(key) = pending.pop() {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            match self.nodes.get(&key) {
+                Some(node) if node.children.is_empty() => result.push(key),
+                Some(node) => pending.extend(node.children.iter().rev().cloned()),
+                None => {}
+            }
+        }
+        result
+    }
+}
+
+pub(crate) async fn tree(ctx: &RunContext) -> Result<std::sync::Arc<TreeIndex>> {
+    ctx.tree_index
+        .get_or_try_init(|| async {
+            let mut nodes = HashMap::new();
+            let mut cursor = String::new();
+            loop {
+                ctx.check()?;
+                let rows = sqlx::query("SELECT step,data FROM checkpoints WHERE run_id=? AND step LIKE 'understanding:node:%' AND step>? ORDER BY step LIMIT 16")
+                    .bind(&ctx.id).bind(&cursor).fetch_all(&ctx.pool).await?;
+                if rows.is_empty() {
+                    break;
+                }
+                for row in rows {
+                    cursor = row.try_get("step")?;
+                    let Ok(node) =
+                        serde_json::from_str::<LightNode>(&row.try_get::<String, _>("data")?)
+                    else {
+                        continue;
+                    };
+                    nodes.insert(
+                        node.key,
+                        TreeNode {
+                            files: node.files,
+                            children: node.children,
+                            findings: node.discovery.brief.findings,
+                            details: node.discovery.details,
+                            spans: node.discovery.evidence,
+                        },
+                    );
+                }
+            }
+            let root = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:root")
+                .await?
+                .and_then(|v| v.get("key").and_then(|k| k.as_str()).map(str::to_string))
+                .filter(|key| nodes.contains_key(key));
+            let mut leaves: Vec<String> =
+                db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:leaves")
+                    .await?
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default();
+            leaves.retain(|key| nodes.contains_key(key));
+            Ok(std::sync::Arc::new(TreeIndex {
+                root,
+                leaves,
+                nodes,
+            }))
+        })
+        .await
+        .cloned()
 }
 
 /// Salvage independently validated observations; never relabel unsupported runtime claims.
@@ -147,8 +309,9 @@ fn recover_output(
         // inside an observation. Discarding the batch would lose the readings
         // the model did finish, and a leaf batch is the only place those
         // passages are ever read.
+        let repaired = llm::repair_json_strings(output);
         findings.extend(
-            llm::array_prefix(output, "findings")
+            llm::array_prefix(repaired.as_deref().unwrap_or(output), "findings")
                 .into_iter()
                 .filter_map(|v| serde_json::from_value(v).ok()),
         );
@@ -209,8 +372,8 @@ fn summary_limit(ctx: &RunContext) -> usize {
 }
 
 /// Bytes a reduction must carry before any original passage is re-read: every
-/// child summary, plus one `source_anchors` entry and one `evidence_classes`
-/// entry per retained original. Only what is left may be spent on originals.
+/// child summary, plus one `source_anchors` entry per retained original. Only
+/// what is left may be spent on originals.
 /// What one evidence id costs once the request has rewritten it to its alias.
 ///
 /// Aliases start at eight characters and lengthen only where two hashes share a
@@ -230,8 +393,10 @@ fn mandatory_bytes(children: &[Node]) -> Result<usize> {
             &child.discovery.brief,
             &child.discovery.evidence,
         )?);
+        // One source_anchors entry per retained original, which also carries
+        // its runtime class.
         for e in &child.discovery.evidence {
-            total = total.saturating_add(2 * (TRANSMITTED_ID_BYTES + e.path.len()) + 128);
+            total = total.saturating_add(TRANSMITTED_ID_BYTES + e.path.len() + 96);
         }
     }
     Ok(total)
@@ -299,7 +464,12 @@ async fn node(
             }
         }
     }
-    let anchors = children
+    let shown_evidence = if final_overview {
+        &[][..]
+    } else {
+        &evidence[..]
+    };
+    let cited_originals: Vec<Evidence> = children
         .iter()
         .flat_map(|n| {
             n.discovery.evidence.iter().filter(|e| {
@@ -310,16 +480,16 @@ async fn node(
                     .any(|f| f.evidence_ids.contains(&e.id))
             })
         })
-        .map(|e| json!({"id":e.id,"path":e.path,"previously_read":true}))
-        .collect::<Vec<_>>();
+        .cloned()
+        .collect();
+    let anchors = crate::planning::anchors(&cited_originals, shown_evidence);
     let summary_cap = summary_limit(ctx);
     let mut input = json!({"phase":if children.is_empty(){"understanding_batch"}else{"understanding_reduce"},
         "summary_budget_bytes":summary_cap,
-        "language":ctx.snapshot.task.language,"final_pass":true,"evidence":evidence,
+        "language":ctx.snapshot.task.language,"final_pass":true,"evidence":crate::planning::classified(&evidence),
         "summaries":summaries,"source_anchors":anchors,
-        "evidence_classes":available.iter().map(|e| json!({"id":e.id,"path":e.path,"runtime_allowed":source::is_implementation(&e.path)})).collect::<Vec<_>>(),
         "finding_kind_policy":crate::planning::FINDING_KIND_POLICY,
-        "classification_policy":"Use evidence_classes from the first attempt, including previously_read anchors. XML/configuration declarations are context: describe what is declared, not whether it is loaded or executed. Runtime observations must cite supplied implementation. If a batch has no implementation, return context observations only. On repair, preserve valid observations and rewrite only invalid ones; never merely relabel an unsupported execution claim.","instruction":if children.is_empty(){READ.as_str()}else{REDUCE.as_str()}});
+        "classification_policy":"runtime_allowed on each evidence passage and each previously_read source anchor says whether it can support a runtime finding. XML/configuration declarations are context: describe what is declared, not whether it is loaded or executed. Runtime observations must cite supplied implementation. If a batch has no implementation, return context observations only. On repair, preserve valid observations and rewrite only invalid ones; never merely relabel an unsupported execution claim.","instruction":if children.is_empty(){READ.as_str()}else{REDUCE.as_str()}});
     if children.is_empty()
         && let Some(object) = input.as_object_mut()
     {
@@ -328,7 +498,7 @@ async fn node(
     if children.is_empty() {
         input["source_graph"] = crate::graph::context(ctx, &evidence, graph_limit(ctx)).await?;
         input["preservation_policy"] = json!(
-            "This is an overview of preserved originals. Use graph symbols and branches to check important contracts; they carry names, not evidence IDs, so every finding still cites supplied passages. Every supplied evidence passage must be cited by at least one finding; do not silently leave a passage unread. Count them first and spread the citations across your findings so none is left over. The final document is independently checked against originals even when a fact does not fit this overview."
+            "This is an overview of preserved originals. Use graph symbols and branches to check important contracts; they carry names, not evidence IDs, so every finding still cites supplied passages. Every supplied evidence passage must be cited by at least one finding; do not silently leave a passage unread. Count them first and spread the citations across your findings so none is left over. Nothing later re-reads these passages to find what this reading left out, so a behavior missing here can be missing from the document: record it rather than trusting a later check."
         );
     } else {
         // A reduction reads its children's summaries, not their source, so the
@@ -592,6 +762,144 @@ fn plan_groups(costs: &[usize], limit: usize) -> Result<Vec<(usize, usize)>> {
     Ok(groups)
 }
 
+/// One reduction of a level, or a lone child passed through to the next level.
+async fn reduce_group(
+    ctx: &RunContext,
+    system: &str,
+    children: Vec<String>,
+    limit: usize,
+    final_overview: bool,
+) -> Result<(String, bool)> {
+    if let [only] = children.as_slice() {
+        return Ok((only.clone(), false));
+    }
+    let mut loaded = vec![];
+    for key in &children {
+        let value = db::load_checkpoint(&ctx.pool, &ctx.id, key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Missing source analysis node"))?;
+        loaded.push(serde_json::from_value::<Node>(value)?);
+    }
+    let evidence = if final_overview {
+        vec![]
+    } else {
+        pack_evidence(
+            &loaded
+                .iter()
+                .map(|n| n.discovery.evidence.clone())
+                .collect::<Vec<_>>(),
+            limit.saturating_sub(mandatory_bytes(&loaded)?),
+        )
+    };
+    Ok((
+        node(ctx, system, evidence, &loaded, final_overview)
+            .await?
+            .key,
+        true,
+    ))
+}
+
+/// Files kept for retrieval but left out of the whole-source reading, by path.
+///
+/// Decided from the file name and the head of its first chunk, which is where
+/// a generator leaves its marker.
+async fn reading_exclusions(ctx: &RunContext) -> Result<HashMap<String, &'static str>> {
+    let mut result = HashMap::new();
+    let mut seen = HashSet::new();
+    let mut after = 0u64;
+    loop {
+        ctx.check()?;
+        let rows = sqlx::query("SELECT c.id,c.path,LEFT(COALESCE(b.content,c.content),600) head FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.run_id=? AND c.start_line=1 AND c.id>? ORDER BY c.id LIMIT 256")
+            .bind(&ctx.id).bind(after).fetch_all(&ctx.pool).await?;
+        if rows.is_empty() {
+            return Ok(result);
+        }
+        for row in rows {
+            after = row.try_get("id")?;
+            let path: String = row.try_get("path")?;
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let head: Option<String> = row.try_get("head")?;
+            if let Some(reason) = source::reading_exclusion(&path, head.as_deref().unwrap_or("")) {
+                result.insert(path, reason);
+            }
+        }
+    }
+}
+
+/// What the reading left out, said in the coverage the run reports.
+fn exclusion_report(
+    ctx: &RunContext,
+    exclusions: &HashMap<String, &'static str>,
+    chunks: usize,
+) -> serde_json::Value {
+    let mut reasons = std::collections::BTreeMap::<&str, usize>::new();
+    for reason in exclusions.values() {
+        *reasons.entry(reason).or_default() += 1;
+    }
+    let roots = &ctx.snapshot.task.sources;
+    let mut paths: Vec<String> = exclusions
+        .keys()
+        .map(|path| {
+            roots
+                .iter()
+                .filter_map(|root| path.strip_prefix(&format!("{}/", root.trim_end_matches('/'))))
+                .min_by_key(|rest| rest.len())
+                .unwrap_or(path)
+                .to_string()
+        })
+        .collect();
+    paths.sort();
+    paths.truncate(20);
+    json!({"files":exclusions.len(),"chunks":chunks,"reasons":reasons,"paths":paths,
+        "note":"Lock, minified and generated files stay searchable for section writing but are not read in the whole-source pass."})
+}
+
+/// How much the whole-source reading will ask of the run, before it asks.
+///
+/// Rough by design - it assumes about 2.5 bytes a token and a minute a request -
+/// but it is said before the first request rather than discovered when the
+/// token or time budget runs out halfway through a large source.
+fn estimate(
+    ctx: &RunContext,
+    chunks: &[(u64, crate::graph::ChunkSpan, u64)],
+    limit: usize,
+    concurrency: usize,
+) -> serde_json::Value {
+    let packed: u64 = chunks
+        .iter()
+        .map(|(_, span, bytes)| bytes + span.path.len() as u64 + 256)
+        .sum();
+    let per_batch = (limit as u64 * 9 / 10).max(1);
+    let leaves = (packed.div_ceil(per_batch) as usize)
+        .max(chunks.len().div_ceil(MAX_BATCH_PASSAGES))
+        .max(1);
+    let reductions = reduction_work(leaves);
+    let requests = leaves + reductions;
+    let graph = graph_limit(ctx) as u64;
+    let input_bytes = packed
+        + leaves as u64 * (REQUEST_OVERHEAD_BYTES as u64 + graph)
+        + reductions as u64 * (limit as u64 + REQUEST_OVERHEAD_BYTES as u64 + graph);
+    let output_tokens = requests as u64 * summary_limit(ctx) as u64 / 3;
+    let tokens = input_bytes * 100 / 250 + output_tokens;
+    let task = &ctx.snapshot.task;
+    let remaining_tokens = task.max_tokens.saturating_sub(
+        ctx.reserved_tokens
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let minutes = requests.div_ceil(concurrency) as u64;
+    let remaining_minutes = task.max_seconds.saturating_sub(ctx.elapsed_before) / 60;
+    let within = tokens <= remaining_tokens && minutes <= remaining_minutes;
+    json!({"stage":"understanding",
+        "title":if within {"전체 소스 읽기 예상 규모"} else {"전체 소스 읽기 예상 규모가 작업 한도를 넘을 수 있습니다"},
+        "source_bytes":packed,"estimated_batches":leaves,"estimated_summaries":reductions,
+        "estimated_requests":requests,"estimated_tokens":tokens,"remaining_token_budget":remaining_tokens,
+        "estimated_minutes":minutes,"remaining_minutes":remaining_minutes,"concurrency":concurrency,
+        "within_budget":within,
+        "note":"Reading only, before planning and writing; assumes about 2.5 bytes per token and one minute per request."})
+}
+
 pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     // The node keys below stay at version 7 on purpose: a leaf's request did not
     // change, so its checkpoint is still valid and is reused. Only a reduction's
@@ -607,24 +915,16 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
         limit >= 1024,
         "CONTEXT_BUDGET: insufficient input space for whole-source reading"
     );
-    let total_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE run_id=?")
-        .bind(&ctx.id)
-        .fetch_one(&ctx.pool)
-        .await?;
-    ensure!(
-        total_chunks > 0,
-        "No source passages available for whole-source understanding"
-    );
-    ctx.event(
-        "source_progress",
-        json!({"stage":"understanding","title":"전체 소스 구현 읽기","read_batches":0,"read_chunks":0,"total_chunks":total_chunks}),
-    )
-    .await?;
+    // Requests already queue on the shared LLM slots; this only lets a run use
+    // the concurrency it was configured with instead of one request at a time.
+    let concurrency = ctx.snapshot.settings.llm.concurrency.max(1);
+    let exclusions = reading_exclusions(ctx).await?;
     let mut after = 0u64;
-    let mut source_chunks = Vec::<(u64, crate::graph::ChunkSpan)>::new();
+    let mut source_chunks = Vec::<(u64, crate::graph::ChunkSpan, u64)>::new();
+    let mut skipped_chunks = 0usize;
     loop {
         ctx.check()?;
-        let rows = sqlx::query("SELECT c.id,c.path,c.start_line,c.end_line FROM chunks c WHERE c.run_id=? AND c.id>? ORDER BY c.id LIMIT 64")
+        let rows = sqlx::query("SELECT c.id,c.path,c.start_line,c.end_line,COALESCE(LENGTH(COALESCE(b.content,c.content)),0) bytes FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.run_id=? AND c.id>? ORDER BY c.id LIMIT 256")
             .bind(&ctx.id).bind(after).fetch_all(&ctx.pool).await?;
         if rows.is_empty() {
             break;
@@ -632,19 +932,70 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
         for row in rows {
             let id: u64 = row.try_get("id")?;
             after = id;
+            let path: String = row.try_get("path")?;
+            if exclusions.contains_key(&path) {
+                skipped_chunks += 1;
+                continue;
+            }
             source_chunks.push((
                 id,
                 crate::graph::ChunkSpan {
-                    path: row.try_get("path")?,
+                    path,
                     start: row.try_get("start_line")?,
                     end: row.try_get("end_line")?,
                 },
+                row.try_get::<i64, _>("bytes")?.max(0) as u64,
             ));
         }
     }
+    // A source made only of lock or generated files is still a source; reading
+    // it is better than reading nothing.
+    let exclusions = if source_chunks.is_empty() && skipped_chunks > 0 {
+        skipped_chunks = 0;
+        after = 0;
+        loop {
+            let rows = sqlx::query("SELECT c.id,c.path,c.start_line,c.end_line,COALESCE(LENGTH(COALESCE(b.content,c.content)),0) bytes FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.run_id=? AND c.id>? ORDER BY c.id LIMIT 256")
+                .bind(&ctx.id).bind(after).fetch_all(&ctx.pool).await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let id: u64 = row.try_get("id")?;
+                after = id;
+                source_chunks.push((
+                    id,
+                    crate::graph::ChunkSpan {
+                        path: row.try_get("path")?,
+                        start: row.try_get("start_line")?,
+                        end: row.try_get("end_line")?,
+                    },
+                    row.try_get::<i64, _>("bytes")?.max(0) as u64,
+                ));
+            }
+        }
+        HashMap::new()
+    } else {
+        exclusions
+    };
+    let total_chunks = source_chunks.len();
+    ensure!(
+        total_chunks > 0,
+        "No source passages available for whole-source understanding"
+    );
+    let excluded_report = exclusion_report(ctx, &exclusions, skipped_chunks);
+    ctx.event(
+        "source_progress",
+        json!({"stage":"understanding","title":"전체 소스 구현 읽기","read_batches":0,"read_chunks":0,"total_chunks":total_chunks,"reading_excluded":excluded_report}),
+    )
+    .await?;
+    ctx.event(
+        "source_estimate",
+        estimate(ctx, &source_chunks, limit, concurrency),
+    )
+    .await?;
     let spans = source_chunks
         .iter()
-        .map(|(_, span)| span.clone())
+        .map(|(_, span, _)| span.clone())
         .collect::<Vec<_>>();
     let order = crate::graph::order_chunks(ctx, &spans).await?;
     ctx.event(
@@ -653,6 +1004,7 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     )
     .await?;
     let mut nodes = vec![];
+    let mut inflight = futures_util::stream::FuturesOrdered::new();
     let mut group: Vec<Evidence> = vec![];
     let mut size = 0;
     let mut chunks_read = 0;
@@ -700,13 +1052,17 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
                 let bytes = part.content.len() + part.path.len() + 256;
                 if (size + bytes > limit || group.len() >= MAX_BATCH_PASSAGES) && !group.is_empty()
                 {
-                    nodes.push(
-                        node(ctx, system, std::mem::take(&mut group), &[], false)
-                            .await?
-                            .key,
-                    );
+                    // Batches are still cut in reading order and collected in
+                    // it, so the leaves, their keys and the tree built over them
+                    // are exactly what one request at a time would produce.
+                    inflight.push_back(node(ctx, system, std::mem::take(&mut group), &[], false));
                     size = 0;
-                    ctx.event("source_batch", json!({"stage":"understanding","title":"전체 소스 구현 읽기","read_batches":nodes.len(),"read_chunks":chunks_read,"total_chunks":total_chunks})).await?;
+                    if inflight.len() >= concurrency
+                        && let Some(done) = inflight.next().await
+                    {
+                        nodes.push(done?.key);
+                        ctx.event("source_batch", json!({"stage":"understanding","title":"전체 소스 구현 읽기","read_batches":nodes.len(),"read_chunks":chunks_read,"total_chunks":total_chunks})).await?;
+                    }
                 }
                 size += bytes;
                 group.push(part);
@@ -715,7 +1071,10 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
         }
     }
     if !group.is_empty() {
-        nodes.push(node(ctx, system, group, &[], false).await?.key);
+        inflight.push_back(node(ctx, system, group, &[], false));
+    }
+    while let Some(done) = inflight.next().await {
+        nodes.push(done?.key);
         ctx.event("source_batch", json!({"stage":"understanding","title":"전체 소스 구현 읽기","read_batches":nodes.len(),"read_chunks":chunks_read,"total_chunks":total_chunks})).await?;
     }
     ensure!(
@@ -742,43 +1101,36 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
         // A narrower fan-out means more summaries than the four-way estimate.
         total_summaries = total_summaries.max(completed_summaries + level_total);
         let mut level_completed = 0usize;
-        for children in &groups {
-            if children.len() == 1 {
-                next.push(children[0].clone());
-                continue;
+        // The children's summaries and anchors are mandatory in a reduction;
+        // originals are re-read only with what is left over. The final
+        // synthesis is shown no originals at all, so packing them would spend
+        // the budget on passages it never sees and would let it cite an
+        // anchor it was never given.
+        let final_overview = groups.len() == 1;
+        let mut queued = groups.iter();
+        let mut work = futures_util::stream::FuturesOrdered::new();
+        loop {
+            while work.len() < concurrency
+                && let Some(children) = queued.next()
+            {
+                work.push_back(reduce_group(
+                    ctx,
+                    system,
+                    children.clone(),
+                    limit,
+                    final_overview,
+                ));
             }
-            let mut loaded = vec![];
-            for key in children {
-                let value = db::load_checkpoint(&ctx.pool, &ctx.id, key)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("Missing source analysis node"))?;
-                loaded.push(serde_json::from_value::<Node>(value)?);
-            }
-            // The children's summaries and anchors are mandatory in this
-            // request; originals are re-read only with what is left over. The
-            // final synthesis is shown no originals at all, so packing them
-            // would spend the budget on passages it never sees and would let it
-            // cite an anchor it was never given.
-            let final_overview = groups.len() == 1;
-            let evidence = if final_overview {
-                vec![]
-            } else {
-                pack_evidence(
-                    &loaded
-                        .iter()
-                        .map(|n| n.discovery.evidence.clone())
-                        .collect::<Vec<_>>(),
-                    limit.saturating_sub(mandatory_bytes(&loaded)?),
-                )
+            let Some(result) = work.next().await else {
+                break;
             };
-            next.push(
-                node(ctx, system, evidence, &loaded, final_overview)
-                    .await?
-                    .key,
-            );
-            level_completed += 1;
-            completed_summaries += 1;
-            ctx.event("source_connections", json!({"stage":"understanding","title":"모듈 역할과 흐름 종합","level":level,"completed":next.len(),"total":groups.len(),"level_completed":level_completed,"level_total":level_total,"completed_summaries":completed_summaries,"total_summaries":total_summaries})).await?;
+            let (key, summarized) = result?;
+            next.push(key);
+            if summarized {
+                level_completed += 1;
+                completed_summaries += 1;
+                ctx.event("source_connections", json!({"stage":"understanding","title":"모듈 역할과 흐름 종합","level":level,"completed":next.len(),"total":groups.len(),"level_completed":level_completed,"level_total":level_total,"completed_summaries":completed_summaries,"total_summaries":total_summaries})).await?;
+            }
         }
         nodes = next;
     }
@@ -793,7 +1145,8 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
             .bind(&ctx.id)
             .fetch_one(&ctx.pool)
             .await?;
-    let coverage = json!({"complete":root.unresolved_nodes == 0,"reading_complete":true,"unresolved_nodes":root.unresolved_nodes,"read_files":files,"read_chunks":chunks_read,"read_batches":batch_count,"levels":level,"root":root.key});
+    let read_files = (files as usize).saturating_sub(exclusions.len());
+    let coverage = json!({"complete":root.unresolved_nodes == 0,"reading_complete":true,"unresolved_nodes":root.unresolved_nodes,"read_files":read_files,"read_chunks":chunks_read,"read_batches":batch_count,"levels":level,"root":root.key,"reading_excluded":excluded_report});
     let mut tx = ctx.pool.begin().await?;
     for (step, value) in [
         ("understanding:root", serde_json::to_value(&root)?),
@@ -1269,6 +1622,41 @@ mod tests {
         assert_eq!(reduction_work(5), 2);
         assert_eq!(reduction_work(16), 5);
         assert_eq!(reduction_work(900), 300);
+    }
+
+    #[test]
+    fn a_leaf_passed_through_a_level_stays_in_every_level_below_it() {
+        // Five leaves reduce as (1..4) and a lone fifth that passes through to
+        // the next level. Walking down from the root used to keep only nodes
+        // with children, so the fifth leaf's reading vanished from the branch
+        // view the outline is planned from.
+        let node = |children: &[&str]| TreeNode {
+            files: vec![],
+            children: children.iter().map(|c| c.to_string()).collect(),
+            findings: vec![],
+            details: vec![],
+            spans: vec![],
+        };
+        let mut nodes = HashMap::new();
+        for leaf in ["l1", "l2", "l3", "l4", "l5"] {
+            nodes.insert(leaf.to_string(), node(&[]));
+        }
+        nodes.insert("r1".into(), node(&["l1", "l2", "l3", "l4"]));
+        nodes.insert("root".into(), node(&["r1", "l5"]));
+        let tree = TreeIndex {
+            root: Some("root".into()),
+            leaves: vec![],
+            nodes,
+        };
+        let levels = tree.levels();
+        assert_eq!(levels[1], ["r1", "l5"]);
+        assert_eq!(levels[2], ["l1", "l2", "l3", "l4", "l5"]);
+        assert_eq!(levels.len(), 3);
+        assert_eq!(tree.leaves_under(&["r1".into()]), ["l1", "l2", "l3", "l4"]);
+        assert_eq!(
+            tree.leaves_under(&["root".into()]),
+            ["l1", "l2", "l3", "l4", "l5"]
+        );
     }
 
     #[test]

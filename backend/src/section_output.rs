@@ -160,8 +160,8 @@ pub async fn write(ctx: &RunContext, system: &str, input: Value) -> Result<Strin
         }
         if progress.parts >= MAX_PARTS {
             // Stop asking rather than fail: the text written so far is real
-            // section content, and the caller validates it and audits the whole
-            // document against the originals for what it leaves out.
+            // section content, and the caller validates and reviews it like any
+            // other draft.
             ctx.event(
                 "section_continuation",
                 json!({"stage":"writing","title":input["title"],

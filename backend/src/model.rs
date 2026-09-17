@@ -183,6 +183,15 @@ pub struct SectionPlan {
     pub key_points: Vec<String>,
     #[serde(default)]
     pub out_of_scope: Vec<String>,
+    /// Parts of the source read tree this section covers, by node key.
+    #[serde(default)]
+    pub branches: Vec<String>,
+}
+/// A part of the source the plan deliberately leaves out, and why.
+#[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct BranchExclusion {
+    pub branch: String,
+    pub reason: String,
 }
 #[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct Outline {
@@ -197,6 +206,10 @@ pub struct Outline {
     pub requirements: Vec<Requirement>,
     #[serde(default)]
     pub revision: u32,
+    /// Parts of the source the purpose does not need, named so an omission and a
+    /// decision can be told apart.
+    #[serde(default)]
+    pub excluded_branches: Vec<BranchExclusion>,
 }
 #[derive(Clone, Serialize, Deserialize, ToSchema)]
 pub struct Requirement {

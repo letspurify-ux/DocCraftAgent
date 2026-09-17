@@ -69,6 +69,28 @@ pub(crate) struct Discovery {
 pub(crate) const MAX_FINDINGS: usize = 12;
 pub(crate) const MAX_EVIDENCE_IDS: usize = 12;
 
+/// How many findings a reading may return before it is rejected, as opposed to
+/// how many `MAX_FINDINGS` asks it for.
+///
+/// The count is a target, not the budget: what a brief must fit is
+/// `summary_budget_bytes`, and that check runs on the reading that comes back.
+/// A reading that says fourteen true things inside the budget was rejected for
+/// the number alone and the retry wrote the same reading again, having been
+/// given nothing else to change - measured in one run as seven of its retries.
+/// So a response that is valid in every other way is accepted past the target,
+/// and only the bytes decide. The ceiling stays finite because each finding
+/// carries citations and a floor of text; a reading that doubles the target has
+/// stopped grouping, which is what the target asks for.
+pub(crate) const ACCEPTED_FINDINGS: usize = MAX_FINDINGS * 2;
+
+/// The same split for citations, and for the same reason. Told that its summary
+/// was over budget, a reading did what the instruction asks - grouped related
+/// passages under one observation and cited them together - and came back with
+/// sixteen IDs on one finding, which the target rejected. The two rules were
+/// pushing opposite ways on one node. What the citations actually cost is
+/// bytes, 66 to a resolved ID, and `summary_budget_bytes` already charges them.
+pub(crate) const ACCEPTED_EVIDENCE_IDS: usize = MAX_EVIDENCE_IDS * 2;
+
 /// How many source anchors one planned section may carry.
 ///
 /// Deliberately not `MAX_EVIDENCE_IDS`: a section names where a reader should
@@ -98,11 +120,24 @@ fn bounded_text(value: &str, max: usize) -> bool {
 /// `subject` names the finding or section being checked. Every other rule here
 /// says which item broke it; a bare "supply 1-N evidence_ids" leaves a repair
 /// attempt guessing which of a dozen items was empty, so it repeats the mistake.
-fn resolve_ids(ids: &mut [String], evidence: &[Evidence], max: usize, subject: &str) -> Result<()> {
+fn resolve_ids(
+    ids: &mut [String],
+    evidence: &[Evidence],
+    requested: usize,
+    accepted: usize,
+    subject: &str,
+) -> Result<()> {
     ensure!(
-        !ids.is_empty() && ids.len() <= max,
-        "{subject:?} supplied {} evidence_ids; cite 1-{max} of the evidence IDs in this request, or drop the item when nothing supplied supports it. Names and line numbers from source_graph are not evidence IDs",
-        ids.len()
+        !ids.is_empty() && ids.len() <= accepted,
+        "{subject:?} supplied {} evidence_ids; cite 1-{accepted} of the evidence IDs in this request{}, or drop the item when nothing supplied supports it. Names and line numbers from source_graph are not evidence IDs",
+        ids.len(),
+        if accepted > requested {
+            format!(
+                " (it asks for at most {requested}, so passages supporting a different claim belong in their own item)"
+            )
+        } else {
+            String::new()
+        }
     );
     let mut seen = HashSet::new();
     for id in ids {
@@ -130,8 +165,9 @@ pub(crate) fn validate_brief(
     final_pass: bool,
 ) -> Result<()> {
     ensure!(
-        !brief.findings.is_empty() && brief.findings.len() <= MAX_FINDINGS,
-        "Supply 1-{MAX_FINDINGS} source findings"
+        !brief.findings.is_empty() && brief.findings.len() <= ACCEPTED_FINDINGS,
+        "Supply 1-{ACCEPTED_FINDINGS} source findings; the request asks for at most {MAX_FINDINGS}, so group related passages under one observation rather than listing {} of them",
+        brief.findings.len()
     );
     ensure!(
         brief.uncertainties.len() <= 8 && brief.uncertainties.iter().all(|s| bounded_text(s, 1500)),
@@ -173,6 +209,7 @@ pub(crate) fn validate_brief(
             &mut finding.evidence_ids,
             evidence,
             MAX_EVIDENCE_IDS,
+            ACCEPTED_EVIDENCE_IDS,
             &subject,
         )?;
         if matches!(finding.kind, FindingKind::Runtime) {
@@ -301,6 +338,7 @@ pub(crate) fn validate_outline(
                 &mut section.evidence_ids,
                 evidence,
                 MAX_SECTION_ANCHORS,
+                MAX_SECTION_ANCHORS,
                 &subject,
             )?;
         }
@@ -348,6 +386,7 @@ fn decode_generated_outline(
         }
     }
     resolve_exclusions(&mut value, labels)?;
+    reject_covered_exclusions(&value, labels)?;
     if let Some(sections) = value.get_mut("sections").and_then(|v| v.as_array_mut()) {
         let titles: Vec<Option<String>> = sections
             .iter()
@@ -1130,6 +1169,53 @@ pub(crate) fn branch_coverage(plan: &Outline, view: &BranchView) -> serde_json::
 /// whether it should be split.
 const CROWDED_BRANCHES: usize = 4;
 
+/// The branches the plan accounted for in neither way, as issues of their own.
+///
+/// Which branches those are is computed rather than judged, and the review
+/// request already shows them under a rule that calls an unassigned branch the
+/// purpose needs a major issue. A real review answered `issues: []` with four
+/// parts unassigned, two of them the agent loop the document was asked to
+/// explain, and the plan was approved as it stood. Whether the purpose needs a
+/// branch is still the model's judgement - it can answer by excluding the
+/// branch with a reason - but that the question is answered at all is not.
+fn unassigned_issues(
+    coverage: &serde_json::Value,
+    reported: &[crate::model::OutlineIssue],
+) -> Vec<crate::model::OutlineIssue> {
+    coverage["unassigned"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let label = item.get("branch").and_then(|v| v.as_str())?;
+            // A review that already named the branch has judged it; saying it
+            // twice would spend a correction round on agreeing.
+            if reported.iter().any(|issue| issue.message.contains(label)) {
+                return None;
+            }
+            let topics: Vec<&str> = item
+                .get("topics")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .collect();
+            Some(crate::model::OutlineIssue {
+                severity: "major".into(),
+                code: "unassigned_branch".into(),
+                message: format!(
+                    "Branch {label} ({} files) is covered by no section and named in no exclusion, so the plan does not say whether the document explains it. Its topics are: {}. Name it in the branches of the section that explains it, add a section for it, or list it once in excluded_branches with a reason tied to the purpose.",
+                    item.get("file_count").and_then(|v| v.as_u64()).unwrap_or_default(),
+                    topics.join("; ")
+                ),
+                section_ids: vec![],
+                requirement_ids: vec![],
+                query: String::new(),
+            })
+        })
+        .collect()
+}
+
 /// Bytes branch coverage may take in an outline review.
 const COVERAGE_VIEW_BYTES: usize = 12_000;
 
@@ -1494,7 +1580,8 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
                 "excluded":coverage["excluded"].as_array().map_or(0, Vec::len),
                 "unassigned":coverage["unassigned"],"crowded_sections":coverage["crowded_sections"]})).await?;
         }
-        let review = review_outline(ctx, system, &plan, &discovery, &view, &coverage).await?;
+        let mut review = review_outline(ctx, system, &plan, &discovery, &view, &coverage).await?;
+        review.issues.extend(unassigned_issues(&coverage, &review.issues));
         ctx.event("outline_review", json!({"stage":"outline_review","title":"목차의 누락·중복·순서 검토","revision":revision,"issues":review.issues})).await?;
         if review.issues.iter().all(|i| i.severity != "major") {
             let approved = db::load_checkpoint(&ctx.pool, &ctx.id, "outline_approved")
@@ -1660,6 +1747,59 @@ fn resolve_labels(
 }
 
 /// Resolve `excluded_branches` in place.
+/// A branch a section covers may not also be excluded.
+///
+/// The plan accounts for every branch exactly one way: named in the sections
+/// that cover it, or listed once in `excluded_branches` with a reason. A real
+/// plan did both to one branch and nothing rejected it: coverage tests covered
+/// first and never reads that branch's exclusion, so the section wrote what the
+/// exclusion said the document would leave out, and the reason stayed in the
+/// plan as a false statement about the document.
+fn reject_covered_exclusions(
+    value: &serde_json::Value,
+    labels: &HashMap<String, String>,
+) -> Result<()> {
+    let by_key: HashMap<&str, &str> = labels
+        .iter()
+        .map(|(label, key)| (key.as_str(), label.as_str()))
+        .collect();
+    let covered: HashMap<&str, &str> = value
+        .get("sections")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|section| {
+            let title = section
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            section
+                .get("branches")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(move |branch| branch.as_str().map(|branch| (branch, title)))
+        })
+        .collect();
+    for item in value
+        .get("excluded_branches")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(branch) = item.get("branch").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(title) = covered.get(branch) {
+            bail!(
+                "Branch {:?} is both covered by section {title:?} and listed in excluded_branches; account for a branch one way only - keep it in that section and drop the exclusion, or drop it from that section's branches and keep the reason",
+                by_key.get(branch).copied().unwrap_or(branch)
+            );
+        }
+    }
+    Ok(())
+}
+
 fn resolve_exclusions(
     value: &mut serde_json::Value,
     labels: &HashMap<String, String>,
@@ -2556,6 +2696,37 @@ mod tests {
         assert_eq!(coverage["excluded"][0]["branch"], "B2");
         assert_eq!(coverage["unassigned"][0]["branch"], "B3");
         assert_eq!(coverage["unassigned"].as_array().map(Vec::len), Some(1));
+        // What no section took and no exclusion named becomes an issue whether
+        // or not the review named it, so the next plan has to decide.
+        let judged = crate::model::OutlineIssue {
+            severity: "minor".into(),
+            code: "missing_topic".into(),
+            message: "B3 is a test harness the purpose does not ask about".into(),
+            section_ids: vec![],
+            requirement_ids: vec![],
+            query: String::new(),
+        };
+        assert!(unassigned_issues(&coverage, std::slice::from_ref(&judged)).is_empty());
+        let raised = unassigned_issues(&coverage, &[]);
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].severity, "major");
+        assert_eq!(raised[0].code, "unassigned_branch");
+        assert!(raised[0].message.contains("B3"), "{}", raised[0].message);
+        // A branch cannot be explained and excluded at once.
+        let both = json!({"reader_goal":"goal","storyline":"story","sections":[
+            {"title":"A","query":"a","key_points":["a"],"evidence_ids":[],"diagrams":[],"branches":["B1","B2"]}],
+            "excluded_branches":[{"branch":"B2","reason":"설치 절차는 목적 밖이다"}]});
+        let contradiction = decode_generated_outline(
+            &both.to_string(),
+            &mut llm::JsonRepair::default(),
+            &labels,
+        )
+        .err()
+        .context("a branch both covered and excluded must not decode")?
+        .to_string();
+        assert!(contradiction.contains("B2"), "{contradiction}");
+        assert!(contradiction.contains("excluded_branches"), "{contradiction}");
+
         let unknown = json!({"reader_goal":"goal","storyline":"story","sections":[
             {"title":"A","query":"a","key_points":["a"],"evidence_ids":[],"diagrams":[],"branches":["B9"]}]});
         let error = decode_generated_outline(
@@ -3047,6 +3218,60 @@ mod tests {
             assert_eq!(validate_brief(&mut brief, &[source], true).is_ok(), valid);
         }
         assert!(llm::decode::<FindingKind>(r#""unknown""#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_reading_past_the_requested_count_is_kept_when_it_is_valid_otherwise() -> Result<()> {
+        let implementation = evidence("/project/a.py", "def receive(x): return finish(x)");
+        let sources = vec![implementation.clone()];
+        let brief_of = |count: usize| -> Result<SourceBrief> {
+            Ok(serde_json::from_value(json!({
+                "findings":(0..count).map(|n| json!({"topic":format!("topic {n}"),
+                    "observation":"receive passes input to finish","kind":"runtime",
+                    "evidence_ids":[&implementation.id[..8]]})).collect::<Vec<_>>(),
+                "uncertainties":[],"followup_queries":[]
+            }))?)
+        };
+        // What the request asks for, and two past it: the second is a reading
+        // that said more true things, not a defect, so it is not sent back.
+        validate_brief(&mut brief_of(MAX_FINDINGS)?, &sources, true)?;
+        validate_brief(&mut brief_of(MAX_FINDINGS + 2)?, &sources, true)?;
+        validate_brief(&mut brief_of(ACCEPTED_FINDINGS)?, &sources, true)?;
+        // Past the ceiling the reading has stopped grouping at all, and the
+        // error names both numbers so the retry knows which one it missed.
+        let error = validate_brief(&mut brief_of(ACCEPTED_FINDINGS + 1)?, &sources, true)
+            .err()
+            .context("a reading past the ceiling must not validate")?
+            .to_string();
+        assert!(error.contains(&ACCEPTED_FINDINGS.to_string()), "{error}");
+        assert!(error.contains(&MAX_FINDINGS.to_string()), "{error}");
+        // A reading with nothing in it is still nothing.
+        assert!(validate_brief(&mut brief_of(0)?, &sources, true).is_err());
+
+        // Told its summary was over budget, a reading groups passages under one
+        // observation and cites them together - what the instruction asks for.
+        // The citation target must not reject it for obeying.
+        let passages: Vec<Evidence> = (0..ACCEPTED_EVIDENCE_IDS + 1)
+            .map(|n| evidence(&format!("/project/p{n}.py"), &format!("def f{n}(): return {n}")))
+            .collect();
+        let grouped = |count: usize| -> Result<SourceBrief> {
+            Ok(serde_json::from_value(json!({
+                "findings":[{"topic":"픽스처 묶음","observation":"같은 계약을 여러 원문이 함께 뒷받침한다",
+                    "kind":"runtime",
+                    "evidence_ids":passages[..count].iter().map(|e| e.id.clone()).collect::<Vec<_>>()}],
+                "uncertainties":[],"followup_queries":[]
+            }))?)
+        };
+        validate_brief(&mut grouped(MAX_EVIDENCE_IDS)?, &passages, true)?;
+        validate_brief(&mut grouped(MAX_EVIDENCE_IDS + 4)?, &passages, true)?;
+        validate_brief(&mut grouped(ACCEPTED_EVIDENCE_IDS)?, &passages, true)?;
+        let error = validate_brief(&mut grouped(ACCEPTED_EVIDENCE_IDS + 1)?, &passages, true)
+            .err()
+            .context("a finding past the citation ceiling must not validate")?
+            .to_string();
+        assert!(error.contains(&ACCEPTED_EVIDENCE_IDS.to_string()), "{error}");
+        assert!(error.contains(&MAX_EVIDENCE_IDS.to_string()), "{error}");
         Ok(())
     }
 

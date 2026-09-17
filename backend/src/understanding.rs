@@ -247,7 +247,7 @@ fn validated_findings(brief: &SourceBrief, evidence: &[Evidence]) -> Vec<crate::
 fn salvage(mut brief: SourceBrief, evidence: &[Evidence], maximum: usize) -> SourceBrief {
     brief.findings = validated_findings(&brief, evidence)
         .into_iter()
-        .take(12)
+        .take(crate::planning::ACCEPTED_FINDINGS)
         .collect();
     brief.uncertainties = brief
         .uncertainties
@@ -693,9 +693,17 @@ async fn node(
             Err(e) => {
                 llm::forget(ctx, system, request).await?;
                 error = editorial::excerpt(&format!("{e:#}"), 1500);
+                // A response the provider cut short is kept in the run's own
+                // history, not only in the server log: the fragment says what
+                // the reading was writing when it stopped, and the next attempt
+                // is judged against it.
+                let fragment = error
+                    .contains(llm::RESPONSE_TRUNCATED)
+                    .then(|| repair.response.as_deref().map(|r| editorial::excerpt(r, 2_000)))
+                    .flatten();
                 ctx.event(
                     "source_validation",
-                    json!({"attempt":attempt+1,"error":error}),
+                    json!({"attempt":attempt+1,"error":error,"truncated_body":fragment}),
                 )
                 .await?;
             }

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 
-const PLAN_TEMPLATE: &str = "Return JSON {sections:[{title:string,key_points:[string],query:string,evidence_ids:[string],diagrams:[string]}],reader_goal:string,storyline:string}. Organize the code into clear sections and summarize its important behavior according to purpose. Choose the smallest number of sections that serves the purpose. source_branches describes the parts the source was read in, each with the topics that part covers and how many files it holds; it is what the source contains, not what this document owes a section. Judge each branch against the purpose: a branch the purpose does not ask about gets no section, however many files it holds, and naming it in a section's out_of_scope is better than covering it. What the branches do change is the ceiling: where the purpose does reach many branches, give a branch with more relevant topics more sections than one with few, and do not compress a large relevant branch into one section because a smaller number looks tidier. A large source with a narrow purpose is a short document, and that is the correct answer rather than a failure to fill the room. Group related responsibilities and workflows, merging thin or overlapping topics. Do not force one section per file or impose a fixed template. Use an order that makes the actual code easy to follow: establish needed context before explaining processing, outputs and important alternative/error paths. Respect the user's explicit audience, scope, section count and diagram instructions. reader_goal briefly states what the document explains; storyline briefly explains the grouping and order. Each section needs a unique title, 1-12 concrete key_points, a query naming observed files/symbols for deeper reading, 1-{MAX_SECTION_ANCHORS} supplied evidence_ids, and diagrams as an array of diagram objectives (use [] if none). Share source evidence across sections when useful, but avoid repeating the same explanation. source_brief and supporting_findings contain previously checked observations, with uncertainties; use original evidence to resolve contradictions or add connections. Previously_read source anchors may support those existing observations when the original is omitted from this request. Missing excerpts and old uncertainties do not prove absent implementation. Do not invent runtime order, join independent workflows, or turn conditional paths into an unconditional sequence. Outline descriptions guide later writing and are not proof of execution. Keep titles under 300 UTF-8 bytes, each key point under 1500 bytes, query under 2000 bytes, reader_goal under 2000 bytes and storyline under 4000 bytes. Allocate at most 4 diagrams per section and respect max_diagrams across the whole document; do not repeat the overall diagram in each section. Use the requested language. Do not generate reader questions, requirement IDs, ownership tables or mandatory handoffs. Detailed transitions belong in the section prose.";
+const PLAN_TEMPLATE: &str = "Return JSON {sections:[{title:string,key_points:[string],query:string,evidence_ids:[string],diagrams:[string]}],reader_goal:string,storyline:string}. Organize the code into clear sections and summarize its important behavior according to purpose. Choose the smallest number of sections that serves the purpose. The three views of the source are one thing at three depths, not three lists to merge: source_brief is the through-line across the whole project, source_branches are the parts that through-line runs through - each with `where` it lives, the topics it covers and how many files it holds - and supporting_findings are earlier observations that may belong to any of them. A topic appearing in more than one view is the same topic seen from further away, so say it once, in the section whose branch owns it. source_branches are listed in the order the source was read, which follows how the code is laid out, and that order is the default spine of the document; depart from it only where the purpose asks for a different journey. source_branches is what the source contains, not what this document owes a section. Judge each branch against the purpose: a branch the purpose does not ask about gets no section, however many files it holds, and naming it in a section's out_of_scope is better than covering it. What the branches do change is the ceiling: where the purpose does reach many branches, give a branch with more relevant topics more sections than one with few, and do not compress a large relevant branch into one section because a smaller number looks tidier. A large source with a narrow purpose is a short document, and that is the correct answer rather than a failure to fill the room. Group related responsibilities and workflows, merging thin or overlapping topics. Do not force one section per file or impose a fixed template. Use an order that makes the actual code easy to follow: establish needed context before explaining processing, outputs and important alternative/error paths. Respect the user's explicit audience, scope, section count and diagram instructions. reader_goal briefly states what the document explains; storyline briefly explains the grouping and order. Each section needs a unique title, 1-12 concrete key_points, a query naming observed files/symbols for deeper reading, 1-{MAX_SECTION_ANCHORS} supplied evidence_ids, and diagrams as an array of diagram objectives (use [] if none). Share source evidence across sections when useful, but avoid repeating the same explanation. source_brief and supporting_findings contain previously checked observations, with uncertainties; use original evidence to resolve contradictions or add connections. Previously_read source anchors may support those existing observations when the original is omitted from this request. Missing excerpts and old uncertainties do not prove absent implementation. Do not invent runtime order, join independent workflows, or turn conditional paths into an unconditional sequence. Outline descriptions guide later writing and are not proof of execution. Keep titles under 300 UTF-8 bytes, each key point under 1500 bytes, query under 2000 bytes, reader_goal under 2000 bytes and storyline under 4000 bytes. Allocate at most 4 diagrams per section and respect max_diagrams across the whole document; do not repeat the overall diagram in each section. Use the requested language. Do not generate reader questions, requirement IDs, ownership tables or mandatory handoffs. Detailed transitions belong in the section prose.";
 pub(crate) static PLAN: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| with_limits(PLAN_TEMPLATE));
 
@@ -587,6 +587,24 @@ fn fits(view: &[serde_json::Value]) -> bool {
     serde_json::to_vec(view).is_ok_and(|v| v.len() <= BRANCH_VIEW_BYTES)
 }
 
+/// The directory a branch lives in, as the one thing that says what it is.
+///
+/// A branch arrived as a file list and two counts, so the planner had to guess
+/// what the group was for from filenames. Its shared directory is the part of
+/// the tree it covers, and the tree was grouped by locality in the first place.
+fn shared_root(files: &[String]) -> String {
+    let Some(first) = files.first() else {
+        return String::new();
+    };
+    let mut root = first.rsplit_once('/').map_or("", |(dir, _)| dir);
+    for path in files.iter().skip(1) {
+        while !root.is_empty() && !path.starts_with(&format!("{root}/")) {
+            root = root.rsplit_once('/').map_or("", |(dir, _)| dir);
+        }
+    }
+    root.to_string()
+}
+
 /// The shortest observation still worth reading; below this a topic is a title.
 const OBSERVATION_FLOOR_BYTES: usize = 120;
 
@@ -612,7 +630,8 @@ fn render_branches(
                 .collect();
             // The counts travel even when the lists are trimmed, so a branch
             // that holds a lot is still recognisable as one that does.
-            json!({"files":node.files.iter().take(files).collect::<Vec<_>>(),
+            json!({"where":shared_root(&node.files),
+                "files":node.files.iter().take(files).collect::<Vec<_>>(),
                 "file_count":node.files.len(),"topic_count":node.discovery.brief.findings.len(),
                 "topics":shown})
         })
@@ -865,6 +884,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_branch_says_where_it_lives_and_the_views_are_related() -> Result<()> {
+        // One directory for a branch that sits in one; the nearest shared one
+        // when it spans several; nothing when it spans the whole tree.
+        let at =
+            |paths: &[&str]| shared_root(&paths.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        assert_eq!(at(&["a/b/one.rs", "a/b/two.rs"]), "a/b");
+        assert_eq!(at(&["a/b/one.rs", "a/c/two.rs"]), "a");
+        assert_eq!(at(&["a/one.rs", "b/two.rs"]), "");
+        assert_eq!(at(&[]), "");
+        // A prefix that is not a directory boundary must not match.
+        assert_eq!(at(&["a/bc/one.rs", "a/bd/two.rs"]), "a");
+        // The planner is told the three views are one thing at three depths,
+        // and which order the branches are in, or it merges them as three
+        // unrelated lists and the narrative wanders.
+        assert!(PLAN.contains("one thing at three depths"), "{}", *PLAN);
+        assert!(PLAN.contains("the order the source was read"), "{}", *PLAN);
+        Ok(())
+    }
+
+    #[test]
     fn branches_raise_the_ceiling_without_obliging_a_section() -> Result<()> {
         // The branch view is read from the understanding tree, which knows
         // nothing of the purpose. Telling the planner to cover every branch
@@ -978,9 +1017,12 @@ mod tests {
                     .all(|b| b["topics"].as_array().is_some_and(|t| !t.is_empty())),
                 "{count} branches left one silent"
             );
-            // A branch whose lists were trimmed still says how much it holds.
+            // A branch whose lists were trimmed still says how much it holds,
+            // and where it lives - a file list and two counts left the planner
+            // guessing what the group was even for.
             assert_eq!(wide[0]["topic_count"], MAX_FINDINGS);
             assert_eq!(wide[0]["file_count"], 3);
+            assert_eq!(wide[0]["where"], "src");
         }
         // Wider than the budget can describe at all: carry what fits and say how
         // many were left out, rather than presenting a prefix as the whole source.

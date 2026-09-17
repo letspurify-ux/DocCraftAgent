@@ -592,7 +592,21 @@ async fn execute_document(ctx: &RunContext) -> Result<()> {
                     db::checkpoint(&ctx.pool, &ctx.id, &key, &serde_json::to_value(&s)?).await?;
                     s
                 }
-                Err(e) => return Err(e),
+                // One section that will not settle is not a reason to abandon
+                // the ones after it. Its draft is kept, named as unresolved,
+                // and left uncheckpointed so a resume asks for it again.
+                Err(e) => match e.downcast::<UnresolvedSection>() {
+                    Ok(unresolved) => {
+                        ctx.event("section_unresolved",json!({"stage":"writing","section":i+1,"title":plan.title,"issues":unresolved.issues})).await?;
+                        warnings.push(format!(
+                            "[major] Section {}: 수선 시도를 모두 소진해 미해결 상태로 실었습니다. 남은 지적: {}",
+                            i + 1,
+                            unresolved.issues
+                        ));
+                        unresolved.section
+                    }
+                    Err(e) => return Err(e),
+                },
             }
         };
         sections.push(section);
@@ -766,7 +780,20 @@ async fn execute_document(ctx: &RunContext) -> Result<()> {
                     Err(e) if is_budget(&e) => {
                         return Err(e);
                     }
-                    Err(e) => return Err(e),
+                    // A repair that will not settle leaves the section as the
+                    // review found it. Ending the document here would throw
+                    // away every section that is already correct.
+                    Err(e) => match e.downcast::<UnresolvedSection>() {
+                        Ok(unresolved) => {
+                            ctx.event("section_unresolved",json!({"stage":"repairing","section":i+1,"title":plan.title,"issues":unresolved.issues})).await?;
+                            warnings.push(format!(
+                                "[major] Section {}: 검토 지적을 수선하지 못해 미해결로 남았습니다. 남은 지적: {}",
+                                i + 1,
+                                unresolved.issues
+                            ));
+                        }
+                        Err(e) => return Err(e),
+                    },
                 }
             }
         }
@@ -1332,6 +1359,35 @@ const REVIEW_REQUEST_OVERHEAD_BYTES: usize = 8_000;
 // Everything that grows with the outline is measured instead.
 const SECTION_BOUNDED_RESERVE_BYTES: usize = 24_000;
 
+/// A section whose repairs ran out while a draft still existed.
+///
+/// Exhausting repair used to end generation for the whole document: one
+/// section that would not satisfy its own checks cost every section after it,
+/// and a run abandoned at the third of eleven published five. The draft is
+/// carried out with the error so the document can keep it, say what is
+/// unresolved about it, and go on writing the rest.
+pub struct UnresolvedSection {
+    pub section: Section,
+    pub issues: String,
+}
+impl std::fmt::Debug for UnresolvedSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The draft itself is the document, not a diagnostic; the error only
+        // has to say which section did not settle and why.
+        write!(
+            f,
+            "UnresolvedSection({:?}: {})",
+            self.section.title, self.issues
+        )
+    }
+}
+impl std::fmt::Display for UnresolvedSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SECTION_REPAIR_EXHAUSTED: {}", self.issues)
+    }
+}
+impl std::error::Error for UnresolvedSection {}
+
 fn recoverable_generation_failure(e: &anyhow::Error) -> bool {
     let message = e.to_string();
     message.contains("API_RETRIES_EXHAUSTED") || message.contains("SECTION_REPAIR_EXHAUSTED")
@@ -1382,6 +1438,9 @@ async fn write_section(
         .unwrap_or_default();
     let query = format!("{} {} {}", repair_queries, plan.query, plan.reader_question);
     let mut last = String::new();
+    // The most recent draft that was shaped like a section but failed its own
+    // checks. Kept so exhaustion can hand back something to publish.
+    let mut drafted: Option<Section> = None;
     let mut correction = correction;
     let mut previous_evidence: Vec<crate::model::Evidence> = match correction
         .as_mut()
@@ -1485,6 +1544,7 @@ async fn write_section(
                 if issues.is_empty() {
                     return Ok(section);
                 }
+                drafted = Some(section.clone());
                 crate::section_output::forget(ctx, SYSTEM, input).await?;
                 ctx.event("section_validation", json!({"stage":"repairing","title":plan.title,"section":section_index+1,"total_sections":outline.sections.len(),"attempt":attempt+1,"issues":issues})).await?;
                 last = serde_json::to_string(&issues)?;
@@ -1515,10 +1575,11 @@ async fn write_section(
             }
         }
     }
-    bail!(
-        "SECTION_REPAIR_EXHAUSTED: {}",
-        last.chars().take(400).collect::<String>()
-    )
+    let issues = last.chars().take(400).collect::<String>();
+    match drafted {
+        Some(section) => Err(UnresolvedSection { section, issues }.into()),
+        None => bail!("SECTION_REPAIR_EXHAUSTED: {issues}"),
+    }
 }
 fn repair_kind(error: &str) -> &'static str {
     if error.contains("CONTEXT_BUDGET") {
@@ -2305,6 +2366,33 @@ mod tests {
         let issues = validate_sections(std::slice::from_ref(&section))?;
         assert!(issues.iter().any(|i| i.severity == "major"));
         assert!(issues.iter().any(|i| i.message.contains("410c7872")));
+        Ok(())
+    }
+
+    #[test]
+    fn an_exhausted_section_hands_back_its_draft_instead_of_ending_the_document() -> Result<()> {
+        let section = Section {
+            title: "결정 루프".into(),
+            markdown: "본문".into(),
+            evidence: vec![],
+        };
+        let error: anyhow::Error = UnresolvedSection {
+            section: section.clone(),
+            issues: "[{\"severity\":\"major\"}]".into(),
+        }
+        .into();
+        // The caller tells this apart from a failure it cannot continue past,
+        // and keeps writing the sections after it.
+        assert!(recoverable_generation_failure(&error));
+        let unresolved = error
+            .downcast::<UnresolvedSection>()
+            .ok()
+            .context("an exhausted section must carry its draft")?;
+        assert_eq!(unresolved.section.markdown, section.markdown);
+        assert!(unresolved.issues.contains("major"));
+        // Anything else still ends generation rather than publishing silence.
+        let other = anyhow::anyhow!("SECTION_REPAIR_EXHAUSTED: no draft survived");
+        assert!(other.downcast::<UnresolvedSection>().is_err());
         Ok(())
     }
 

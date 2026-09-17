@@ -419,6 +419,8 @@ pub(crate) fn pack_evidence(groups: &[Vec<Evidence>], limit: usize) -> Vec<Evide
 /// A file a reader opens has to end somewhere, and past this the answer is more
 /// documents rather than a longer one.
 const SECTIONS_MAX: usize = 64;
+/// What the ceiling was before it followed the branches, and its floor now.
+const SECTIONS_WITHOUT_BRANCHES: usize = 32;
 
 /// How many sections this document may hold.
 ///
@@ -432,7 +434,13 @@ const SECTIONS_MAX: usize = 64;
 /// valid when planned would be rejected the next time it is read.
 pub(crate) fn section_ceiling(branches: Option<usize>) -> usize {
     match branches {
-        Some(n) => n.saturating_mul(3).clamp(12, SECTIONS_MAX),
+        // Floored at what it replaced. Raising the ceiling for a large source
+        // must not lower it for a small one: five branches would otherwise cap
+        // a project at fifteen sections where a flat thirty-two had allowed it
+        // twice that, and an outline that was fine before would fail planning.
+        Some(n) => n
+            .saturating_mul(3)
+            .clamp(SECTIONS_WITHOUT_BRANCHES, SECTIONS_MAX),
         None => SECTIONS_MAX,
     }
 }
@@ -482,7 +490,9 @@ pub(crate) async fn branch_topics(ctx: &RunContext) -> Result<Vec<serde_json::Va
     let Some(root) = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:root").await? else {
         return Ok(vec![]);
     };
-    let root: crate::understanding::Node = serde_json::from_value(root)?;
+    let Ok(root) = serde_json::from_value::<crate::understanding::Node>(root) else {
+        return Ok(vec![]);
+    };
     let leaves: Vec<String> = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:leaves")
         .await?
         .map(serde_json::from_value)
@@ -497,8 +507,14 @@ pub(crate) async fn branch_topics(ctx: &RunContext) -> Result<Vec<serde_json::Va
         let mut next = vec![];
         for node in &level {
             for key in &node.children {
-                if let Some(value) = db::load_checkpoint(&ctx.pool, &ctx.id, key).await? {
-                    next.push(serde_json::from_value::<crate::understanding::Node>(value)?);
+                // A node this run cannot read is a narrower view, not a reason
+                // to abandon the outline: `analyze` reads only the root when it
+                // resumes, so a child of an older shape reaches here unchecked
+                // and used to fail planning that had no need of it.
+                if let Some(value) = db::load_checkpoint(&ctx.pool, &ctx.id, key).await?
+                    && let Ok(child) = serde_json::from_value::<crate::understanding::Node>(value)
+                {
+                    next.push(child);
                 }
             }
         }
@@ -884,7 +900,13 @@ mod tests {
         assert!(
             section_ceiling(Some(branch_target(520))) > section_ceiling(Some(branch_target(52)))
         );
-        assert_eq!(section_ceiling(Some(0)), 12);
+        // Never tighter than the flat ceiling it replaced: the change was to
+        // let a large source have more, not to take from a small one.
+        assert_eq!(section_ceiling(Some(0)), SECTIONS_WITHOUT_BRANCHES);
+        assert!(
+            (0..=SECTIONS_MAX).all(|n| section_ceiling(Some(n)) >= SECTIONS_WITHOUT_BRANCHES),
+            "a branch count must never narrow the document"
+        );
         assert_eq!(section_ceiling(Some(usize::MAX)), SECTIONS_MAX);
         // Levels step by the fan-in, so the first past the target can overshoot
         // it several times; the closer of the two is chosen.
@@ -1245,7 +1267,7 @@ mod tests {
                 validate_outline(&mut plan, std::slice::from_ref(&source), Some(0), Some(4));
             assert_eq!(
                 narrow.is_ok(),
-                (1..=12).contains(&count),
+                (1..=SECTIONS_WITHOUT_BRANCHES).contains(&count),
                 "narrow section count {count}: {narrow:?}"
             );
         }

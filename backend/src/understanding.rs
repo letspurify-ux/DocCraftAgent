@@ -204,12 +204,27 @@ fn summary_limit(ctx: &RunContext) -> usize {
 /// Bytes a reduction must carry before any original passage is re-read: every
 /// child summary, plus one `source_anchors` entry and one `evidence_classes`
 /// entry per retained original. Only what is left may be spent on originals.
+/// What one evidence id costs once the request has rewritten it to its alias.
+///
+/// Aliases start at eight characters and lengthen only where two hashes share a
+/// prefix, so twelve is generous while staying far from the sixty-four of a
+/// resolved hash that no request ever carries.
+const TRANSMITTED_ID_BYTES: usize = 12;
+
 fn mandatory_bytes(children: &[Node]) -> Result<usize> {
     let mut total = 0usize;
     for child in children {
-        total = total.saturating_add(serde_json::to_vec(&child.discovery.brief)?.len());
+        // Measured the way the request will carry it, like the budget a brief
+        // is accepted against. Charging resolved hashes here while accepting
+        // briefs on their transmitted size let two children that each fit be
+        // judged too large together, which stalls the tree at a level it can
+        // never reduce.
+        total = total.saturating_add(transmitted_size(
+            &child.discovery.brief,
+            &child.discovery.evidence,
+        )?);
         for e in &child.discovery.evidence {
-            total = total.saturating_add(2 * (e.id.len() + e.path.len()) + 128);
+            total = total.saturating_add(2 * (TRANSMITTED_ID_BYTES + e.path.len()) + 128);
         }
     }
     Ok(total)
@@ -1025,6 +1040,39 @@ mod tests {
             salvage(brief.clone(), &evidence, between).findings.len(),
             brief.findings.len()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn the_packing_charges_a_summary_the_way_the_cap_accepted_it() -> Result<()> {
+        let c = LlmConfig {
+            max_output_tokens: 32_000,
+            ..Default::default()
+        };
+        let limit = request_limit(&c, 0);
+        let cap = summary_maximum(limit);
+        // Two children that each fit the cap have to fit one request together,
+        // or the level stalls: "two source summaries no longer fit one request".
+        let children = [saturated_child(1, cap, 6), saturated_child(2, cap, 6)];
+        let costs: Vec<usize> = children
+            .iter()
+            .map(|c| mandatory_bytes(std::slice::from_ref(c)))
+            .collect::<Result<_>>()?;
+        assert_eq!(plan_groups(&costs, limit)?, vec![(0, 2)]);
+        // Charged at the alias the request sends, not the resolved hash it
+        // never carries; the sixty-four-byte form is what stalled the tree.
+        let inflated: usize = children
+            .iter()
+            .map(|c| {
+                serde_json::to_vec(&c.discovery.brief).map_or(0, |v| v.len())
+                    + c.discovery
+                        .evidence
+                        .iter()
+                        .map(|e| 2 * (e.id.len() + e.path.len()) + 128)
+                        .sum::<usize>()
+            })
+            .sum();
+        assert!(costs.iter().sum::<usize>() < inflated);
         Ok(())
     }
 

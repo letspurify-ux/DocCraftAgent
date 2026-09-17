@@ -303,6 +303,29 @@ async fn node(
             "Read source evidence before planning through verified child findings. Synthesize ALL verified child findings into a balanced project overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve the main product workflows, public entry points, processing, persisted/returned results, consumers and error/cancel paths across ALL children. Dependencies and test harness details together need at most two findings; do not let them displace product behavior. Use at most 12 findings, each under 1000 characters and with 1-6 source_anchors from its child findings, and at most 8 uncertainties. The whole findings array must serialize under summary_budget_bytes, so write fewer and denser observations rather than many that have to be trimmed; non-ASCII text costs about three bytes per character. Previously-read originals are retained and validated by the caller; do not treat their omission from this synthesis request as an unknown project behavior. Carry only observations already in children and distinguish their runtime/context kinds. Do not add new facts or invent cross-module execution order; retain genuinely unresolved connections. Use the requested language."
         );
     }
+    // What a request actually spends, against what it was allowed. The split
+    // between the structural hint and everything else is a fixed fraction that
+    // was chosen when the hint carried declarations and site counts as well as
+    // links; a reduction now carries only links, and whether the rest of the
+    // request even uses its share decides whether that fraction still earns its
+    // place. Recorded before the checkpoint lookup so a resumed run measures
+    // every node, not only the ones it re-requests.
+    let part = |key: &str| {
+        input
+            .get(key)
+            .map(|v| serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0))
+            .unwrap_or(0)
+    };
+    ctx.event(
+        "request_composition",
+        json!({"stage":"understanding","phase":if children.is_empty(){"batch"}else{"reduce"},
+            "summaries_bytes":part("summaries"),"evidence_bytes":part("evidence"),
+            "anchors_bytes":part("source_anchors"),"graph_bytes":part("source_graph"),
+            "total_bytes":serde_json::to_vec(&input)?.len(),
+            "non_graph_budget":input_limit(ctx),"graph_budget":graph_limit(ctx),
+            "children":children.len()}),
+    )
+    .await?;
     // LLM cache also includes model/endpoint/settings. Checkpoints must obey the
     // same contract when resuming with explicitly changed model settings.
     let config = &ctx.snapshot.settings.llm;

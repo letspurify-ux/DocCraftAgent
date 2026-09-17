@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 
-const PLAN_TEMPLATE: &str = "Return JSON {sections:[{title:string,key_points:[string],query:string,evidence_ids:[string],diagrams:[string]}],reader_goal:string,storyline:string}. Organize the code into clear sections and summarize its important behavior according to purpose. Choose the smallest useful number of sections, from 1 to 32; 32 is a ceiling, not a target. Group related responsibilities and workflows, merging thin or overlapping topics. Do not force one section per file or impose a fixed template. Use an order that makes the actual code easy to follow: establish needed context before explaining processing, outputs and important alternative/error paths. Respect the user's explicit audience, scope, section count and diagram instructions. reader_goal briefly states what the document explains; storyline briefly explains the grouping and order. Each section needs a unique title, 1-12 concrete key_points, a query naming observed files/symbols for deeper reading, 1-{MAX_SECTION_ANCHORS} supplied evidence_ids, and diagrams as an array of diagram objectives (use [] if none). Share source evidence across sections when useful, but avoid repeating the same explanation. source_brief and supporting_findings contain previously checked observations, with uncertainties; use original evidence to resolve contradictions or add connections. Previously_read source anchors may support those existing observations when the original is omitted from this request. Missing excerpts and old uncertainties do not prove absent implementation. Do not invent runtime order, join independent workflows, or turn conditional paths into an unconditional sequence. Outline descriptions guide later writing and are not proof of execution. Keep titles under 300 UTF-8 bytes, each key point under 1500 bytes, query under 2000 bytes, reader_goal under 2000 bytes and storyline under 4000 bytes. Allocate at most 4 diagrams per section and respect max_diagrams across the whole document; do not repeat the overall diagram in each section. Use the requested language. Do not generate reader questions, requirement IDs, ownership tables or mandatory handoffs. Detailed transitions belong in the section prose.";
+const PLAN_TEMPLATE: &str = "Return JSON {sections:[{title:string,key_points:[string],query:string,evidence_ids:[string],diagrams:[string]}],reader_goal:string,storyline:string}. Organize the code into clear sections and summarize its important behavior according to purpose. source_branches describes the parts the source was read in, each with the topics that part covers and how many files it holds; together they are the scope of this document. Cover every branch, and give a branch with more topics more sections than one with few, so the document grows with what the project does rather than staying a fixed size. Sections come from the branches and their topics, not from a template, and 1 to 32 bounds the result; do not pad thin branches to reach a number, and do not compress a large branch into one section because a smaller number looks tidier. Group related responsibilities and workflows, merging thin or overlapping topics. Do not force one section per file or impose a fixed template. Use an order that makes the actual code easy to follow: establish needed context before explaining processing, outputs and important alternative/error paths. Respect the user's explicit audience, scope, section count and diagram instructions. reader_goal briefly states what the document explains; storyline briefly explains the grouping and order. Each section needs a unique title, 1-12 concrete key_points, a query naming observed files/symbols for deeper reading, 1-{MAX_SECTION_ANCHORS} supplied evidence_ids, and diagrams as an array of diagram objectives (use [] if none). Share source evidence across sections when useful, but avoid repeating the same explanation. source_brief and supporting_findings contain previously checked observations, with uncertainties; use original evidence to resolve contradictions or add connections. Previously_read source anchors may support those existing observations when the original is omitted from this request. Missing excerpts and old uncertainties do not prove absent implementation. Do not invent runtime order, join independent workflows, or turn conditional paths into an unconditional sequence. Outline descriptions guide later writing and are not proof of execution. Keep titles under 300 UTF-8 bytes, each key point under 1500 bytes, query under 2000 bytes, reader_goal under 2000 bytes and storyline under 4000 bytes. Allocate at most 4 diagrams per section and respect max_diagrams across the whole document; do not repeat the overall diagram in each section. Use the requested language. Do not generate reader questions, requirement IDs, ownership tables or mandatory handoffs. Detailed transitions belong in the section prose.";
 pub(crate) static PLAN: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| with_limits(PLAN_TEMPLATE));
 
@@ -412,9 +412,90 @@ pub(crate) fn pack_evidence(groups: &[Vec<Evidence>], limit: usize) -> Vec<Evide
     selected
 }
 
-// The brief, supporting findings, anchors, project overview, feedback and the
-// planning instruction that ride along with the packed evidence.
-const PLAN_REQUEST_OVERHEAD_BYTES: usize = 32_000;
+/// How many branches the planner is shown. Descending stops once a level has at
+/// least this many nodes, so a small project keeps its shallow tree and a large
+/// one is described by its parts rather than by one summary of everything.
+const BRANCH_TARGET: usize = 8;
+/// Bytes the branch view may spend. Split evenly, so more branches each say
+/// less rather than the last ones saying nothing.
+const BRANCH_VIEW_BYTES: usize = 24_000;
+
+/// The reduction tree's branches, as the topics each one covers.
+///
+/// An outline used to be planned from the root summary alone: twelve findings
+/// inside one summary budget, whatever the size of the source. The document's
+/// breadth was therefore fixed by a byte budget rather than by how much the
+/// project does, and a larger project produced the same number of sections,
+/// only coarser. Section writing never had that limit - `section_memory`
+/// rehydrates leaf observations the root never carried - so the ceiling was on
+/// what sections could exist, not on what one could say.
+///
+/// The tree already groups the source by locality. Showing the planner the
+/// branches lets the number of sections follow the number of things the project
+/// does. This reads checkpoints only; it asks the model nothing.
+pub(crate) async fn branch_topics(ctx: &RunContext) -> Result<Vec<serde_json::Value>> {
+    let Some(root) = db::load_checkpoint(&ctx.pool, &ctx.id, "understanding:root").await? else {
+        return Ok(vec![]);
+    };
+    let root: crate::understanding::Node = serde_json::from_value(root)?;
+    let mut level = vec![root];
+    loop {
+        if level.len() >= BRANCH_TARGET {
+            break;
+        }
+        let mut next = vec![];
+        for node in &level {
+            for key in &node.children {
+                if let Some(value) = db::load_checkpoint(&ctx.pool, &ctx.id, key).await? {
+                    next.push(serde_json::from_value::<crate::understanding::Node>(value)?);
+                }
+            }
+        }
+        // A level that adds nothing is the leaves, or a tree that was never
+        // built; either way the level above is the widest honest view.
+        if next.is_empty() || next.len() <= level.len() {
+            break;
+        }
+        level = next;
+    }
+    if level.len() < 2 {
+        return Ok(vec![]);
+    }
+    Ok(branch_view(&level))
+}
+
+/// One branch each, inside a shared byte budget.
+///
+/// Split evenly rather than first-come: a project with many parts should have
+/// every part described briefly, not the first few described fully and the rest
+/// left out of the document entirely.
+fn branch_view(level: &[crate::understanding::Node]) -> Vec<serde_json::Value> {
+    let per = BRANCH_VIEW_BYTES / level.len().max(1);
+    let room = (per / MAX_FINDINGS.max(1)).max(120);
+    level
+        .iter()
+        .map(|node| {
+            let topics: Vec<serde_json::Value> = node
+                .discovery
+                .brief
+                .findings
+                .iter()
+                .map(|f| {
+                    json!({"topic":editorial::excerpt(&f.topic,200),
+                        "observation":editorial::excerpt(&f.observation, room)})
+                })
+                .collect();
+            json!({"files":node.files.iter().take(12).collect::<Vec<_>>(),
+                "file_count":node.files.len(),"topics":topics})
+        })
+        .collect()
+}
+
+// The brief, supporting findings, anchors, project overview, feedback, the
+// branch view and the planning instruction that ride along with the packed
+// evidence. Derived so that widening the branch view cannot quietly overrun the
+// request it shares with the evidence.
+const PLAN_REQUEST_OVERHEAD_BYTES: usize = 32_000 + BRANCH_VIEW_BYTES;
 
 pub(crate) fn evidence_budget(ctx: &RunContext) -> usize {
     crate::budget::packing_limit(
@@ -445,6 +526,8 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
         .await?
         .unwrap_or(json!({}));
     let mut discovery = discovery;
+    // Read once: the tree does not change while an outline is being planned.
+    let branches = branch_topics(ctx).await?;
     loop {
         let pending = db::load_checkpoint(&ctx.pool, &ctx.id, "outline_candidate").await?;
         if pending.is_none() {
@@ -464,9 +547,9 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
                 "CONTEXT_BUDGET: insufficient room for grounded outline"
             );
             let brief = &discovery.brief;
-            ctx.event("outline_planning", json!({"stage":"planning","title":"구현 근거에 맞춰 설명 순서 구성","attempt":attempt+1,"evidence_chunks":evidence.len()})).await?;
+            ctx.event("outline_planning", json!({"stage":"planning","title":"구현 근거에 맞춰 설명 순서 구성","attempt":attempt+1,"evidence_chunks":evidence.len(),"branches":branches.len(),"branch_topics":branches.iter().map(|b| b["topics"].as_array().map_or(0,Vec::len)).sum::<usize>()})).await?;
             let mut input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
-            "source_brief":brief,"supporting_findings":crate::purpose::context(&discovery),"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"project_overview":inventory,"feedback":feedback,"revision":revision,
+            "source_brief":brief,"supporting_findings":crate::purpose::context(&discovery),"source_branches":branches,"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"project_overview":inventory,"feedback":feedback,"revision":revision,
             "evidence":evidence,"max_diagrams":ctx.snapshot.task.max_diagrams,
             "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{} Respect user feedback and preserve valid existing section IDs when supplied.", *PLAN)});
             repair.apply(&mut input);
@@ -651,6 +734,67 @@ pub async fn section_evidence(ctx: &RunContext, plan: &SectionPlan) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_branch_view_describes_every_branch_inside_one_budget() -> Result<()> {
+        let branch = |files: usize, topics: usize| crate::understanding::Node {
+            key: format!("k{files}"),
+            files: (0..files).map(|i| format!("src/m{i}.rs")).collect(),
+            children: vec![],
+            discovery: Discovery {
+                brief: SourceBrief {
+                    findings: (0..topics)
+                        .map(|i| Finding {
+                            topic: format!("주제 {i}"),
+                            observation: "관".repeat(4000),
+                            kind: FindingKind::Context,
+                            evidence_ids: vec![],
+                        })
+                        .collect(),
+                    uncertainties: vec![],
+                    followup_queries: vec![],
+                },
+                evidence: vec![],
+                details: vec![],
+                validation_unresolved: false,
+            },
+            unresolved_nodes: 0,
+            validation_issues: vec![],
+            unverified_brief: None,
+            unverified_output: None,
+        };
+        // A wide tree must not spend the budget on its first branches and leave
+        // the rest out of the document: every branch is described.
+        let wide: Vec<_> = (1..=16).map(|i| branch(i, MAX_FINDINGS)).collect();
+        let view = branch_view(&wide);
+        assert_eq!(view.len(), 16);
+        assert!(
+            view.iter()
+                .all(|b| b["topics"].as_array().is_some_and(|t| !t.is_empty()))
+        );
+        assert!(
+            serde_json::to_vec(&view)?.len() <= BRANCH_VIEW_BYTES * 2,
+            "{}",
+            serde_json::to_vec(&view)?.len()
+        );
+        // The file count travels even when the list is capped, so a large branch
+        // is recognisable as large.
+        let big = branch_view(&[branch(40, 1)]);
+        assert_eq!(big[0]["file_count"], 40);
+        assert_eq!(big[0]["files"].as_array().map(Vec::len), Some(12));
+        // Fewer branches each get more room than many do.
+        let narrow = branch_view(&[branch(1, MAX_FINDINGS), branch(1, MAX_FINDINGS)]);
+        let narrow_len = narrow[0]["topics"][0]["observation"]
+            .as_str()
+            .unwrap_or("")
+            .len();
+        let wide_len = view[0]["topics"][0]["observation"]
+            .as_str()
+            .unwrap_or("")
+            .len();
+        assert!(narrow_len > wide_len, "{narrow_len} vs {wide_len}");
+        Ok(())
+    }
 
     #[test]
     fn an_uncitable_item_is_named_so_a_repair_knows_which_one_to_fix() -> Result<()> {

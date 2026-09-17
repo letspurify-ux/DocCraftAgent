@@ -371,6 +371,22 @@ fn summary_limit(ctx: &RunContext) -> usize {
     summary_maximum(input_limit(ctx))
 }
 
+/// What a reduction carries, as opposed to the `summary_budget_bytes` its
+/// request asks for.
+///
+/// A sixth of the request is the size that keeps a four-way reduction shallow,
+/// not a size the next request cannot carry: `plan_groups` measures children
+/// and takes three or two when four do not fit, so a reading that came back
+/// over its target costs another reduction rather than a failed one. Refusing
+/// it instead spends a retry asking a valid reading to say the same thing in
+/// fewer bytes. The ceiling is what keeps that true - two summaries and their
+/// anchors must still fit one request - so a third of the space, and no
+/// relaxation at all where the window is too small to give one away.
+fn accepted_summary(limit: usize) -> usize {
+    let asked = summary_maximum(limit);
+    asked.saturating_mul(2).min(limit / 3).max(asked)
+}
+
 /// Bytes a reduction must carry before any original passage is re-read: every
 /// child summary, plus one `source_anchors` entry per retained original. Only
 /// what is left may be spent on originals.
@@ -484,6 +500,7 @@ async fn node(
         .collect();
     let anchors = crate::planning::anchors(&cited_originals, shown_evidence);
     let summary_cap = summary_limit(ctx);
+    let summary_accept = accepted_summary(input_limit(ctx));
     let mut input = json!({"phase":if children.is_empty(){"understanding_batch"}else{"understanding_reduce"},
         "summary_budget_bytes":summary_cap,
         "language":ctx.snapshot.task.language,"final_pass":true,"evidence":crate::planning::classified(&evidence),
@@ -563,14 +580,15 @@ async fn node(
                 Ok(brief) => brief,
                 Err(error) if attempt == 2 => {
                     validation_issues.push(format!("{error:#}"));
-                    return Ok(recover_output(&s, children, &available, summary_cap));
+                    return Ok(recover_output(&s, children, &available, summary_accept));
                 }
                 Err(error) => return Err(error),
             };
             let validation = validate_brief(&mut brief, &available, true).and_then(|_| {
+                let size = transmitted_size(&brief, &available)?;
                 ensure!(
-                    transmitted_size(&brief, &available)? <= summary_cap,
-                    "Source summary exceeds {summary_cap} bytes; compress observations"
+                    size <= summary_accept,
+                    "Source summary is {size} bytes; summary_budget_bytes is {summary_cap} and at most {summary_accept} can be carried into the next request. Compress by grouping related passages under one observation and citing their IDs together, never by leaving a supplied passage uncited"
                 );
                 if children.is_empty() {
                     // Name the passages that were left out. "Cite every evidence
@@ -617,7 +635,7 @@ async fn node(
                 }
                 validation_issues.push(error.to_string());
                 unverified_brief = Some(brief.clone());
-                brief = salvage(brief, &available, summary_cap);
+                brief = salvage(brief, &available, summary_accept);
             }
             Ok(brief)
         });
@@ -1175,6 +1193,24 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_summary_over_its_target_is_carried_while_two_still_fit_one_request() {
+        let c = LlmConfig {
+            max_output_tokens: 32_000,
+            ..Default::default()
+        };
+        let limit = request_limit(&c, 0);
+        let asked = summary_maximum(limit);
+        let carried = accepted_summary(limit);
+        assert!(carried > asked, "carried {carried}, asked {asked}");
+        // What makes the slack safe: a reduction still takes two children and
+        // keeps a third of the request for their anchors and its own text.
+        assert!(carried * 3 <= limit, "carried {carried} of {limit}");
+        // Where the window is too small to give a third away, the target holds.
+        let tight = 12_000;
+        assert_eq!(accepted_summary(tight), summary_maximum(tight));
+    }
+
     #[test]
     fn the_stated_finding_limits_fit_the_byte_budget_they_are_checked_against() {
         // A brief is rejected on bytes, so twelve findings written to the stated

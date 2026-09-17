@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 
-const PLAN: &str = "Return JSON {sections:[{title:string,key_points:[string],query:string,evidence_ids:[string],diagrams:[string]}],reader_goal:string,storyline:string}. Organize the code into clear sections and summarize its important behavior according to purpose. Choose the smallest useful number of sections, from 1 to 32; 32 is a ceiling, not a target. Group related responsibilities and workflows, merging thin or overlapping topics. Do not force one section per file or impose a fixed template. Use an order that makes the actual code easy to follow: establish needed context before explaining processing, outputs and important alternative/error paths. Respect the user's explicit audience, scope, section count and diagram instructions. reader_goal briefly states what the document explains; storyline briefly explains the grouping and order. Each section needs a unique title, 1-12 concrete key_points, a query naming observed files/symbols for deeper reading, 1-8 supplied evidence_ids, and diagrams as an array of diagram objectives (use [] if none). Share source evidence across sections when useful, but avoid repeating the same explanation. source_brief and supporting_findings contain previously checked observations, with uncertainties; use original evidence to resolve contradictions or add connections. Previously_read source anchors may support those existing observations when the original is omitted from this request. Missing excerpts and old uncertainties do not prove absent implementation. Do not invent runtime order, join independent workflows, or turn conditional paths into an unconditional sequence. Outline descriptions guide later writing and are not proof of execution. Keep titles under 300 UTF-8 bytes, each key point under 1500 bytes, query under 2000 bytes, reader_goal under 2000 bytes and storyline under 4000 bytes. Allocate at most 4 diagrams per section and respect max_diagrams across the whole document; do not repeat the overall diagram in each section. Use the requested language. Do not generate reader questions, requirement IDs, ownership tables or mandatory handoffs. Detailed transitions belong in the section prose.";
+const PLAN_TEMPLATE: &str = "Return JSON {sections:[{title:string,key_points:[string],query:string,evidence_ids:[string],diagrams:[string]}],reader_goal:string,storyline:string}. Organize the code into clear sections and summarize its important behavior according to purpose. Choose the smallest useful number of sections, from 1 to 32; 32 is a ceiling, not a target. Group related responsibilities and workflows, merging thin or overlapping topics. Do not force one section per file or impose a fixed template. Use an order that makes the actual code easy to follow: establish needed context before explaining processing, outputs and important alternative/error paths. Respect the user's explicit audience, scope, section count and diagram instructions. reader_goal briefly states what the document explains; storyline briefly explains the grouping and order. Each section needs a unique title, 1-12 concrete key_points, a query naming observed files/symbols for deeper reading, 1-{MAX_SECTION_ANCHORS} supplied evidence_ids, and diagrams as an array of diagram objectives (use [] if none). Share source evidence across sections when useful, but avoid repeating the same explanation. source_brief and supporting_findings contain previously checked observations, with uncertainties; use original evidence to resolve contradictions or add connections. Previously_read source anchors may support those existing observations when the original is omitted from this request. Missing excerpts and old uncertainties do not prove absent implementation. Do not invent runtime order, join independent workflows, or turn conditional paths into an unconditional sequence. Outline descriptions guide later writing and are not proof of execution. Keep titles under 300 UTF-8 bytes, each key point under 1500 bytes, query under 2000 bytes, reader_goal under 2000 bytes and storyline under 4000 bytes. Allocate at most 4 diagrams per section and respect max_diagrams across the whole document; do not repeat the overall diagram in each section. Use the requested language. Do not generate reader questions, requirement IDs, ownership tables or mandatory handoffs. Detailed transitions belong in the section prose.";
+pub(crate) static PLAN: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| with_limits(PLAN_TEMPLATE));
 
 pub(crate) const FINDING_KIND_POLICY: &str = "For each finding, kind must be exactly the JSON string \"runtime\" or \"context\". The word implementation describes source evidence, never a third finding kind. runtime_allowed is a boolean describing whether an evidence anchor can support a runtime finding; it is not the finding kind. Use runtime only with at least one supplied implementation anchor. Use context for declarations, documentation or test intent without asserting execution. Always include findings, uncertainties and followup_queries as arrays; use [] for empty lists, never null. Return one JSON object without Markdown fences.";
 
@@ -65,7 +67,27 @@ pub(crate) struct Discovery {
 /// itself checked against `summary_budget_bytes`, and those checks already fail
 /// on length.
 pub(crate) const MAX_FINDINGS: usize = 12;
-pub(crate) const MAX_EVIDENCE_IDS: usize = 8;
+pub(crate) const MAX_EVIDENCE_IDS: usize = 12;
+
+/// How many source anchors one planned section may carry.
+///
+/// Deliberately not `MAX_EVIDENCE_IDS`: a section names where a reader should
+/// start, a finding names what one observation rests on, and the two have moved
+/// independently. Named so the next change to either does not sweep up the other.
+pub(crate) const MAX_SECTION_ANCHORS: usize = 8;
+
+/// Render a prompt's limits from the constants the checker enforces.
+///
+/// A prompt that repeats a limit as a literal drifts from the check silently,
+/// and the reading is then rejected for obeying what it was told. Twice this
+/// session a cap moved and a prompt did not, so prompts carry the placeholder
+/// and never the number.
+pub(crate) fn with_limits(template: &str) -> String {
+    template
+        .replace("{MAX_EVIDENCE_IDS}", &MAX_EVIDENCE_IDS.to_string())
+        .replace("{MAX_FINDINGS}", &MAX_FINDINGS.to_string())
+        .replace("{MAX_SECTION_ANCHORS}", &MAX_SECTION_ANCHORS.to_string())
+}
 
 fn bounded_text(value: &str, max: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max
@@ -264,7 +286,12 @@ pub(crate) fn validate_outline(
             "Every section needs a bounded diagrams array"
         );
         let subject = section.title.clone();
-        resolve_ids(&mut section.evidence_ids, evidence, 8, &subject)?;
+        resolve_ids(
+            &mut section.evidence_ids,
+            evidence,
+            MAX_SECTION_ANCHORS,
+            &subject,
+        )?;
     }
     if let Some(error) = outline_diagram_error(outline, maximum) {
         bail!("{error}");
@@ -441,7 +468,7 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
             let mut input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
             "source_brief":brief,"supporting_findings":crate::purpose::context(&discovery),"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"project_overview":inventory,"feedback":feedback,"revision":revision,
             "evidence":evidence,"max_diagrams":ctx.snapshot.task.max_diagrams,
-            "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{PLAN} Respect user feedback and preserve valid existing section IDs when supplied.")});
+            "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{} Respect user feedback and preserve valid existing section IDs when supplied.", *PLAN)});
             repair.apply(&mut input);
             if let Some(response) = &repair.response {
                 input["previous_section_dependencies"] = dependency_repair_context(response);

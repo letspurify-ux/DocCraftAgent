@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 
-pub(crate) const READ: &str = "Read source evidence before planning the document. Summarize the code according to purpose, grouping related responsibilities and actual workflows. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[string]}. Use 1-12 findings with short topics, observations under 1000 characters and 1-8 supplied evidence IDs. Preserve important entry points, processing, conditions, state changes, outputs, consumers and error/cancellation paths. Adapt the emphasis to the user's requested audience and scope. Do not generate a list of reader questions or a table of contents. verified_overview and supporting_findings contain prior observations checked against their original passages. Carry relevant observations using previously_read anchors; use original passages supplied in this request for new claims or cross-module connections. Runtime findings require implementation evidence; XML/configuration/docs/tests establish context, not execution. Do not infer call order from filenames/imports or treat separate alternatives as consecutive steps. Do not infer absent implementation from an omitted excerpt. Record genuinely unresolved links in uncertainties (at most 8). Request at most 3 focused followup_queries using observed paths/symbols ONLY when an important part of the requested flow needs more source evidence. Avoid extra investigation of minor helper details. On the final pass return followup_queries:[] and keep remaining gaps in uncertainties. When correcting an earlier finding reuse its exact topic. Include all three arrays, even when empty. Use the requested language.";
+const READ_TEMPLATE: &str = "Read source evidence before planning the document. Summarize the code according to purpose, grouping related responsibilities and actual workflows. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[string]}. Use 1-{MAX_FINDINGS} findings with short topics, observations under 1000 characters and 1-{MAX_EVIDENCE_IDS} supplied evidence IDs. Preserve important entry points, processing, conditions, state changes, outputs, consumers and error/cancellation paths. Adapt the emphasis to the user's requested audience and scope. Do not generate a list of reader questions or a table of contents. verified_overview and supporting_findings contain prior observations checked against their original passages. Carry relevant observations using previously_read anchors; use original passages supplied in this request for new claims or cross-module connections. Runtime findings require implementation evidence; XML/configuration/docs/tests establish context, not execution. Do not infer call order from filenames/imports or treat separate alternatives as consecutive steps. Do not infer absent implementation from an omitted excerpt. Record genuinely unresolved links in uncertainties (at most 8). Request at most 3 focused followup_queries using observed paths/symbols ONLY when an important part of the requested flow needs more source evidence. Avoid extra investigation of minor helper details. On the final pass return followup_queries:[] and keep remaining gaps in uncertainties. When correcting an earlier finding reuse its exact topic. Include all three arrays, even when empty. Use the requested language.";
+pub(crate) static READ: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::planning::with_limits(READ_TEMPLATE));
 
 pub(crate) fn intent_key(task: &TaskConfig) -> String {
     source::hash(
@@ -226,7 +228,7 @@ async fn read_sources(
             "source_anchors":prior.evidence.iter().map(|e|json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),
             "evidence":evidence,"evidence_classes":available.iter().map(|e|json!({"id":e.id,"path":e.path,"runtime_allowed":source::is_implementation(&e.path)})).collect::<Vec<_>>(),
             "open_questions":prior.brief.uncertainties,"final_pass":final_pass,"attempt":attempt+1,"previous_error":error,
-            "finding_kind_policy":crate::planning::FINDING_KIND_POLICY,"instruction":READ});
+            "finding_kind_policy":crate::planning::FINDING_KIND_POLICY,"instruction":READ.as_str()});
         repair.apply(&mut input);
         let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
             let mut brief: SourceBrief = repair.decode(&s)?;
@@ -282,7 +284,7 @@ pub(crate) async fn analyze(
         "root":db::load_checkpoint(&ctx.pool,&ctx.id,"understanding:coverage").await?.and_then(|v|v.get("root").cloned()),
         "model":config.model,"endpoint":config.base_url,"output":config.max_output_tokens,
         "context":config.context_limit,"model_context":config.model_context_limit,"safety":config.safety_percent,
-        "reasoning":config.reasoning,"effort":config.effort,"system":system,"instruction":READ
+        "reasoning":config.reasoning,"effort":config.effort,"system":system,"instruction":READ.as_str()
     }).to_string().as_bytes());
     if db::load_checkpoint(&ctx.pool, &ctx.id, "source_understanding_scope").await?
         == Some(json!(scope))

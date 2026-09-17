@@ -446,12 +446,24 @@ pub(crate) fn section_ceiling(branches: Option<usize>) -> usize {
 /// one level deeper and could be described by *fewer* branches - 52 leaves
 /// stopped at 13, 520 leaves at 9. The target follows the leaves instead, so
 /// the level chosen widens as the source does.
+/// Whether descending from `here` to `next` lands closer to `target`.
+fn closer_level(here: usize, next: usize, target: usize) -> bool {
+    next <= target || next - target <= target.saturating_sub(here)
+}
+
 fn branch_target(leaves: usize) -> usize {
     (leaves / 4).clamp(8, SECTIONS_MAX)
 }
 /// Bytes the branch view may spend. Split evenly, so more branches each say
 /// less rather than the last ones saying nothing.
 const BRANCH_VIEW_BYTES: usize = 24_000;
+
+/// An empty branch view is a tree that could not be read, not a project with no
+/// parts. Reported as unknown, or the ceiling would tighten below where it sat
+/// before the branches were consulted at all.
+fn branch_count(branches: &[serde_json::Value]) -> Option<usize> {
+    (!branches.is_empty()).then_some(branches.len())
+}
 
 /// The reduction tree's branches, as the topics each one covers.
 ///
@@ -495,6 +507,12 @@ pub(crate) async fn branch_topics(ctx: &RunContext) -> Result<Vec<serde_json::Va
         if next.is_empty() || next.len() <= level.len() {
             break;
         }
+        // Levels step by the fan-in, so the first one past the target can
+        // overshoot it several times over - 21 then 82 against a target of 64.
+        // Whichever sits closer to the target is the better description.
+        if !closer_level(level.len(), next.len(), target) {
+            break;
+        }
         level = next;
     }
     if level.len() < 2 {
@@ -509,23 +527,72 @@ pub(crate) async fn branch_topics(ctx: &RunContext) -> Result<Vec<serde_json::Va
 /// every part described briefly, not the first few described fully and the rest
 /// left out of the document entirely.
 fn branch_view(level: &[crate::understanding::Node]) -> Vec<serde_json::Value> {
-    let per = BRANCH_VIEW_BYTES / level.len().max(1);
-    let room = (per / MAX_FINDINGS.max(1)).max(120);
+    // Measured, not divided and trusted. Dividing the budget by the branches and
+    // flooring each share spent five times the allowance on a wide tree, and
+    // trading topics for room keeps their product the same, so shrinking the
+    // allowance is what actually converges.
+    let mut allowance = BRANCH_VIEW_BYTES;
+    for _ in 0..24 {
+        let per = allowance / level.len().max(1);
+        let topics = (per / OBSERVATION_FLOOR_BYTES).clamp(1, MAX_FINDINGS);
+        let view = render_branches(
+            level,
+            topics,
+            (per / topics).max(OBSERVATION_FLOOR_BYTES),
+            (per / 600).min(12),
+        );
+        if fits(&view) {
+            return view;
+        }
+        allowance = allowance * 4 / 5;
+    }
+    // Past that the branches themselves do not fit. Carry as many as do and say
+    // how many were left out, rather than silently describing a prefix as if it
+    // were the whole source.
+    let mut shown = level.len();
+    while shown > 1 {
+        shown = shown * 4 / 5;
+        let mut view = render_branches(&level[..shown], 1, OBSERVATION_FLOOR_BYTES, 0);
+        view.push(json!({"branches_not_shown": level.len() - shown}));
+        if fits(&view) {
+            return view;
+        }
+    }
+    vec![json!({"branches_not_shown": level.len()})]
+}
+
+fn fits(view: &[serde_json::Value]) -> bool {
+    serde_json::to_vec(view).is_ok_and(|v| v.len() <= BRANCH_VIEW_BYTES)
+}
+
+/// The shortest observation still worth reading; below this a topic is a title.
+const OBSERVATION_FLOOR_BYTES: usize = 120;
+
+fn render_branches(
+    level: &[crate::understanding::Node],
+    topics: usize,
+    room: usize,
+    files: usize,
+) -> Vec<serde_json::Value> {
     level
         .iter()
         .map(|node| {
-            let topics: Vec<serde_json::Value> = node
+            let shown: Vec<serde_json::Value> = node
                 .discovery
                 .brief
                 .findings
                 .iter()
+                .take(topics)
                 .map(|f| {
                     json!({"topic":editorial::excerpt(&f.topic,200),
                         "observation":editorial::excerpt(&f.observation, room)})
                 })
                 .collect();
-            json!({"files":node.files.iter().take(12).collect::<Vec<_>>(),
-                "file_count":node.files.len(),"topics":topics})
+            // The counts travel even when the lists are trimmed, so a branch
+            // that holds a lot is still recognisable as one that does.
+            json!({"files":node.files.iter().take(files).collect::<Vec<_>>(),
+                "file_count":node.files.len(),"topic_count":node.discovery.brief.findings.len(),
+                "topics":shown})
         })
         .collect()
 }
@@ -590,7 +657,7 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
             let mut input = json!({"purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
             "source_brief":brief,"supporting_findings":crate::purpose::context(&discovery),"source_branches":branches,"source_anchors":discovery.evidence.iter().map(|e| json!({"id":e.id,"path":e.path,"previously_read":true})).collect::<Vec<_>>(),"project_overview":inventory,"feedback":feedback,"revision":revision,
             "evidence":evidence,"max_diagrams":ctx.snapshot.task.max_diagrams,
-            "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{} At most {} sections for this document. Respect user feedback and preserve valid existing section IDs when supplied.", *PLAN, section_ceiling(Some(branches.len())))});
+            "previous_error":previous_error,"attempt":attempt+1,"instruction":format!("{} At most {} sections for this document. Respect user feedback and preserve valid existing section IDs when supplied.", *PLAN, section_ceiling(branch_count(&branches)))});
             repair.apply(&mut input);
             if let Some(response) = &repair.response {
                 input["previous_section_dependencies"] = dependency_repair_context(response);
@@ -602,7 +669,7 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
                     &mut plan,
                     &discovery.evidence,
                     ctx.snapshot.task.max_diagrams,
-                    Some(branches.len()),
+                    branch_count(&branches),
                 )?;
                 Ok(plan)
             });
@@ -819,6 +886,10 @@ mod tests {
         );
         assert_eq!(section_ceiling(Some(0)), 12);
         assert_eq!(section_ceiling(Some(usize::MAX)), SECTIONS_MAX);
+        // Levels step by the fan-in, so the first past the target can overshoot
+        // it several times; the closer of the two is chosen.
+        assert!(closer_level(21, 82, 64));
+        assert!(!closer_level(60, 300, 64));
         // The old flat ceiling is no longer the answer for a large source.
         assert!(section_ceiling(Some(branch_target(5200))) > 32);
         // An outline re-read without its branches keeps the widest bound, or one
@@ -863,11 +934,36 @@ mod tests {
             view.iter()
                 .all(|b| b["topics"].as_array().is_some_and(|t| !t.is_empty()))
         );
-        assert!(
-            serde_json::to_vec(&view)?.len() <= BRANCH_VIEW_BYTES * 2,
-            "{}",
-            serde_json::to_vec(&view)?.len()
-        );
+        // The budget is measured, not divided and hoped for: dividing it and
+        // flooring each share spent five times the allowance once the tree was
+        // wide, and the planning request reserves exactly this much.
+        // The level chosen sits near the target, which is capped, so these are
+        // the widths that actually occur.
+        for count in [2usize, 16, 64] {
+            let level: Vec<_> = (0..count).map(|_| branch(3, MAX_FINDINGS)).collect();
+            let wide = branch_view(&level);
+            assert_eq!(wide.len(), count, "every branch is described");
+            let size = serde_json::to_vec(&wide)?.len();
+            assert!(size <= BRANCH_VIEW_BYTES, "{count} branches took {size}");
+            assert!(
+                wide.iter()
+                    .all(|b| b["topics"].as_array().is_some_and(|t| !t.is_empty())),
+                "{count} branches left one silent"
+            );
+            // A branch whose lists were trimmed still says how much it holds.
+            assert_eq!(wide[0]["topic_count"], MAX_FINDINGS);
+            assert_eq!(wide[0]["file_count"], 3);
+        }
+        // Wider than the budget can describe at all: carry what fits and say how
+        // many were left out, rather than presenting a prefix as the whole source.
+        let huge: Vec<_> = (0..200).map(|_| branch(3, MAX_FINDINGS)).collect();
+        let view = branch_view(&huge);
+        assert!(serde_json::to_vec(&view)?.len() <= BRANCH_VIEW_BYTES);
+        let omitted = view
+            .last()
+            .and_then(|v| v["branches_not_shown"].as_u64())
+            .context("an omission must be named")?;
+        assert_eq!(omitted as usize + view.len() - 1, 200);
         // The file count travels even when the list is capped, so a large branch
         // is recognisable as large.
         let big = branch_view(&[branch(40, 1)]);

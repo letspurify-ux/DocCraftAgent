@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 
-const PLAN_TEMPLATE: &str = "Return JSON {sections:[{title:string,key_points:[string],query:string,evidence_ids:[string],diagrams:[string]}],reader_goal:string,storyline:string}. Organize the code into clear sections and summarize its important behavior according to purpose. source_branches describes the parts the source was read in, each with the topics that part covers and how many files it holds; together they are the scope of this document. Cover every branch, and give a branch with more topics more sections than one with few, so the document grows with what the project does rather than staying a fixed size. Sections come from the branches and their topics, not from a template, and section_ceiling bounds the result; do not pad thin branches to reach a number, and do not compress a large branch into one section because a smaller number looks tidier. Group related responsibilities and workflows, merging thin or overlapping topics. Do not force one section per file or impose a fixed template. Use an order that makes the actual code easy to follow: establish needed context before explaining processing, outputs and important alternative/error paths. Respect the user's explicit audience, scope, section count and diagram instructions. reader_goal briefly states what the document explains; storyline briefly explains the grouping and order. Each section needs a unique title, 1-12 concrete key_points, a query naming observed files/symbols for deeper reading, 1-{MAX_SECTION_ANCHORS} supplied evidence_ids, and diagrams as an array of diagram objectives (use [] if none). Share source evidence across sections when useful, but avoid repeating the same explanation. source_brief and supporting_findings contain previously checked observations, with uncertainties; use original evidence to resolve contradictions or add connections. Previously_read source anchors may support those existing observations when the original is omitted from this request. Missing excerpts and old uncertainties do not prove absent implementation. Do not invent runtime order, join independent workflows, or turn conditional paths into an unconditional sequence. Outline descriptions guide later writing and are not proof of execution. Keep titles under 300 UTF-8 bytes, each key point under 1500 bytes, query under 2000 bytes, reader_goal under 2000 bytes and storyline under 4000 bytes. Allocate at most 4 diagrams per section and respect max_diagrams across the whole document; do not repeat the overall diagram in each section. Use the requested language. Do not generate reader questions, requirement IDs, ownership tables or mandatory handoffs. Detailed transitions belong in the section prose.";
+const PLAN_TEMPLATE: &str = "Return JSON {sections:[{title:string,key_points:[string],query:string,evidence_ids:[string],diagrams:[string]}],reader_goal:string,storyline:string}. Organize the code into clear sections and summarize its important behavior according to purpose. Choose the smallest number of sections that serves the purpose. source_branches describes the parts the source was read in, each with the topics that part covers and how many files it holds; it is what the source contains, not what this document owes a section. Judge each branch against the purpose: a branch the purpose does not ask about gets no section, however many files it holds, and naming it in a section's out_of_scope is better than covering it. What the branches do change is the ceiling: where the purpose does reach many branches, give a branch with more relevant topics more sections than one with few, and do not compress a large relevant branch into one section because a smaller number looks tidier. A large source with a narrow purpose is a short document, and that is the correct answer rather than a failure to fill the room. Group related responsibilities and workflows, merging thin or overlapping topics. Do not force one section per file or impose a fixed template. Use an order that makes the actual code easy to follow: establish needed context before explaining processing, outputs and important alternative/error paths. Respect the user's explicit audience, scope, section count and diagram instructions. reader_goal briefly states what the document explains; storyline briefly explains the grouping and order. Each section needs a unique title, 1-12 concrete key_points, a query naming observed files/symbols for deeper reading, 1-{MAX_SECTION_ANCHORS} supplied evidence_ids, and diagrams as an array of diagram objectives (use [] if none). Share source evidence across sections when useful, but avoid repeating the same explanation. source_brief and supporting_findings contain previously checked observations, with uncertainties; use original evidence to resolve contradictions or add connections. Previously_read source anchors may support those existing observations when the original is omitted from this request. Missing excerpts and old uncertainties do not prove absent implementation. Do not invent runtime order, join independent workflows, or turn conditional paths into an unconditional sequence. Outline descriptions guide later writing and are not proof of execution. Keep titles under 300 UTF-8 bytes, each key point under 1500 bytes, query under 2000 bytes, reader_goal under 2000 bytes and storyline under 4000 bytes. Allocate at most 4 diagrams per section and respect max_diagrams across the whole document; do not repeat the overall diagram in each section. Use the requested language. Do not generate reader questions, requirement IDs, ownership tables or mandatory handoffs. Detailed transitions belong in the section prose.";
 pub(crate) static PLAN: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| with_limits(PLAN_TEMPLATE));
 
@@ -774,6 +774,36 @@ pub async fn section_evidence(ctx: &RunContext, plan: &SectionPlan) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branches_raise_the_ceiling_without_obliging_a_section() {
+        // The branch view is read from the understanding tree, which knows
+        // nothing of the purpose. Telling the planner to cover every branch
+        // therefore spent sections on parts the reader never asked about: a
+        // large source with a narrow purpose is a short document.
+        assert!(
+            PLAN.contains("Choose the smallest number of sections"),
+            "{}",
+            *PLAN
+        );
+        assert!(
+            PLAN.contains("not what this document owes a section"),
+            "{}",
+            *PLAN
+        );
+        assert!(PLAN.contains("gets no section"), "{}", *PLAN);
+        // And the ceiling is only a ceiling: nothing requires a plan to reach it.
+        let source = evidence("/project/a.py", "def process(): return 1");
+        let mut plan: Outline = serde_json::from_value(json!({
+            "reader_goal":"Understand processing","storyline":"One step",
+            "terminology":[],"sections":[{"title":"Only","query":"process",
+                "key_points":["Describe it"],"evidence_ids":[source.id],"diagrams":[]}]
+        }))
+        .expect("outline");
+        assert!(
+            validate_outline(&mut plan, std::slice::from_ref(&source), Some(0), Some(40)).is_ok()
+        );
+    }
 
     #[test]
     fn the_document_widens_with_the_source_rather_than_a_fixed_ceiling() {

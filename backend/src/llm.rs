@@ -874,6 +874,13 @@ fn closes_string(rest: &str) -> bool {
     }
 }
 
+/// Whether `rest`, taken from the `u` of an escape onwards, spells a `u` and
+/// the four hexadecimal digits a JSON code point needs.
+fn hex_escape(rest: &str) -> bool {
+    let mut chars = rest.chars();
+    chars.next() == Some('u') && chars.take(4).filter(char::is_ascii_hexdigit).count() == 4
+}
+
 /// Repair what models most often break inside JSON strings, or `None` when
 /// nothing needed repair.
 ///
@@ -897,6 +904,14 @@ pub fn repair_json_strings(text: &str) -> Option<String> {
         }
         match ch {
             '\\' => match chars.peek().map(|(_, next)| *next) {
+                // Of the escapes, only a code point needs more than its next
+                // character to be valid. A model that wrote a backslash, a u
+                // and then something else left the one broken escape no repair
+                // touched, because u is on the list that starts a valid one.
+                Some('u') if !hex_escape(&text[index + 1..]) => {
+                    out.push_str("\\\\");
+                    changed = true;
+                }
                 Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') => {
                     out.push(ch);
                     if let Some((_, next)) = chars.next() {
@@ -1388,6 +1403,19 @@ mod quota_tests {
             "calls render(\"text\") with {type: \"math\"} and \\( x \\)\nthen returns"
         );
         assert_eq!(value["findings"][0]["evidence_ids"][0], "abcdef12");
+        // A code point escape the model did not finish: u is on the list that
+        // starts a valid escape, so nothing repaired it before.
+        let short = "{\"findings\":[{\"observation\":\"decode reads \\u12 and stops\"}]}";
+        assert!(serde_json::from_str::<Value>(short).is_err());
+        let repaired: Value = decode(short)?;
+        assert_eq!(
+            repaired["findings"][0]["observation"],
+            "decode reads \\u12 and stops"
+        );
+        // A finished one is still an escape and is left alone.
+        let complete = "{\"a\":\"caf\\u00e9\"}";
+        assert_eq!(repair_json_strings(complete), None);
+        assert_eq!(decode::<Value>(complete)?["a"], "café");
         // Valid JSON is left exactly as it was, escapes included.
         let valid = r#"{"a":"quote \" slash \\ tab \t","b":["x", "y"],"c":{"d":"e"}}"#;
         assert_eq!(repair_json_strings(valid), None);

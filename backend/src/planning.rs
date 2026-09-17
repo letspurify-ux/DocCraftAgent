@@ -540,7 +540,86 @@ pub(crate) async fn branch_topics(ctx: &RunContext) -> Result<Vec<serde_json::Va
     if level.len() < 2 {
         return Ok(vec![]);
     }
-    Ok(branch_view(&level))
+    // Paired, so a branch and its files cannot come apart: zipping two slices
+    // would have dropped branches silently if they ever differed in length.
+    let mut branches = Vec::with_capacity(level.len());
+    for node in level {
+        let (files, whole) = covered_files(ctx, &node).await?;
+        branches.push(Branch { node, files, whole });
+    }
+    Ok(branch_view(&branches))
+}
+
+/// Every file a branch was read from, and whether the walk saw all of them.
+///
+/// A node's own `files` are the paths of the passages that reduction carried,
+/// and a reduction packs its children's originals into whatever budget the
+/// summaries leave over - so a branch covering sixteen files reports the six
+/// that happened to fit. The count decides how many sections a branch earns and
+/// the shared directory is its only identity, so both come from the leaves,
+/// where `files` is what was actually read.
+///
+/// Breadth-first and only two fields deep: a depth-first walk that ran out of
+/// budget could return interior nodes and almost no leaves, which is the very
+/// undercount this replaces, and a leaf checkpoint carries its passages' text,
+/// which need not be parsed to read a path.
+async fn covered_files(
+    ctx: &RunContext,
+    branch: &crate::understanding::Node,
+) -> Result<(Vec<String>, bool)> {
+    fn strings(value: &serde_json::Value, key: &str) -> Vec<String> {
+        value[key]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let mut seen = HashSet::new();
+    let mut frontier: std::collections::VecDeque<Vec<String>> =
+        std::collections::VecDeque::from([branch.children.clone()]);
+    if branch.children.is_empty() {
+        seen.extend(branch.files.iter().cloned());
+    }
+    let mut budget = 4_096usize;
+    let mut whole = true;
+    while let Some(keys) = frontier.pop_front() {
+        for key in keys {
+            if budget == 0 {
+                whole = false;
+                break;
+            }
+            budget -= 1;
+            let Some(value) = db::load_checkpoint(&ctx.pool, &ctx.id, &key).await? else {
+                whole = false;
+                continue;
+            };
+            let children = strings(&value, "children");
+            if children.is_empty() {
+                seen.extend(strings(&value, "files"));
+            } else {
+                frontier.push_back(children);
+            }
+        }
+    }
+    // Shown against the source the user named, not from the filesystem root:
+    // every branch otherwise repeats the same long prefix in `where` and in
+    // every path it lists, and the reader already knows where their source is.
+    let roots = &ctx.snapshot.task.sources;
+    let mut files: Vec<String> = seen.iter().map(|path| relative(path, roots)).collect();
+    files.sort();
+    Ok((files, whole))
+}
+
+fn relative(path: &str, roots: &[String]) -> String {
+    roots
+        .iter()
+        .filter_map(|root| path.strip_prefix(&format!("{}/", root.trim_end_matches('/'))))
+        .min_by_key(|rest| rest.len())
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// One branch each, inside a shared byte budget.
@@ -548,7 +627,15 @@ pub(crate) async fn branch_topics(ctx: &RunContext) -> Result<Vec<serde_json::Va
 /// Split evenly rather than first-come: a project with many parts should have
 /// every part described briefly, not the first few described fully and the rest
 /// left out of the document entirely.
-fn branch_view(level: &[crate::understanding::Node]) -> Vec<serde_json::Value> {
+struct Branch {
+    node: crate::understanding::Node,
+    files: Vec<String>,
+    /// False when the walk could not reach every leaf, so `file_count` is a
+    /// floor rather than the number. Silence there would read as a small branch.
+    whole: bool,
+}
+
+fn branch_view(level: &[Branch]) -> Vec<serde_json::Value> {
     // Measured, not divided and trusted. Dividing the budget by the branches and
     // flooring each share spent five times the allowance on a wide tree, and
     // trading topics for room keeps their product the same, so shrinking the
@@ -609,14 +696,15 @@ fn shared_root(files: &[String]) -> String {
 const OBSERVATION_FLOOR_BYTES: usize = 120;
 
 fn render_branches(
-    level: &[crate::understanding::Node],
+    level: &[Branch],
     topics: usize,
     room: usize,
     files: usize,
 ) -> Vec<serde_json::Value> {
     level
         .iter()
-        .map(|node| {
+        .map(|branch| {
+            let (node, paths) = (&branch.node, &branch.files);
             let shown: Vec<serde_json::Value> = node
                 .discovery
                 .brief
@@ -630,10 +718,14 @@ fn render_branches(
                 .collect();
             // The counts travel even when the lists are trimmed, so a branch
             // that holds a lot is still recognisable as one that does.
-            json!({"where":shared_root(&node.files),
-                "files":node.files.iter().take(files).collect::<Vec<_>>(),
-                "file_count":node.files.len(),"topic_count":node.discovery.brief.findings.len(),
-                "topics":shown})
+            let mut record = json!({"where":shared_root(paths),
+                "files":paths.iter().take(files).collect::<Vec<_>>(),
+                "file_count":paths.len(),"topic_count":node.discovery.brief.findings.len(),
+                "topics":shown});
+            if !branch.whole {
+                record["file_count_is_a_floor"] = json!(true);
+            }
+            record
         })
         .collect()
 }
@@ -895,6 +987,16 @@ mod tests {
         assert_eq!(at(&[]), "");
         // A prefix that is not a directory boundary must not match.
         assert_eq!(at(&["a/bc/one.rs", "a/bd/two.rs"]), "a");
+        // Paths are shown against the source the user named, so a branch does
+        // not repeat the same long prefix in `where` and in every file it lists.
+        let roots = vec!["/w/proj".to_string(), "/w/proj/vendor".to_string()];
+        assert_eq!(relative("/w/proj/backend/a.rs", &roots), "backend/a.rs");
+        // The nearest root wins when they nest.
+        assert_eq!(relative("/w/proj/vendor/b.rs", &roots), "b.rs");
+        // A path under no named source is left as it is rather than mangled.
+        assert_eq!(relative("/elsewhere/c.rs", &roots), "/elsewhere/c.rs");
+        // A trailing slash on the source must not leave a leading one behind.
+        assert_eq!(relative("/w/p/a.rs", &["/w/p/".to_string()]), "a.rs");
         // The planner is told the three views are one thing at three depths,
         // and which order the branches are in, or it merges them as three
         // unrelated lists and the narrative wanders.
@@ -1005,9 +1107,20 @@ mod tests {
         };
         // A wide tree must not spend the budget on its first branches and leave
         // the rest out of the document: every branch is described.
+        let pair = |nodes: Vec<crate::understanding::Node>, files: usize| -> Vec<Branch> {
+            nodes
+                .into_iter()
+                .map(|node| Branch {
+                    node,
+                    files: (0..files).map(|i| format!("src/m{i}.rs")).collect(),
+                    whole: true,
+                })
+                .collect()
+        };
         let wide: Vec<_> = (1..=16).map(|i| branch(i, MAX_FINDINGS)).collect();
-        let view = branch_view(&wide);
+        let view = branch_view(&pair(wide, 3));
         assert_eq!(view.len(), 16);
+        assert_eq!(view[0]["file_count"], 3);
         assert!(
             view.iter()
                 .all(|b| b["topics"].as_array().is_some_and(|t| !t.is_empty()))
@@ -1019,7 +1132,7 @@ mod tests {
         // the widths that actually occur.
         for count in [2usize, 16, 64] {
             let level: Vec<_> = (0..count).map(|_| branch(3, MAX_FINDINGS)).collect();
-            let wide = branch_view(&level);
+            let wide = branch_view(&pair(level, 3));
             assert_eq!(wide.len(), count, "every branch is described");
             let size = serde_json::to_vec(&wide)?.len();
             assert!(size <= BRANCH_VIEW_BYTES, "{count} branches took {size}");
@@ -1038,7 +1151,7 @@ mod tests {
         // Wider than the budget can describe at all: carry what fits and say how
         // many were left out, rather than presenting a prefix as the whole source.
         let huge: Vec<_> = (0..200).map(|_| branch(3, MAX_FINDINGS)).collect();
-        let view = branch_view(&huge);
+        let view = branch_view(&pair(huge, 3));
         assert!(serde_json::to_vec(&view)?.len() <= BRANCH_VIEW_BYTES);
         // The marker is not a branch, so the ceiling is not raised by it.
         assert_eq!(branch_count(&view), Some(view.len() - 1));
@@ -1050,11 +1163,24 @@ mod tests {
         assert_eq!(omitted as usize + view.len() - 1, 200);
         // The file count travels even when the list is capped, so a large branch
         // is recognisable as large.
-        let big = branch_view(&[branch(40, 1)]);
+        let big = branch_view(&pair(vec![branch(40, 1)], 40));
         assert_eq!(big[0]["file_count"], 40);
         assert_eq!(big[0]["files"].as_array().map(Vec::len), Some(12));
+        // A walk that could not reach every leaf says so, or an undercount
+        // reads as a small branch and the branch earns fewer sections - the
+        // very failure taking the count from the leaves was meant to end.
+        let partial = branch_view(&[Branch {
+            node: branch(2, 1),
+            files: vec!["src/a.rs".into()],
+            whole: false,
+        }]);
+        assert_eq!(partial[0]["file_count_is_a_floor"], true);
+        assert!(view[0]["file_count_is_a_floor"].is_null());
         // Fewer branches each get more room than many do.
-        let narrow = branch_view(&[branch(1, MAX_FINDINGS), branch(1, MAX_FINDINGS)]);
+        let narrow = branch_view(&pair(
+            vec![branch(1, MAX_FINDINGS), branch(1, MAX_FINDINGS)],
+            1,
+        ));
         let narrow_len = narrow[0]["topics"][0]["observation"]
             .as_str()
             .unwrap_or("")

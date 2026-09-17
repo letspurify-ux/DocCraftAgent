@@ -776,7 +776,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn branches_raise_the_ceiling_without_obliging_a_section() {
+    fn branches_raise_the_ceiling_without_obliging_a_section() -> Result<()> {
         // The branch view is read from the understanding tree, which knows
         // nothing of the purpose. Telling the planner to cover every branch
         // therefore spent sections on parts the reader never asked about: a
@@ -798,11 +798,9 @@ mod tests {
             "reader_goal":"Understand processing","storyline":"One step",
             "terminology":[],"sections":[{"title":"Only","query":"process",
                 "key_points":["Describe it"],"evidence_ids":[source.id],"diagrams":[]}]
-        }))
-        .expect("outline");
-        assert!(
-            validate_outline(&mut plan, std::slice::from_ref(&source), Some(0), Some(40)).is_ok()
-        );
+        }))?;
+        validate_outline(&mut plan, std::slice::from_ref(&source), Some(0), Some(40))?;
+        Ok(())
     }
 
     #[test]

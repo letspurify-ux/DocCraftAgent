@@ -560,6 +560,18 @@ pub fn compact_evidence_ids(input: &mut Value) {
             _ => {}
         }
     }
+    let mut ids = std::collections::BTreeSet::new();
+    collect(input, &mut ids);
+    compact_against(input, &ids);
+}
+
+/// Rewrite ids to the aliases they would be sent as, for a value whose own
+/// shape does not carry the passages that name them.
+///
+/// A brief holds bare id strings and no evidence objects, so `collect` finds
+/// nothing in it. Measuring one against a byte budget still has to charge what
+/// the request will actually spend, which is the alias and not the hash.
+pub fn compact_against(value: &mut Value, ids: &std::collections::BTreeSet<String>) {
     fn rewrite(value: &mut Value, aliases: &[(String, String)]) {
         match value {
             Value::Object(map) => {
@@ -586,8 +598,6 @@ pub fn compact_evidence_ids(input: &mut Value) {
             _ => {}
         }
     }
-    let mut ids = std::collections::BTreeSet::new();
-    collect(input, &mut ids);
     let aliases = ids
         .iter()
         .map(|id| {
@@ -602,7 +612,7 @@ pub fn compact_evidence_ids(input: &mut Value) {
             (id.clone(), id[..length].to_string())
         })
         .collect::<Vec<_>>();
-    rewrite(input, &aliases);
+    rewrite(value, &aliases);
 }
 
 #[cfg(test)]

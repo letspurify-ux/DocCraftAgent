@@ -89,12 +89,31 @@ fn salvage(mut brief: SourceBrief, evidence: &[Evidence], maximum: usize) -> Sou
         .collect();
     brief.uncertainties.push("일부 소스 관찰은 근거 검증을 통과하지 못해 제외되었습니다. 해당 분석 묶음의 검증 오류와 원문을 재검토해야 합니다.".into());
     brief.followup_queries = vec![];
-    while serde_json::to_vec(&brief).map_or(true, |v| v.len() > maximum)
+    // Measured the way the next request will carry it, like the check that sent
+    // the brief here; charging resolved hashes would drop findings to fit a
+    // budget they were never going to spend.
+    while transmitted_size(&brief, evidence).map_or(true, |size| size > maximum)
         && !brief.findings.is_empty()
     {
         brief.findings.pop();
     }
     brief
+}
+
+/// The brief's size as the next request will actually carry it.
+///
+/// Every request rewrites evidence ids to their shortest unique prefix before
+/// it leaves, so a citation costs eight or ten bytes on the wire and never the
+/// sixty-six of a resolved hash. Charging the resolved form against the budget
+/// spent a brief's whole allowance on citations: eight ids across twelve
+/// findings measured over six thousand bytes that were never sent, and readings
+/// well inside the real budget were rejected for length and salvaged, which is
+/// what thinned the document.
+fn transmitted_size(brief: &SourceBrief, evidence: &[Evidence]) -> Result<usize> {
+    let ids = evidence.iter().map(|e| e.id.clone()).collect();
+    let mut value = serde_json::to_value(brief)?;
+    crate::editorial::compact_against(&mut value, &ids);
+    Ok(serde_json::to_vec(&value)?.len())
 }
 
 /// Recover only independently checkable findings; malformed JSON contributes no claims.
@@ -360,7 +379,7 @@ async fn node(
             };
             let validation = validate_brief(&mut brief, &available, true).and_then(|_| {
                 ensure!(
-                    serde_json::to_vec(&brief)?.len() <= summary_cap,
+                    transmitted_size(&brief, &available)? <= summary_cap,
                     "Source summary exceeds {summary_cap} bytes; compress observations"
                 );
                 if children.is_empty() {
@@ -967,6 +986,45 @@ mod tests {
         let recovered = salvage(brief, &[], SUMMARY_MAX_BYTES);
         assert!(recovered.findings.is_empty());
         assert_eq!(recovered.uncertainties.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_brief_is_measured_by_the_citations_the_request_will_carry() -> Result<()> {
+        let evidence: Vec<Evidence> = (0..crate::planning::MAX_EVIDENCE_IDS)
+            .map(|i| Evidence {
+                id: source::hash(&[i as u8]),
+                path: format!("m{i}.rs"),
+                start: 1,
+                end: 2,
+                content: String::new(),
+            })
+            .collect();
+        let brief = SourceBrief {
+            findings: (0..crate::planning::MAX_FINDINGS)
+                .map(|_| crate::planning::Finding {
+                    topic: "관측".into(),
+                    observation: "가".repeat(20),
+                    kind: crate::planning::FindingKind::Context,
+                    evidence_ids: evidence.iter().map(|e| e.id.clone()).collect(),
+                })
+                .collect(),
+            uncertainties: vec![],
+            followup_queries: vec![],
+        };
+        let resolved = serde_json::to_vec(&brief)?.len();
+        let sent = transmitted_size(&brief, &evidence)?;
+        // Every request rewrites an id to its shortest unique prefix, so the
+        // budget was charging sixty-six bytes for something sent as eight.
+        assert!(sent * 2 < resolved, "resolved {resolved}, sent {sent}");
+        // A cap between the two is a brief that fits and used to be rejected,
+        // then salvaged - which is how citations thinned the document.
+        let between = (sent + resolved) / 2;
+        assert!(transmitted_size(&brief, &evidence)? <= between);
+        assert_eq!(
+            salvage(brief.clone(), &evidence, between).findings.len(),
+            brief.findings.len()
+        );
         Ok(())
     }
 

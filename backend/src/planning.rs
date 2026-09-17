@@ -1178,6 +1178,63 @@ const CROWDED_BRANCHES: usize = 4;
 /// explain, and the plan was approved as it stood. Whether the purpose needs a
 /// branch is still the model's judgement - it can answer by excluding the
 /// branch with a reason - but that the question is answered at all is not.
+/// Sections holding more than their writer can be shown.
+///
+/// `crowded_sections` tells review how many branches a section took and asks
+/// whether they are one workflow; a real review answered that with silence
+/// while five sections of six were crowded, one of them 155 files. Whether
+/// branches belong together is a judgement, but whether the section's scope
+/// reaches the writer is not: `branch_memory` carries one observation per leaf
+/// inside a fixed budget and counts what it leaves out. A section whose
+/// checklist is mostly deferred gets written without most of what the whole
+/// reading found about it, however well its branches go together.
+async fn unshowable_sections(
+    ctx: &RunContext,
+    plan: &Outline,
+    reported: &[crate::model::OutlineIssue],
+) -> Result<Vec<crate::model::OutlineIssue>> {
+    let mut issues = vec![];
+    for (index, section) in plan.sections.iter().enumerate() {
+        if section.branches.is_empty()
+            || reported
+                .iter()
+                .any(|issue| issue.section_ids.contains(&section.id))
+        {
+            continue;
+        }
+        let (memory, _) =
+            crate::purpose::branch_memory(ctx, plan, index, crate::runner::BRANCH_MEMORY_BYTES)
+                .await?;
+        issues.extend(scope_issue(
+            section,
+            memory["findings"].as_array().map_or(0, Vec::len),
+            memory["deferred_findings"].as_u64().unwrap_or_default() as usize,
+        ));
+    }
+    Ok(issues)
+}
+
+/// The issue a section earns when most of its own scope stays behind.
+fn scope_issue(
+    section: &SectionPlan,
+    shown: usize,
+    deferred: usize,
+) -> Option<crate::model::OutlineIssue> {
+    (deferred > shown).then(|| crate::model::OutlineIssue {
+        severity: "major".into(),
+        code: "section_scope_not_shown".into(),
+        message: format!(
+            "Section {} ({:?}) covers {} branches, and the reading found more in its scope than its writer can be shown: {shown} observations fit the checklist a section is written from and {deferred} are left out. Split it so that each section carries a scope that fits, or give some of its branches to the sections that explain them.",
+            short_id(&section.id),
+            section.title,
+            section.branches.len()
+        ),
+        section_ids: vec![section.id.clone()],
+        requirement_ids: vec![],
+        query: String::new(),
+    })
+}
+
 fn unassigned_issues(
     coverage: &serde_json::Value,
     reported: &[crate::model::OutlineIssue],
@@ -1582,6 +1639,8 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
         }
         let mut review = review_outline(ctx, system, &plan, &discovery, &view, &coverage).await?;
         review.issues.extend(unassigned_issues(&coverage, &review.issues));
+        let unshowable = unshowable_sections(ctx, &plan, &review.issues).await?;
+        review.issues.extend(unshowable);
         ctx.event("outline_review", json!({"stage":"outline_review","title":"목차의 누락·중복·순서 검토","revision":revision,"issues":review.issues})).await?;
         if review.issues.iter().all(|i| i.severity != "major") {
             let approved = db::load_checkpoint(&ctx.pool, &ctx.id, "outline_approved")
@@ -3218,6 +3277,26 @@ mod tests {
             assert_eq!(validate_brief(&mut brief, &[source], true).is_ok(), valid);
         }
         assert!(llm::decode::<FindingKind>(r#""unknown""#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_section_that_cannot_be_shown_its_own_scope_is_reported_however_coherent() -> Result<()> {
+        let section: SectionPlan = serde_json::from_value(json!({
+            "id":"37d5c3b904b0aaaabbbbccccdddd","title":"벡터 검색·임베딩 동기화·지식 데이터 모델",
+            "key_points":["a"],"query":"q","evidence_ids":[],"diagrams":[],
+            "branches":["B1","B2","B3","B4","B5","B6"]}))?;
+        // What fits is the checklist its writer is given; what does not is what
+        // the reading found and the document will not be told.
+        let issue = scope_issue(&section, 14, 61).context("a mostly deferred scope is an issue")?;
+        assert_eq!(issue.severity, "major");
+        assert_eq!(issue.code, "section_scope_not_shown");
+        assert_eq!(issue.section_ids, vec![section.id.clone()]);
+        assert!(issue.message.contains("61"), "{}", issue.message);
+        assert!(issue.message.contains('6'), "{}", issue.message);
+        // A section whose scope reaches its writer is left alone, crowded or not.
+        assert!(scope_issue(&section, 40, 3).is_none());
+        assert!(scope_issue(&section, 12, 12).is_none());
         Ok(())
     }
 

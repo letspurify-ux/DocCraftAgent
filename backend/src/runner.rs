@@ -1634,7 +1634,7 @@ const REVIEW_REQUEST_OVERHEAD_BYTES: usize = 8_000;
 // Everything that grows with the outline is measured instead.
 const SECTION_BOUNDED_RESERVE_BYTES: usize = 24_000;
 /// Bytes of branch observations one section request carries.
-const BRANCH_MEMORY_BYTES: usize = 16_000;
+pub(crate) const BRANCH_MEMORY_BYTES: usize = 16_000;
 
 /// A section whose repairs ran out while a draft still existed.
 ///

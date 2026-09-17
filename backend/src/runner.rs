@@ -1610,13 +1610,19 @@ fn merge_evidence(
     );
     fresh
 }
+/// What counts as a citation, for resolving one and for checking one.
+///
+/// A citation holds no closing bracket, so everything up to one is its id list.
+/// The two passes used to disagree here - resolution allowed spaces, validation
+/// did not - and a citation the model annotated, as
+/// `[E:410c7872 — preserved observation]`, was therefore resolved by neither and
+/// seen by neither: no issue was raised, no repair was asked for, and the raw
+/// marker reached the page. One pattern, so they cannot drift apart again.
+const CITATION_PATTERN: &str = r"\[E:([^\]]{1,400})\]";
+
 fn normalize_citations(markdown: &str, evidence: &[crate::model::Evidence]) -> Result<String> {
     let literals = crate::editorial::code_ranges(markdown);
-    // A citation holds no closing bracket, so everything up to one is its id
-    // list. Matching only a run without spaces missed [E:a, b], which then
-    // passed every later check untouched: nothing resolved it, nothing
-    // validated it, and the raw marker reached the page.
-    let cite = regex::Regex::new(r"\[E:([^\]]{1,400})\]")?;
+    let cite = regex::Regex::new(CITATION_PATTERN)?;
     Ok(cite
         .replace_all(markdown, |captures: &regex::Captures<'_>| {
             if captures
@@ -1677,7 +1683,7 @@ fn normalize_citations(markdown: &str, evidence: &[crate::model::Evidence]) -> R
         .into_owned())
 }
 pub fn validate_sections(sections: &[Section]) -> Result<Vec<Issue>> {
-    let cite = regex::Regex::new(r"\[E:([^\]\s]+)\]")?;
+    let cite = regex::Regex::new(CITATION_PATTERN)?;
     let mut issues = vec![];
     for (i, s) in sections.iter().enumerate() {
         let ids: std::collections::HashSet<&str> =
@@ -2266,6 +2272,39 @@ mod tests {
         // reject, rather than resolved to whatever happens to be nearby.
         let unknown = normalize_citations("Claim [E:ffffffff(`gone`)].", std::slice::from_ref(&e))?;
         assert!(unknown.contains("[E:ffffffff(`gone`)]"), "{unknown}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_annotated_citation_is_checked_rather_than_slipping_past_review() -> Result<()> {
+        let supplied = Evidence {
+            id: format!("c61fb07b{}", "a".repeat(56)),
+            path: "agent.js".into(),
+            start: 1,
+            end: 4,
+            content: "decide()".into(),
+        };
+        let evidence = [supplied.clone()];
+        // The model annotates a citation when it wants to qualify it. With the
+        // id it names supplied, that still resolves: the label is dropped and
+        // the passage kept.
+        let kept = normalize_citations("보존된 값이다 [E:c61fb07b — 보존된 관찰].", &evidence)?;
+        assert!(kept.contains(&format!("[E:{}]", supplied.id)), "{kept}");
+
+        // With an id that was never supplied it cannot resolve, and the point
+        // is that validation must then see it. The narrower pattern stopped at
+        // the space, so this citation was invisible to review and published raw.
+        let raw = "실측이다 [E:410c7872 — 보존된 관찰; 상태기계는 다른 곳에 있다].";
+        let unresolved = normalize_citations(raw, &evidence)?;
+        assert_eq!(unresolved, raw);
+        let section = Section {
+            title: "흐름".into(),
+            markdown: unresolved,
+            evidence: evidence.to_vec(),
+        };
+        let issues = validate_sections(std::slice::from_ref(&section))?;
+        assert!(issues.iter().any(|i| i.severity == "major"));
+        assert!(issues.iter().any(|i| i.message.contains("410c7872")));
         Ok(())
     }
 

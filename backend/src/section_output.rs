@@ -132,18 +132,19 @@ pub async fn write(ctx: &RunContext, system: &str, input: Value) -> Result<Strin
     loop {
         ctx.check()?;
         let actual_request = request(input.clone(), &progress);
-        let (output, truncated) = match llm::call(ctx, system, actual_request.clone()).await {
-            Ok(output) => (output, false),
-            Err(error) => {
-                let Some(partial) = error.downcast_ref::<llm::TruncatedOutput>() else {
-                    return Err(error);
-                };
-                if partial.content.trim().is_empty() {
-                    return Err(error);
+        let (output, truncated) =
+            match llm::call_markdown(ctx, system, actual_request.clone()).await {
+                Ok(output) => (output, false),
+                Err(error) => {
+                    let Some(partial) = error.downcast_ref::<llm::TruncatedOutput>() else {
+                        return Err(error);
+                    };
+                    if partial.content.trim().is_empty() {
+                        return Err(error);
+                    }
+                    (partial.content.clone(), true)
                 }
-                (partial.content.clone(), true)
-            }
-        };
+            };
         let complete = match progress.append(&output, truncated) {
             Ok(complete) => complete,
             Err(error) => {

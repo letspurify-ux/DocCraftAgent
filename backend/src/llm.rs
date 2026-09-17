@@ -113,10 +113,27 @@ async fn count_tokens(ctx: &RunContext, request: &Value) -> Result<u64> {
 fn retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
-pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<String> {
+/// Ask for a JSON document. Every caller but section writing wants one, and a
+/// fifth of this run's requests were retries of output that was not valid JSON,
+/// so the request says so in the one place the provider can enforce it.
+pub async fn call(ctx: &RunContext, system: &str, input: Value) -> Result<String> {
+    call_with(ctx, system, input, true).await
+}
+
+/// Ask for prose. Section bodies are Markdown, and JSON mode would wrap them.
+pub async fn call_markdown(ctx: &RunContext, system: &str, input: Value) -> Result<String> {
+    call_with(ctx, system, input, false).await
+}
+
+async fn call_with(ctx: &RunContext, system: &str, mut input: Value, json: bool) -> Result<String> {
     ctx.check()?;
     let c = &ctx.snapshot.settings.llm;
-    let (request, cache_key) = prepared_request(c, system, std::mem::take(&mut input))?;
+    // The cache key is taken before this, so turning JSON mode on or off never
+    // invalidates a cached answer or moves the key `forget` computes.
+    let (mut request, cache_key) = prepared_request(c, system, std::mem::take(&mut input))?;
+    if json && !ctx.json_mode_off.load(std::sync::atomic::Ordering::Relaxed) {
+        request["response_format"] = json!({"type": "json_object"});
+    }
     if let Some(row) = sqlx::query("SELECT data FROM llm_cache WHERE hash=?")
         .bind(&cache_key)
         .fetch_optional(&ctx.pool)
@@ -317,6 +334,26 @@ pub async fn call(ctx: &RunContext, system: &str, mut input: Value) -> Result<St
                     bail!("CONTEXT_BUDGET: server requires smaller input");
                 }
                 if !retryable_status(status) {
+                    // A server that does not implement JSON mode rejects the
+                    // request outright, and some say so only with a bare 400.
+                    // Dropping the field and asking once more costs one request
+                    // and tells the two cases apart; the flag keeps the rest of
+                    // the run from paying it again.
+                    if request.get("response_format").is_some() {
+                        ctx.json_mode_off
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(object) = request.as_object_mut() {
+                            object.remove("response_format");
+                        }
+                        ctx.event("json_mode",json!({"stage":"llm","supported":false,"http_status":status.as_u16(),"message":crate::editorial::excerpt(&message,200)})).await?;
+                        if attempt == c.retries {
+                            bail!(
+                                "API rejected request (HTTP {}) while asking for JSON output; JSON mode is now off for this run, so resuming it will not ask again",
+                                status.as_u16()
+                            );
+                        }
+                        continue;
+                    }
                     bail!(
                         "API rejected request (HTTP {}); verify authentication, model and reasoning parameter support",
                         status.as_u16()
@@ -725,6 +762,23 @@ mod quota_tests {
         assert!(!retryable_status(reqwest::StatusCode::BAD_REQUEST));
         assert!(!retryable_status(reqwest::StatusCode::UNAUTHORIZED));
     }
+    #[test]
+    fn json_mode_never_moves_the_cache_key() -> Result<()> {
+        let c = crate::model::LlmConfig {
+            model: "m".into(),
+            base_url: "http://x/v1".into(),
+            ..Default::default()
+        };
+        let (request, key) = prepared_request(&c, "sys", json!({"a":1}))?;
+        // The field is attached by the caller, after the key is taken. Moving it
+        // into the payload would change every key, stranding the whole cache and
+        // making `forget` compute a different key than the call it must evict.
+        assert!(request.get("response_format").is_none(), "{request}");
+        let (_, again) = prepared_request(&c, "sys", json!({"a":1}))?;
+        assert_eq!(key, again);
+        Ok(())
+    }
+
     #[test]
     fn decoder_reports_field_paths_types_and_syntax_positions() -> Result<()> {
         #[derive(serde::Deserialize)]

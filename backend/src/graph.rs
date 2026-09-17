@@ -701,7 +701,23 @@ fn resolve_links(files: &[FileGraph]) -> LinkIndex {
 pub async fn connections(ctx: &RunContext, evidence: &[Evidence], max: usize) -> Result<Value> {
     let index = link_index(ctx).await?;
     let scope: HashSet<&str> = evidence.iter().map(|e| e.path.as_str()).collect();
-    project(&index, &scope, max)
+    let projection = project(&index, &scope, max)?;
+    // What the projection had to leave out decides whether a reduction can see
+    // past its own group, and it is only ever sent to the model. Recording it
+    // makes the rationing measurable from a finished run instead of guessed at.
+    ctx.event(
+        "graph_projection",
+        json!({"stage":"understanding","files":scope.len(),"budget_bytes":max,
+            "links_sent":projection["items"].as_array().map_or(0, Vec::len),
+            "links_deferred":projection["deferred_links"],
+            "calls_leaving":projection["not_shown"]["calls_leaving_this_request"],
+            "same_file_calls":projection["not_shown"]["same_file_calls"],
+            "undeclared_names":projection["not_shown"]["calls_to_undeclared_names"],
+            "files_without_links":projection["files_without_links"].as_array().map_or(0, Vec::len),
+            "files_without_graph":projection["files_without_graph"].as_array().map_or(0, Vec::len)}),
+    )
+    .await?;
+    Ok(projection)
 }
 
 fn project(index: &LinkIndex, scope: &HashSet<&str>, max: usize) -> Result<Value> {

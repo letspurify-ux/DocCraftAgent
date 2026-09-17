@@ -565,7 +565,7 @@ async fn call_with(ctx: &RunContext, system: &str, mut input: Value, json: bool)
                         // this run's checkpoints; this is the model's own text.
                         ctx.event("content_dropped",json!({"stage":"llm","output_tokens":output_tokens,"reasoning_tokens":reasoning,"visible_bytes":output.len(),"body":crate::editorial::excerpt(&output, 2_000),"title":"공급자가 응답 본문 일부를 제거했습니다. 캐시하지 않고 다시 요청합니다"})).await?;
                         bail!(
-                            "PROVIDER_CONTENT_DROPPED: the provider billed {} visible output tokens but delivered only {} bytes, so part of the previous response was removed before it arrived - it stops where the text opened a tag in angle brackets. Write no angle-bracket tag of any kind: not reasoning or chat-template tags (think, /think, im_start) and not markup tags (div, script, xml), even while describing code that parses tags. Name a tag in words or in backticks without its brackets, such as the `think` tag or a `div` element.",
+                            "PROVIDER_CONTENT_DROPPED: the provider billed {} visible output tokens but delivered only {} bytes, so part of the previous response was removed before it arrived - it stops where the text wrote a literal angle bracket around a tag. Backticks do not protect it and neither does a code fence. Write the tag escaped as &lt;think&gt;, which arrives intact, or name it in words without brackets, such as the think tag - for reasoning and chat-template tags (think, /think, im_start) and markup tags (div, script, xml) alike, even while describing code that parses them.",
                             output_tokens.saturating_sub(reasoning.unwrap_or(0)),
                             output.len()
                         );

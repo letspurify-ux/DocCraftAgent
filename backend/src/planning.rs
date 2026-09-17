@@ -91,6 +91,13 @@ pub(crate) const ACCEPTED_FINDINGS: usize = MAX_FINDINGS * 2;
 /// bytes, 66 to a resolved ID, and `summary_budget_bytes` already charges them.
 pub(crate) const ACCEPTED_EVIDENCE_IDS: usize = MAX_EVIDENCE_IDS * 2;
 
+/// Unresolved links a reading is asked to record, and the number that is
+/// still taken. Their bytes are charged with the rest of the brief, so the
+/// count is the same kind of target as the others: a reading that found ten
+/// genuine gaps should not have to drop two of them to be read at all.
+pub(crate) const MAX_UNCERTAINTIES: usize = 8;
+pub(crate) const ACCEPTED_UNCERTAINTIES: usize = MAX_UNCERTAINTIES * 2;
+
 /// How many source anchors one planned section may carry.
 ///
 /// Deliberately not `MAX_EVIDENCE_IDS`: a section names where a reader should
@@ -109,6 +116,7 @@ pub(crate) fn with_limits(template: &str) -> String {
         .replace("{MAX_EVIDENCE_IDS}", &MAX_EVIDENCE_IDS.to_string())
         .replace("{MAX_FINDINGS}", &MAX_FINDINGS.to_string())
         .replace("{MAX_SECTION_ANCHORS}", &MAX_SECTION_ANCHORS.to_string())
+        .replace("{MAX_UNCERTAINTIES}", &MAX_UNCERTAINTIES.to_string())
 }
 
 fn bounded_text(value: &str, max: usize) -> bool {
@@ -170,8 +178,15 @@ pub(crate) fn validate_brief(
         brief.findings.len()
     );
     ensure!(
-        brief.uncertainties.len() <= 8 && brief.uncertainties.iter().all(|s| bounded_text(s, 1500)),
-        "Invalid uncertainties"
+        brief.uncertainties.len() <= ACCEPTED_UNCERTAINTIES
+            && brief.uncertainties.iter().all(|s| bounded_text(s, 1500)),
+        "Supply at most {ACCEPTED_UNCERTAINTIES} nonempty uncertainties of at most 1500 bytes each; the request asks for {MAX_UNCERTAINTIES} (received {} items; lengths {:?})",
+        brief.uncertainties.len(),
+        brief
+            .uncertainties
+            .iter()
+            .map(String::len)
+            .collect::<Vec<_>>()
     );
     // Empty strings are a common representation of no further questions.
     brief
@@ -3327,6 +3342,29 @@ mod tests {
         assert!(error.contains(&MAX_FINDINGS.to_string()), "{error}");
         // A reading with nothing in it is still nothing.
         assert!(validate_brief(&mut brief_of(0)?, &sources, true).is_err());
+
+        // Unresolved links follow the same split, and the refusal says which
+        // rule broke rather than "Invalid uncertainties".
+        let gaps = |count: usize, size: usize| -> Result<SourceBrief> {
+            let mut brief = brief_of(1)?;
+            brief.uncertainties = (0..count).map(|n| format!("{n}{}", "가".repeat(size))).collect();
+            Ok(brief)
+        };
+        validate_brief(&mut gaps(MAX_UNCERTAINTIES + 4, 1)?, &sources, true)?;
+        validate_brief(&mut gaps(ACCEPTED_UNCERTAINTIES, 1)?, &sources, true)?;
+        let error = validate_brief(&mut gaps(ACCEPTED_UNCERTAINTIES + 1, 1)?, &sources, true)
+            .err()
+            .context("more unresolved links than a request carries must not validate")?
+            .to_string();
+        assert!(error.contains(&(ACCEPTED_UNCERTAINTIES + 1).to_string()), "{error}");
+        assert!(error.contains(&MAX_UNCERTAINTIES.to_string()), "{error}");
+        // One too long is still refused, and the lengths say which.
+        let long = validate_brief(&mut gaps(1, 600)?, &sources, true)
+            .err()
+            .context("an oversized uncertainty must not validate")?
+            .to_string();
+        assert!(long.contains("1500"), "{long}");
+        assert!(long.contains("lengths"), "{long}");
 
         // Told its summary was over budget, a reading groups passages under one
         // observation and cites them together - what the instruction asks for.

@@ -13,8 +13,8 @@ use serde_json::json;
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 
-const READ: &str = "Read source evidence before planning, independently of any future documentation purpose. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Read ALL supplied passages. Explain module responsibilities, entry points, inputs, conditions, decisions, state/data changes, outputs, consumers and errors/cancellation/lifecycle. Preserve distinct public workflows, important branches, and producer/consumer contracts. Imports and call names are navigation candidates, not proof of execution. Mark unresolved connections. Runtime observations require implementation passages; tests/docs describe context only. Use at most 12 findings, observations under 1000 characters, at most 6 evidence IDs each, and 8 uncertainties. The whole findings array must serialize under summary_budget_bytes; non-ASCII text costs about three bytes per character. Stay inside that budget by grouping related passages under one observation and citing all of their IDs together, never by leaving a supplied passage uncited. Do not design a table of contents or force unrelated flows into one sequence. Use the requested language.";
-const REDUCE: &str = "Read source evidence before planning. Integrate ALL supplied child summaries into a higher-level source overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve distinct workflows, module contracts, state changes, result consumers, conditional/error/cancel branches and unresolved cross-module links. Child findings have already been checked against their original passages. Preserve their important workflows and source anchors even when those passages are not repeated in this bounded request. previously_read anchors identify those originals; they support carrying the child observation, not inventing new facts. source_graph lists the declarations and connections of the files those children read: a connection there is a syntax candidate, so use it to name and follow a link between two children instead of dropping it, and mark it unresolved rather than asserting execution it does not prove. A finding about such a link still cites supplied evidence IDs at its ends; graph records carry names, not IDs. Use newly supplied original evidence to establish NEW connections; mark any other cross-module synthesis as uncertain. Never invent an execution order to join independent workflows. Do not assume a missing excerpt is absent from the project. Include at most 12 findings, each observation under 1000 characters and with 1-6 supplied evidence IDs, and at most 8 uncertainties. The whole findings array must serialize under summary_budget_bytes, so write fewer and denser observations rather than many that have to be trimmed; non-ASCII text costs about three bytes per character. Do not produce a document outline. Use the requested language.";
+const READ: &str = "Read source evidence before planning, independently of any future documentation purpose. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Read ALL supplied passages. Explain module responsibilities, entry points, inputs, conditions, decisions, state/data changes, outputs, consumers and errors/cancellation/lifecycle. Preserve distinct public workflows, important branches, and producer/consumer contracts. Imports and call names are navigation candidates, not proof of execution. Mark unresolved connections. Runtime observations require implementation passages; tests/docs describe context only. Use at most 12 findings, observations under 1000 characters, at most 8 evidence IDs each, and 8 uncertainties. The whole findings array must serialize under summary_budget_bytes; non-ASCII text costs about three bytes per character. Stay inside that budget by grouping related passages under one observation and citing all of their IDs together, never by leaving a supplied passage uncited. Do not design a table of contents or force unrelated flows into one sequence. Use the requested language.";
+const REDUCE: &str = "Read source evidence before planning. Integrate ALL supplied child summaries into a higher-level source overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve distinct workflows, module contracts, state changes, result consumers, conditional/error/cancel branches and unresolved cross-module links. Child findings have already been checked against their original passages. Preserve their important workflows and source anchors even when those passages are not repeated in this bounded request. previously_read anchors identify those originals; they support carrying the child observation, not inventing new facts. source_graph lists the declarations and connections of the files those children read: a connection there is a syntax candidate, so use it to name and follow a link between two children instead of dropping it, and mark it unresolved rather than asserting execution it does not prove. A finding about such a link still cites supplied evidence IDs at its ends; graph records carry names, not IDs. Use newly supplied original evidence to establish NEW connections; mark any other cross-module synthesis as uncertain. Never invent an execution order to join independent workflows. Do not assume a missing excerpt is absent from the project. Include at most 12 findings, each observation under 1000 characters and with 1-8 supplied evidence IDs, and at most 8 uncertainties. The whole findings array must serialize under summary_budget_bytes, so write fewer and denser observations rather than many that have to be trimmed; non-ASCII text costs about three bytes per character. Do not produce a document outline. Use the requested language.";
 
 // Ceilings, not the operating limits. Both effective limits are derived from
 // the configured context window so that a request always fits the gate in
@@ -24,12 +24,16 @@ const SUMMARY_MAX_BYTES: usize = 48_000;
 const SOURCE_INPUT_MAX_BYTES: usize = 96_000;
 // A leaf must cite every passage it was given, and one brief can name at most
 // MAX_FINDINGS x MAX_EVIDENCE_IDS distinct passages. Filling a batch to that
-// exact ceiling would demand a perfect partition - twelve findings of six
-// distinct passages each, no passage shared - which no reading produces, so the
-// batch takes half of it and leaves the rest for passages that support more
-// than one observation.
-const MAX_BATCH_PASSAGES: usize =
-    crate::planning::MAX_FINDINGS * crate::planning::MAX_EVIDENCE_IDS / 2;
+// exact ceiling would demand a perfect partition - one finding per group of
+// distinct passages, none shared - which no reading produces, so the batch
+// stays well short of it and leaves room for passages that support more than
+// one observation.
+//
+// Held apart from the citation cap rather than derived from it. Letting one
+// finding group more passages should make a reading easier to write, not hand
+// the next batch more source to read; tying the two together meant the cap
+// could not be raised without also enlarging every request.
+const MAX_BATCH_PASSAGES: usize = 36;
 // Instructions, policies and the per-evidence class table that ride along with
 // every understanding request. The structural hint is not in here: it scales
 // with the request instead, so a small context window still leaves room to read
@@ -300,7 +304,7 @@ async fn node(
     if final_overview {
         input["evidence"] = json!([]);
         input["instruction"] = json!(
-            "Read source evidence before planning through verified child findings. Synthesize ALL verified child findings into a balanced project overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve the main product workflows, public entry points, processing, persisted/returned results, consumers and error/cancel paths across ALL children. Dependencies and test harness details together need at most two findings; do not let them displace product behavior. Use at most 12 findings, each under 1000 characters and with 1-6 source_anchors from its child findings, and at most 8 uncertainties. The whole findings array must serialize under summary_budget_bytes, so write fewer and denser observations rather than many that have to be trimmed; non-ASCII text costs about three bytes per character. Previously-read originals are retained and validated by the caller; do not treat their omission from this synthesis request as an unknown project behavior. Carry only observations already in children and distinguish their runtime/context kinds. Do not add new facts or invent cross-module execution order; retain genuinely unresolved connections. Use the requested language."
+            "Read source evidence before planning through verified child findings. Synthesize ALL verified child findings into a balanced project overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve the main product workflows, public entry points, processing, persisted/returned results, consumers and error/cancel paths across ALL children. Dependencies and test harness details together need at most two findings; do not let them displace product behavior. Use at most 12 findings, each under 1000 characters and with 1-8 source_anchors from its child findings, and at most 8 uncertainties. The whole findings array must serialize under summary_budget_bytes, so write fewer and denser observations rather than many that have to be trimmed; non-ASCII text costs about three bytes per character. Previously-read originals are retained and validated by the caller; do not treat their omission from this synthesis request as an unknown project behavior. Carry only observations already in children and distinguish their runtime/context kinds. Do not add new facts or invent cross-module execution order; retain genuinely unresolved connections. Use the requested language."
         );
     }
     // What a request actually spends, against what it was allowed. The split
@@ -795,6 +799,23 @@ mod tests {
         // never be presented as a reason to write fewer findings there.
         assert!(!READ.contains("write fewer"), "{READ}");
         assert!(READ.contains("never by leaving a supplied passage uncited"));
+        // A reading is told what the checker will accept. When the two drifted,
+        // the instruction to group related passages under one observation was
+        // rejected by the cap it never named, and every such reading cost a
+        // retry that only undid the grouping.
+        let cap = crate::planning::MAX_EVIDENCE_IDS;
+        assert!(
+            READ.contains(&format!("at most {cap} evidence IDs each")),
+            "{READ}"
+        );
+        assert!(
+            REDUCE.contains(&format!("1-{cap} supplied evidence IDs")),
+            "{REDUCE}"
+        );
+        assert!(
+            crate::purpose::READ.contains(&format!("1-{cap} supplied evidence IDs")),
+            "purpose READ"
+        );
     }
 
     #[test]

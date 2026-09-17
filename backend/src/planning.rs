@@ -54,8 +54,18 @@ pub(crate) struct Discovery {
 /// `MAX_EVIDENCE_IDS` citations, so one brief can name at most their product in
 /// distinct passages. Callers that must have every supplied passage cited size
 /// their requests against that ceiling.
+///
+/// The citation cap was six, and the readings that hit it were not wrong: a
+/// leaf is told to stay inside its byte budget "by grouping related passages
+/// under one observation and citing all of their IDs together", and a finding
+/// about a fixture set or a migration directory genuinely rests on seven or
+/// eight passages. Rejecting those cost a whole retry and bought nothing, since
+/// the repair only split or dropped the grouping the instruction had asked for.
+/// Eight and not more because a resolved ID costs 66 bytes in the brief that is
+/// itself checked against `summary_budget_bytes`, and those checks already fail
+/// on length.
 pub(crate) const MAX_FINDINGS: usize = 12;
-pub(crate) const MAX_EVIDENCE_IDS: usize = 6;
+pub(crate) const MAX_EVIDENCE_IDS: usize = 8;
 
 fn bounded_text(value: &str, max: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max
@@ -64,7 +74,7 @@ fn bounded_text(value: &str, max: usize) -> bool {
 /// Resolve only unambiguous prefixes from THIS request, then persist full hashes.
 ///
 /// `subject` names the finding or section being checked. Every other rule here
-/// says which item broke it; a bare "supply 1-6 evidence_ids" leaves a repair
+/// says which item broke it; a bare "supply 1-N evidence_ids" leaves a repair
 /// attempt guessing which of a dozen items was empty, so it repeats the mistake.
 fn resolve_ids(ids: &mut [String], evidence: &[Evidence], max: usize, subject: &str) -> Result<()> {
     ensure!(

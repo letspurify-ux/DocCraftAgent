@@ -720,7 +720,44 @@ pub async fn connections(ctx: &RunContext, evidence: &[Evidence], max: usize) ->
     Ok(projection)
 }
 
+/// The longest directory prefix every supplied path shares.
+///
+/// Absolute paths dominated the table: each record repeated the source root
+/// twice, once in its own `path` and once in the `to` it names, and an ambiguous
+/// record repeated it in every candidate. Naming the root once and sending what
+/// follows it costs one field and roughly halves a record.
+fn common_root(paths: &[&str]) -> String {
+    let Some(first) = paths.first() else {
+        return String::new();
+    };
+    let mut root = match first.rfind('/') {
+        Some(cut) => &first[..=cut],
+        None => return String::new(),
+    };
+    for path in paths.iter().skip(1) {
+        while !root.is_empty() && !path.starts_with(root) {
+            root = &root[..root[..root.len() - 1].rfind('/').map_or(0, |cut| cut + 1)];
+        }
+        if root.is_empty() {
+            break;
+        }
+    }
+    root.to_string()
+}
+
+/// Files whose omitted connections a reader should distrust most, named rather
+/// than listed in full: one record per file spent more of the budget on what
+/// could not be carried than on what could.
+const MOST_DEFERRED_MAX: usize = 5;
+/// Room held back for the two fields that can only be filled after rationing.
+const DEFERRAL_REPORT_BYTES: usize = 400;
+
 fn project(index: &LinkIndex, scope: &HashSet<&str>, max: usize) -> Result<Value> {
+    let mut paths: Vec<&str> = scope.iter().copied().collect();
+    paths.sort_unstable();
+    let root = common_root(&paths);
+    let short = |path: &str| path.strip_prefix(root.as_str()).unwrap_or(path).to_string();
+
     let mut by_file: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
     let mut leaving = 0usize;
     for link in &index.cross {
@@ -737,9 +774,10 @@ fn project(index: &LinkIndex, scope: &HashSet<&str>, max: usize) -> Result<Value
             continue;
         }
         let record = if link.to_path.is_empty() {
-            json!({"from":link.from,"to":link.to,"declared_in":link.candidates,"calls":link.calls,"resolved":false})
+            json!({"from":link.from,"to":link.to,"calls":link.calls,"resolved":false,
+                "declared_in":link.candidates.iter().map(|c| short(c)).collect::<Vec<_>>()})
         } else {
-            json!({"from":link.from,"to":format!("{}::{}",link.to_path,link.to),"calls":link.calls})
+            json!({"from":link.from,"to":format!("{}::{}",short(&link.to_path),link.to),"calls":link.calls})
         };
         by_file
             .entry(link.from_path.as_str())
@@ -747,46 +785,64 @@ fn project(index: &LinkIndex, scope: &HashSet<&str>, max: usize) -> Result<Value
             .push(record);
     }
     let linked: HashSet<&str> = by_file.keys().copied().collect();
-    let mut without_links: Vec<&str> = scope
+    let named_short = |paths: &[&str]| -> Value {
+        let shortened: Vec<String> = paths.iter().map(|p| short(p)).collect();
+        if shortened.len() <= NAMED_FILES_MAX {
+            return json!(shortened);
+        }
+        json!({"paths":&shortened[..NAMED_FILES_MAX],"further":shortened.len()-NAMED_FILES_MAX})
+    };
+    let without_links: Vec<&str> = paths
         .iter()
         .copied()
         .filter(|p| index.paths.contains(*p) && !linked.contains(p))
         .collect();
-    let mut without_graph: Vec<&str> = scope
+    let without_graph: Vec<&str> = paths
         .iter()
         .copied()
         .filter(|p| !index.paths.contains(*p))
         .collect();
-    without_links.sort_unstable();
-    without_graph.sort_unstable();
+    let counted =
+        |m: &HashMap<String, usize>| -> usize { scope.iter().filter_map(|p| m.get(*p)).sum() };
+
+    // Everything but the links, measured first: the budget bounds the whole
+    // hint, and until now it bounded only the records, so a request with many
+    // files spent half again its allowance on the list of what it had dropped.
+    let mut out = json!({
+        "root":root,
+        "files_without_links":named_short(&without_links),
+        "files_without_graph":named_short(&without_graph),
+        "not_shown":{"same_file_calls":counted(&index.internal),
+            "calls_leaving_this_request":leaving,
+            "calls_to_undeclared_names":counted(&index.unresolved)},
+        "semantics":"Syntax only, and never a citation: `from` and `to` are declaration names with a call count folded across every site, not evidence IDs, so cite the supplied child findings instead. Every path is relative to `root`. A `to` of the form `path::symbol` means that name is declared in exactly one other supplied file; a record with `resolved:false` means several files declare the name and `declared_in` lists them, so treat which one runs as unresolved. `calls` counts call sites, not executions, and this table carries no order or condition: do not assert runtime sequence from it. Same-file calls are left out because the child summaries already describe them. `deferred_links`, `most_deferred`, `files_without_links` and `files_without_graph` say where connections exist that this request could not carry or could not see; treat those as unresolved, never as evidence that none exist."
+    });
+    let overhead = serde_json::to_vec(&out)?.len() + DEFERRAL_REPORT_BYTES;
+
     let files: Vec<(String, Vec<Value>)> = by_file
         .into_iter()
-        .map(|(path, records)| (path.to_string(), records))
+        .map(|(path, records)| (short(path), records))
         .collect();
-    let (items, omitted) = ration(&files, max)?;
+    let (items, omitted) = ration(&files, max.saturating_sub(overhead))?;
     let deferred: usize = omitted
         .iter()
         .filter_map(|o| o["omitted_records"].as_u64())
         .sum::<u64>() as usize;
-    let counted =
-        |m: &HashMap<String, usize>| -> usize { scope.iter().filter_map(|p| m.get(*p)).sum() };
-    Ok(json!({
-        "items":items,"omitted":omitted,"deferred_links":deferred,
-        "files_without_links":named(&without_links),"files_without_graph":named(&without_graph),
-        "not_shown":{"same_file_calls":counted(&index.internal),
-            "calls_leaving_this_request":leaving,
-            "calls_to_undeclared_names":counted(&index.unresolved)},
-        "semantics":"Syntax only, and never a citation: `from` and `to` are declaration names with a call count folded across every site, not evidence IDs, so cite the supplied child findings instead. A `to` of the form `path::symbol` means that name is declared in exactly one other supplied file; a record with `resolved:false` means several files declare the name and `declared_in` lists them, so treat which one runs as unresolved. `calls` counts call sites, not executions, and this table carries no order or condition: do not assert runtime sequence from it. Same-file calls are left out because the child summaries already describe them. `omitted`, `files_without_links` and `files_without_graph` name connections this request could not carry or could not see; treat those as unresolved, never as evidence that none exist."
-    }))
-}
-
-/// Name the files, up to a cap, rather than report a bare total: a reader that
-/// sees only a count cannot tell which summary to distrust.
-fn named(paths: &[&str]) -> Value {
-    if paths.len() <= NAMED_FILES_MAX {
-        return json!(paths);
-    }
-    json!({"paths":&paths[..NAMED_FILES_MAX],"further":paths.len()-NAMED_FILES_MAX})
+    let mut worst: Vec<(&str, u64)> = omitted
+        .iter()
+        .filter_map(|o| Some((o["path"].as_str()?, o["omitted_records"].as_u64()?)))
+        .collect();
+    worst.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    worst.truncate(MOST_DEFERRED_MAX);
+    out["items"] = json!(items);
+    out["deferred_links"] = json!(deferred);
+    out["most_deferred"] = json!(
+        worst
+            .into_iter()
+            .map(|(path, links)| json!({"path":path,"links":links}))
+            .collect::<Vec<_>>()
+    );
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -930,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn a_squeezed_budget_still_describes_every_calling_file() -> Result<()> {
+    fn the_whole_hint_fits_the_budget_and_still_describes_every_calling_file() -> Result<()> {
         let files = [
             parsed("a.rs", "fn a1() { t1(); t1(); t1(); }\nfn a2() { t2(); }")?,
             parsed("b.rs", "fn b1() { t1(); }\nfn b2() { t2(); t2(); }")?,
@@ -938,18 +994,62 @@ mod tests {
         ];
         let index = resolve_links(&files);
         let scope = scope_of(&["a.rs", "b.rs", "t.rs"]);
-        let full = project(&index, &scope, 4000)?;
+        let full = project(&index, &scope, 8_000)?;
         assert_eq!(full["items"].as_array().map(Vec::len), Some(4));
-        let tight = project(&index, &scope, 150)?;
+        assert_eq!(full["deferred_links"], 0);
+
+        // The budget bounds the hint, not just its records: the instructions
+        // and the report of what was dropped are part of what the request
+        // carries. The exact byte counts are not the contract, so the squeeze
+        // is found rather than assumed.
+        let floor = serde_json::to_vec(&project(&index, &scope, 0)?)?.len();
+        let (mut tight, mut budget) = (Value::Null, 0usize);
+        for extra in (0..=600).step_by(20) {
+            let candidate = project(&index, &scope, floor + extra)?;
+            let carried = candidate["items"].as_array().map_or(0, Vec::len);
+            if (2..4).contains(&carried) {
+                (tight, budget) = (candidate, floor + extra);
+                break;
+            }
+        }
+        assert!(!tight.is_null(), "no budget produced a partial hint");
+        assert!(serde_json::to_vec(&tight)?.len() <= budget);
         let items = tight["items"].as_array().cloned().unwrap_or_default();
-        assert!(!items.is_empty() && items.len() < 4);
         let described: HashSet<&str> = items.iter().filter_map(|i| i["path"].as_str()).collect();
         // Breadth-first: a long first file cannot consume the whole budget.
         assert_eq!(described.len(), 2);
         assert!(tight["deferred_links"].as_u64().unwrap_or(0) > 0);
-        // The busiest pair survives the squeeze.
+        // The busiest pair survives the squeeze, and the files that lost the
+        // most are named rather than listed one record per file.
         let kept = items.iter().find(|i| i["path"] == "a.rs").context("a.rs")?;
         assert_eq!(kept["calls"], 3);
+        assert!(
+            tight["most_deferred"]
+                .as_array()
+                .is_some_and(|w| !w.is_empty())
+        );
+        assert!(tight["most_deferred"].as_array().map(Vec::len) <= Some(MOST_DEFERRED_MAX));
+        Ok(())
+    }
+
+    #[test]
+    fn a_shared_source_root_is_named_once_instead_of_on_every_record() -> Result<()> {
+        let files = [
+            parsed("/w/app/backend/src/server.rs", "fn handle() { resolve(); }")?,
+            parsed("/w/app/backend/src/chart.rs", "fn resolve() {}")?,
+        ];
+        let index = resolve_links(&files);
+        let scope = scope_of(&[
+            "/w/app/backend/src/server.rs",
+            "/w/app/backend/src/chart.rs",
+        ]);
+        let out = project(&index, &scope, 8_000)?;
+        assert_eq!(out["root"], "/w/app/backend/src/");
+        // Each record repeated the root twice, and an ambiguous one repeated it
+        // in every candidate; the reader still gets the full path from `root`.
+        assert_eq!(out["items"][0]["to"], "chart.rs::resolve");
+        assert_eq!(out["items"][0]["path"], "server.rs");
+        assert!(!serde_json::to_string(&out["items"])?.contains("/w/app"));
         Ok(())
     }
 

@@ -1193,6 +1193,18 @@ const CROWDED_BRANCHES: usize = 4;
 /// explain, and the plan was approved as it stood. Whether the purpose needs a
 /// branch is still the model's judgement - it can answer by excluding the
 /// branch with a reason - but that the question is answered at all is not.
+/// Whether `message` names the branch `label` rather than the start of a longer
+/// one. `B1` reads as a substring of `B12` and of `B1.2`, so a review that
+/// named the twelfth branch silently answered for the first as well.
+fn names_label(message: &str, label: &str) -> bool {
+    message.match_indices(label).any(|(at, _)| {
+        let before = message[..at].chars().next_back();
+        let after = message[at + label.len()..].chars().next();
+        before.is_none_or(|c| !c.is_ascii_alphanumeric())
+            && after.is_none_or(|c| !c.is_ascii_digit() && c != '.')
+    })
+}
+
 /// Sections holding more than their writer can be shown.
 ///
 /// `crowded_sections` tells review how many branches a section took and asks
@@ -1208,6 +1220,11 @@ async fn unshowable_sections(
     plan: &Outline,
     reported: &[crate::model::OutlineIssue],
 ) -> Result<Vec<crate::model::OutlineIssue>> {
+    if plan.sections.iter().all(|s| s.branches.is_empty()) {
+        return Ok(vec![]);
+    }
+    let counts =
+        crate::purpose::scope_counts(ctx, plan, crate::runner::BRANCH_MEMORY_BYTES).await?;
     let mut issues = vec![];
     for (index, section) in plan.sections.iter().enumerate() {
         if section.branches.is_empty()
@@ -1217,14 +1234,8 @@ async fn unshowable_sections(
         {
             continue;
         }
-        let (memory, _) =
-            crate::purpose::branch_memory(ctx, plan, index, crate::runner::BRANCH_MEMORY_BYTES)
-                .await?;
-        issues.extend(scope_issue(
-            section,
-            memory["findings"].as_array().map_or(0, Vec::len),
-            memory["deferred_findings"].as_u64().unwrap_or_default() as usize,
-        ));
+        let (shown, deferred) = counts.get(index).copied().unwrap_or_default();
+        issues.extend(scope_issue(section, shown, deferred));
     }
     Ok(issues)
 }
@@ -1262,7 +1273,10 @@ fn unassigned_issues(
             let label = item.get("branch").and_then(|v| v.as_str())?;
             // A review that already named the branch has judged it; saying it
             // twice would spend a correction round on agreeing.
-            if reported.iter().any(|issue| issue.message.contains(label)) {
+            if reported
+                .iter()
+                .any(|issue| names_label(&issue.message, label))
+            {
                 return None;
             }
             let topics: Vec<&str> = item
@@ -1624,27 +1638,23 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
             }
             None => plan_whole(ctx, system, &discovery, &view, &feedback, revision).await?,
         };
-        db::checkpoint(
-            &ctx.pool,
-            &ctx.id,
-            "outline_candidate",
-            &serde_json::to_value(&plan)?,
-        )
-        .await?;
-        db::checkpoint(
-            &ctx.pool,
-            &ctx.id,
-            &format!("outline_candidate:{revision}"),
-            &serde_json::to_value(&plan)?,
-        )
-        .await?;
-        db::checkpoint(
-            &ctx.pool,
-            &ctx.id,
-            "outline_state",
-            &json!({"revision":revision,"round":round,"extra_queries":extra_queries}),
-        )
-        .await?;
+        // One statement for the candidate and the number that identifies it. As
+        // separate writes, a process that died between them came back with a
+        // plan from one revision and a state from the one before, and an
+        // approval written for the plan was then compared against the state.
+        let stored = serde_json::to_value(&plan)?;
+        let mut tx = ctx.pool.begin().await?;
+        for (step, value) in [
+            ("outline_candidate".to_string(), stored.clone()),
+            (format!("outline_candidate:{revision}"), stored),
+            (
+                "outline_state".to_string(),
+                json!({"revision":revision,"round":round,"extra_queries":extra_queries}),
+            ),
+        ] {
+            sqlx::query("INSERT INTO checkpoints(run_id,step,data) VALUES(?,?,?) ON DUPLICATE KEY UPDATE data=VALUES(data)").bind(&ctx.id).bind(step).bind(value.to_string()).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         let coverage = branch_coverage(&plan, &view);
         if !coverage.is_null() {
             ctx.event("outline_coverage", json!({"stage":"planning","title":"목차의 소스 브랜치 배정 확인","revision":revision,
@@ -1653,15 +1663,31 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
                 "unassigned":coverage["unassigned"],"crowded_sections":coverage["crowded_sections"]})).await?;
         }
         let mut review = review_outline(ctx, system, &plan, &discovery, &view, &coverage).await?;
+        let reviewed = review.issues.len();
         review.issues.extend(unassigned_issues(&coverage, &review.issues));
         let unshowable = unshowable_sections(ctx, &plan, &review.issues).await?;
         review.issues.extend(unshowable);
+        if review.issues.len() != reviewed {
+            // What the server found belongs to the stored review, not only to
+            // this loop: the screen reads that checkpoint, and so does the
+            // approval that starts writing. Re-reading it adds nothing, because
+            // both additions skip an issue already naming what they found.
+            db::checkpoint(
+                &ctx.pool,
+                &ctx.id,
+                &format!("outline_review:{}", plan.revision),
+                &serde_json::to_value(&review)?,
+            )
+            .await?;
+        }
         ctx.event("outline_review", json!({"stage":"outline_review","title":"목차의 누락·중복·순서 검토","revision":revision,"issues":review.issues})).await?;
         if review.issues.iter().all(|i| i.severity != "major") {
+            // The approval names the plan's own revision, which is what the
+            // API wrote and what a legacy candidate without the field reads as.
             let approved = db::load_checkpoint(&ctx.pool, &ctx.id, "outline_approved")
                 .await?
                 .and_then(|v| v.as_u64())
-                == Some(u64::from(revision));
+                == Some(u64::from(plan.revision));
             if ctx.snapshot.task.preview_outline && !approved {
                 bail!("AWAITING_OUTLINE: 목차를 확인하고 본문 작성을 시작하세요");
             }
@@ -2781,6 +2807,19 @@ mod tests {
             query: String::new(),
         };
         assert!(unassigned_issues(&coverage, std::slice::from_ref(&judged)).is_empty());
+        // A review that named a longer label has not answered for this one.
+        let other = crate::model::OutlineIssue {
+            message: "B31 and B3.2 are covered by section two".into(),
+            ..judged.clone()
+        };
+        assert_eq!(
+            unassigned_issues(&coverage, std::slice::from_ref(&other)).len(),
+            1
+        );
+        assert!(names_label("B3 is unassigned", "B3"));
+        assert!(names_label("sections cover B3, and B4", "B3"));
+        assert!(!names_label("B31 is crowded", "B3"));
+        assert!(!names_label("B3.2 is crowded", "B3"));
         let raised = unassigned_issues(&coverage, &[]);
         assert_eq!(raised.len(), 1);
         assert_eq!(raised[0].severity, "major");

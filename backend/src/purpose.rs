@@ -423,10 +423,50 @@ pub(crate) fn assign_leaves(
     index: usize,
     mine: &[String],
 ) -> (Vec<String>, usize) {
-    // Every section's claims, not only this one's: a tie is broken by how many
-    // ties each section has already won, and that count has to come out the
-    // same whichever section is asking.
-    let mut claims: HashMap<&str, Vec<usize>> = HashMap::new();
+    kept(tree, &ownership(tree, outline), index, mine)
+}
+
+/// Every section's leaves in one pass.
+///
+/// A section's own leaves are decided by looking at every section, so asking
+/// section by section walks the whole outline once per section. Callers that
+/// need more than one section ask once.
+pub(crate) fn assign_all(
+    tree: &crate::understanding::TreeIndex,
+    outline: &Outline,
+) -> Vec<(Vec<String>, usize)> {
+    let own = ownership(tree, outline);
+    (0..outline.sections.len())
+        .map(|index| kept(tree, &own, index, &own.reached[index]))
+        .collect()
+}
+
+/// Which section owns each shared leaf, and what each section reaches.
+struct Ownership {
+    reached: Vec<Vec<String>>,
+    terms: Vec<Vec<String>>,
+    owner: HashMap<String, usize>,
+}
+
+fn leaf_text(tree: &crate::understanding::TreeIndex, leaf: &str) -> String {
+    tree.nodes.get(leaf).map_or(String::new(), |node| {
+        node.observations()
+            .map(|f| format!("{} {}", f.topic, f.observation))
+            .chain(node.spans.iter().map(|s| s.path.clone()))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    })
+}
+
+fn term_score(terms: &[String], text: &str) -> usize {
+    terms
+        .iter()
+        .filter(|term| text.contains(term.as_str()))
+        .count()
+}
+
+fn ownership(tree: &crate::understanding::TreeIndex, outline: &Outline) -> Ownership {
     let reached: Vec<Vec<String>> = outline
         .sections
         .iter()
@@ -438,6 +478,10 @@ pub(crate) fn assign_leaves(
             }
         })
         .collect();
+    // Every section's claims, not only one's: a tie is broken by how many ties
+    // each section has already won, and that count has to come out the same
+    // whichever section is asking.
+    let mut claims: HashMap<&str, Vec<usize>> = HashMap::new();
     for (section, leaves) in reached.iter().enumerate() {
         for leaf in leaves {
             claims.entry(leaf.as_str()).or_default().push(section);
@@ -455,23 +499,7 @@ pub(crate) fn assign_leaves(
             ))
         })
         .collect();
-    let text = |leaf: &str| {
-        tree.nodes.get(leaf).map_or(String::new(), |node| {
-            node.observations()
-                .map(|f| format!("{} {}", f.topic, f.observation))
-                .chain(node.spans.iter().map(|s| s.path.clone()))
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_lowercase()
-        })
-    };
-    let score = |text: &str, section: usize| {
-        terms[section]
-            .iter()
-            .filter(|term| text.contains(term.as_str()))
-            .count()
-    };
-    let mut owner: HashMap<&str, usize> = HashMap::new();
+    let mut owner: HashMap<String, usize> = HashMap::new();
     let mut won = vec![0usize; outline.sections.len()];
     for leaf in &tree.leaves {
         let Some(candidates) = claims.get(leaf.as_str()) else {
@@ -480,8 +508,11 @@ pub(crate) fn assign_leaves(
         if candidates.len() < 2 {
             continue;
         }
-        let text = text(leaf);
-        let scores: Vec<usize> = candidates.iter().map(|c| score(&text, *c)).collect();
+        let text = leaf_text(tree, leaf);
+        let scores: Vec<usize> = candidates
+            .iter()
+            .map(|c| term_score(&terms[*c], &text))
+            .collect();
         let best = scores.iter().copied().max().unwrap_or(0);
         let chosen = candidates
             .iter()
@@ -491,20 +522,129 @@ pub(crate) fn assign_leaves(
             .min_by_key(|c| (won[*c], *c))
             .unwrap_or(candidates[0]);
         won[chosen] += 1;
-        owner.insert(leaf.as_str(), chosen);
+        owner.insert(leaf.clone(), chosen);
     }
+    Ownership {
+        reached,
+        terms,
+        owner,
+    }
+}
+
+fn kept(
+    tree: &crate::understanding::TreeIndex,
+    own: &Ownership,
+    index: usize,
+    mine: &[String],
+) -> (Vec<String>, usize) {
     let mut kept = vec![];
     let mut elsewhere = 0;
     for leaf in mine {
-        if owner.get(leaf.as_str()).is_some_and(|o| *o != index) {
+        if own.owner.get(leaf).is_some_and(|o| *o != index) {
             elsewhere += 1;
             continue;
         }
-        kept.push((score(&text(leaf), index), leaf.clone()));
+        kept.push((
+            term_score(&own.terms[index], &leaf_text(tree, leaf)),
+            leaf.clone(),
+        ));
     }
     // Most relevant first; the sort is stable, so reading order breaks ties.
     kept.sort_by(|a, b| b.0.cmp(&a.0));
     (kept.into_iter().map(|(_, leaf)| leaf).collect(), elsewhere)
+}
+
+/// What a section's checklist carries: the records that fit, the leaf and
+/// passage each cited, and how many records were left behind.
+type Scope = (Vec<Value>, Vec<(String, String)>, usize);
+
+/// One observation from every leaf before a second from any, measured against
+/// the budget the request will spend on them: what fits, the passages those
+/// records cite, and how many records were left behind.
+fn scope_records(
+    tree: &crate::understanding::TreeIndex,
+    leaves: &[String],
+    limit: usize,
+    relative: &dyn Fn(&str) -> String,
+) -> Result<Scope> {
+    let mut shown = vec![];
+    let mut cited: Vec<(String, String)> = vec![];
+    let (mut used, mut deferred) = (0usize, 0usize);
+    let deepest = leaves
+        .iter()
+        .filter_map(|key| tree.nodes.get(key))
+        .map(|node| node.observations().count())
+        .max()
+        .unwrap_or(0);
+    for round in 0..deepest {
+        for key in leaves {
+            let Some(node) = tree.nodes.get(key) else {
+                continue;
+            };
+            let Some(finding) = node.observations().nth(round) else {
+                continue;
+            };
+            let sources: Vec<String> = node
+                .spans
+                .iter()
+                .filter(|span| finding.evidence_ids.contains(&span.id))
+                .map(|span| format!("{}:{}-{}", relative(&span.path), span.start, span.end))
+                .collect();
+            let record = json!({"topic":finding.topic,
+                "observation":editorial::excerpt(&finding.observation, 900),
+                "kind":finding.kind,"sources":sources});
+            let size = serde_json::to_vec(&record)?.len();
+            if used + size > limit {
+                deferred += 1;
+                continue;
+            }
+            used += size;
+            shown.push(record);
+            cited.extend(
+                finding
+                    .evidence_ids
+                    .iter()
+                    .map(|id| (key.clone(), id.clone())),
+            );
+        }
+    }
+    Ok((shown, cited, deferred))
+}
+
+/// What every section's checklist would show and what it would leave behind,
+/// without opening the passages behind it.
+///
+/// Planning needs both counts for every section. Asking `branch_memory` section
+/// by section assigned the leaves of the whole outline once per section and
+/// then read a checkpoint for every passage it cited, whose text the caller
+/// dropped.
+pub(crate) async fn scope_counts(
+    ctx: &RunContext,
+    outline: &Outline,
+    limit: usize,
+) -> Result<Vec<(usize, usize)>> {
+    let tree = crate::understanding::tree(ctx).await?;
+    let assignment = assign_all(&tree, outline);
+    let roots = &ctx.snapshot.task.sources;
+    let relative = |path: &str| {
+        roots
+            .iter()
+            .filter_map(|root| path.strip_prefix(&format!("{}/", root.trim_end_matches('/'))))
+            .min_by_key(|rest| rest.len())
+            .unwrap_or(path)
+            .to_string()
+    };
+    let mut counts = Vec::with_capacity(outline.sections.len());
+    for (index, section) in outline.sections.iter().enumerate() {
+        ctx.check()?;
+        if section.branches.is_empty() {
+            counts.push((0, 0));
+            continue;
+        }
+        let (shown, _, deferred) = scope_records(&tree, &assignment[index].0, limit, &relative)?;
+        counts.push((shown.len(), deferred));
+    }
+    Ok(counts)
 }
 
 /// The readings of the source a section was planned to cover, and the passages
@@ -541,47 +681,7 @@ pub(crate) async fn branch_memory(
             .unwrap_or(path)
             .to_string()
     };
-    let mut shown = vec![];
-    let mut cited: Vec<(String, String)> = vec![];
-    let (mut used, mut deferred) = (0usize, 0usize);
-    let deepest = leaves
-        .iter()
-        .filter_map(|key| tree.nodes.get(key))
-        .map(|node| node.observations().count())
-        .max()
-        .unwrap_or(0);
-    for round in 0..deepest {
-        for key in &leaves {
-            let Some(node) = tree.nodes.get(key) else {
-                continue;
-            };
-            let Some(finding) = node.observations().nth(round) else {
-                continue;
-            };
-            let sources: Vec<String> = node
-                .spans
-                .iter()
-                .filter(|span| finding.evidence_ids.contains(&span.id))
-                .map(|span| format!("{}:{}-{}", relative(&span.path), span.start, span.end))
-                .collect();
-            let record = json!({"topic":finding.topic,
-                "observation":editorial::excerpt(&finding.observation, 900),
-                "kind":finding.kind,"sources":sources});
-            let size = serde_json::to_vec(&record)?.len();
-            if used + size > limit {
-                deferred += 1;
-                continue;
-            }
-            used += size;
-            shown.push(record);
-            cited.extend(
-                finding
-                    .evidence_ids
-                    .iter()
-                    .map(|id| (key.clone(), id.clone())),
-            );
-        }
-    }
+    let (shown, cited, deferred) = scope_records(&tree, &leaves, limit, &relative)?;
     // Only the leaves that contributed a shown observation are opened for text.
     let mut opened: HashMap<String, Vec<Evidence>> = HashMap::new();
     let mut evidence = vec![];

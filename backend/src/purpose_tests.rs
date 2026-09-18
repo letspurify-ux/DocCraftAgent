@@ -146,6 +146,11 @@ fn sections_sharing_a_branch_split_its_leaves_instead_of_repeating_the_first() -
         unmatched.iter().any(|l| first.contains(&l.to_string()))
             && unmatched.iter().any(|l| second.contains(&l.to_string()))
     );
+    // Asking for every section at once gives what asking one at a time gave.
+    let all = assign_all(&tree, &outline);
+    assert_eq!(all[0], (first.clone(), left_first));
+    assert_eq!(all[1], (second.clone(), left_second));
+    assert_eq!(all[2], (vec![], 0));
     // A branch nobody else names keeps all of its leaves.
     let alone: crate::model::Outline = serde_json::from_value(
         json!({"sections":[{"title":"전부","query":"q","key_points":[],"branches":["branch"]}]}),

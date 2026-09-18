@@ -157,7 +157,20 @@ fn resolve_ids(
             .iter()
             .filter(|e| e.id.starts_with(id.as_str()))
             .collect();
-        ensure!(matches.len() == 1, "Unknown or ambiguous evidence ID: {id}");
+        ensure!(
+            matches.len() == 1,
+            "{subject:?} cites {id:?}, which {} of the evidence supplied to this request. Use an id exactly as this request spells it, such as {:?}, or drop the citation when nothing supplied supports the item",
+            if matches.is_empty() {
+                "names none"
+            } else {
+                "is the start of more than one"
+            },
+            evidence
+                .iter()
+                .take(6)
+                .map(|e| e.id.get(..12).unwrap_or(&e.id))
+                .collect::<Vec<_>>()
+        );
         *id = matches[0].id.clone();
         ensure!(
             seen.insert(id.clone()),
@@ -1570,7 +1583,40 @@ fn pack_planning_evidence(
     input["source_anchors"] = json!(anchors(&discovery.evidence, &evidence));
     let count = evidence.len();
     input["evidence"] = json!(evidence);
+    // Observations are carried between stages, and the passages behind them are
+    // not always carried with them. A finding whose passage this run no longer
+    // retains still arrives with its id, and a plan that starts a section from
+    // that id is then refused for citing something it was shown. The request
+    // keeps only the ids the check will answer to.
+    let retained: HashSet<&str> = discovery.evidence.iter().map(|e| e.id.as_str()).collect();
+    for field in ["source_brief", "supporting_findings"] {
+        if let Some(value) = input.get_mut(field) {
+            drop_unretained_ids(value, &retained);
+        }
+    }
     Ok(count)
+}
+
+/// Remove evidence ids no retained passage answers to, wherever they appear.
+fn drop_unretained_ids(value: &mut serde_json::Value, retained: &HashSet<&str>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::Array(ids)) = map.get_mut("evidence_ids") {
+                ids.retain(|id| id.as_str().is_some_and(|id| retained.contains(id)));
+            }
+            for (key, value) in map.iter_mut() {
+                if key != "evidence_ids" {
+                    drop_unretained_ids(value, retained);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                drop_unretained_ids(value, retained);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The purpose reading narrowed to the files a chapter covers.
@@ -1732,6 +1778,33 @@ pub async fn outline(ctx: &RunContext, system: &str) -> Result<Outline> {
     }
 }
 
+/// Anchors a plan named that no supplied passage answers to, removed so that
+/// the rest of the plan survives.
+///
+/// An anchor only says where a section's reading should start. A section that
+/// names branches draws its source from them, and one without branches still
+/// has its query and the search that writing runs anyway. A plan refused three
+/// times over a single invented id left the run waiting with nothing written,
+/// which serves the reader worse than a section that starts from its own
+/// search. Only the last attempt does this, so the model is still told first.
+fn drop_unknown_anchors(plan: &mut Outline, evidence: &[Evidence]) -> Vec<String> {
+    let mut dropped = vec![];
+    for section in &mut plan.sections {
+        let before = section.evidence_ids.len();
+        section.evidence_ids.retain(|id| {
+            evidence
+                .iter()
+                .filter(|e| e.id.starts_with(id.as_str()))
+                .count()
+                == 1
+        });
+        if section.evidence_ids.len() != before {
+            dropped.push(section.title.clone());
+        }
+    }
+    dropped
+}
+
 /// Plan the whole document in one request.
 async fn plan_whole(
     ctx: &RunContext,
@@ -1759,19 +1832,31 @@ async fn plan_whole(
         }
         let packed = pack_planning_evidence(ctx, discovery, &mut input, reductions, true)?;
         ctx.event("outline_planning", json!({"stage":"planning","title":"구현 근거에 맞춰 설명 순서 구성","attempt":attempt+1,"evidence_chunks":packed,"branches":branches.len(),"branch_topics":branches.iter().map(|b| b["topics"].as_array().map_or(0,Vec::len)).sum::<usize>()})).await?;
+        let mut salvaged: Vec<String> = vec![];
         let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
             let mut plan = decode_generated_outline(&s, &mut repair, &labels)?;
             plan.revision = revision;
-            validate_outline(
-                &mut plan,
-                &discovery.evidence,
-                ctx.snapshot.task.max_diagrams,
-                view.count(),
-            )?;
+            let ceiling = view.count();
+            let maximum = ctx.snapshot.task.max_diagrams;
+            if let Err(error) = validate_outline(&mut plan, &discovery.evidence, maximum, ceiling) {
+                if attempt < 2 {
+                    return Err(error);
+                }
+                salvaged = drop_unknown_anchors(&mut plan, &discovery.evidence);
+                if salvaged.is_empty() {
+                    return Err(error);
+                }
+                validate_outline(&mut plan, &discovery.evidence, maximum, ceiling)?;
+            }
             Ok(plan)
         });
         match result {
-            Ok(plan) => return Ok(plan),
+            Ok(plan) => {
+                if !salvaged.is_empty() {
+                    ctx.event("outline_anchor_dropped", json!({"stage":"planning","title":"근거를 찾을 수 없는 시작 지점을 빼고 목차를 받았습니다","sections":salvaged})).await?;
+                }
+                return Ok(plan);
+            }
             Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
             Err(e) => {
                 llm::forget(ctx, system, input).await?;
@@ -2419,10 +2504,21 @@ async fn plan_chapter(
         }
         let packed = pack_planning_evidence(ctx, &scoped, &mut input, reductions, false)?;
         ctx.event("outline_planning", json!({"stage":"planning","title":"장별 설명 순서 구성","chapter":batch.chapter+1,"chapters":request.chapters.len(),"part":batch.part+1,"parts":batch.parts,"attempt":attempt+1,"evidence_chunks":packed,"branches":branches.len()})).await?;
+        let mut salvaged: Vec<String> = vec![];
         let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
             let mut part = decode_generated_outline(&s, &mut repair, &labels)?;
             part.revision = request.revision;
-            validate_outline(&mut part, &scoped.evidence, request.diagrams, None)?;
+            if let Err(error) = validate_outline(&mut part, &scoped.evidence, request.diagrams, None)
+            {
+                if attempt < 2 {
+                    return Err(error);
+                }
+                salvaged = drop_unknown_anchors(&mut part, &scoped.evidence);
+                if salvaged.is_empty() {
+                    return Err(error);
+                }
+                validate_outline(&mut part, &scoped.evidence, request.diagrams, None)?;
+            }
             ensure!(
                 part.sections.len() <= request.sections,
                 "Supply at most {} sections for this part",
@@ -2441,7 +2537,12 @@ async fn plan_chapter(
             Ok(part)
         });
         match result {
-            Ok(part) => return Ok(part),
+            Ok(part) => {
+                if !salvaged.is_empty() {
+                    ctx.event("outline_anchor_dropped", json!({"stage":"planning","title":"근거를 찾을 수 없는 시작 지점을 빼고 목차를 받았습니다","chapter":batch.chapter+1,"part":batch.part+1,"sections":salvaged})).await?;
+                }
+                return Ok(part);
+            }
             Err(e) if fatal(&e) || is_budget(&e) => return Err(e),
             Err(e) => {
                 llm::forget(ctx, system, input).await?;
@@ -3331,6 +3432,43 @@ mod tests {
             assert_eq!(validate_brief(&mut brief, &[source], true).is_ok(), valid);
         }
         assert!(llm::decode::<FindingKind>(r#""unknown""#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn an_anchor_no_passage_answers_to_is_dropped_rather_than_taking_the_plan_down() -> Result<()> {
+        let real = evidence("/project/a.py", "def receive(x): return finish(x)");
+        let mut plan: Outline = serde_json::from_value(json!({"sections":[
+            {"title":"받는 쪽","query":"receive","key_points":["a"],"branches":["B1"],
+             "evidence_ids":[real.id.clone(), "ffffffffffff".to_string()],"diagrams":[]},
+            {"title":"보내는 쪽","query":"send","key_points":["b"],"branches":["B2"],
+             "evidence_ids":[real.id.clone()],"diagrams":[]}]}))?;
+        let dropped = drop_unknown_anchors(&mut plan, std::slice::from_ref(&real));
+        assert_eq!(dropped, vec!["받는 쪽".to_string()]);
+        assert_eq!(plan.sections[0].evidence_ids, vec![real.id.clone()]);
+        assert_eq!(plan.sections[1].evidence_ids, vec![real.id.clone()]);
+        // The refusal that precedes it says which item broke and what to use.
+        let mut ids = vec!["ffffffffffff".to_string()];
+        let error = resolve_ids(
+            &mut ids,
+            std::slice::from_ref(&real),
+            MAX_SECTION_ANCHORS,
+            MAX_SECTION_ANCHORS,
+            "받는 쪽",
+        )
+        .err()
+        .context("an unknown anchor must not resolve")?
+        .to_string();
+        assert!(error.contains("받는 쪽"), "{error}");
+        assert!(error.contains(&real.id[..12]), "{error}");
+
+        // A request never shows an id the check would then refuse.
+        let retained: HashSet<&str> = std::iter::once(real.id.as_str()).collect();
+        let mut shown = json!({"findings":[
+            {"topic":"t","observation":"o","kind":"context",
+             "evidence_ids":[real.id.clone(),"ffffffffffff".to_string()]}]});
+        drop_unretained_ids(&mut shown, &retained);
+        assert_eq!(shown["findings"][0]["evidence_ids"], json!([real.id]));
         Ok(())
     }
 

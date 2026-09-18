@@ -1,10 +1,12 @@
 //! Exhaustive, resumable source reading. Request size limits split work; they
 //! never truncate the file inventory or mark unread input as understood.
 use crate::{
-    db, editorial, llm,
+    context::RunContext,
+    db, editorial,
+    findings::{Discovery, SourceBrief, pack_evidence, validate_brief},
+    llm,
     model::{Evidence, LlmConfig},
-    planning::{Discovery, SourceBrief, pack_evidence, validate_brief},
-    runner::{RunContext, fatal, is_budget},
+    runner::{fatal, is_budget},
     source,
 };
 use anyhow::{Result, ensure};
@@ -18,11 +20,11 @@ const READ_TEMPLATE: &str = "Read source evidence before planning, independently
 const REDUCE_TEMPLATE: &str = "Read source evidence before planning. Integrate ALL supplied child summaries into a higher-level source overview. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve distinct workflows, module contracts, state changes, result consumers, conditional/error/cancel branches and unresolved cross-module links. Child findings have already been checked against their original passages. Preserve their important workflows and source anchors even when those passages are not repeated in this bounded request. previously_read anchors identify those originals; they support carrying the child observation, not inventing new facts. source_graph lists the declarations and connections of the files those children read: a connection there is a syntax candidate, so use it to name and follow a link between two children instead of dropping it, and mark it unresolved rather than asserting execution it does not prove. A finding about such a link still cites supplied evidence IDs at its ends; graph records carry names, not IDs. Use newly supplied original evidence to establish NEW connections; mark any other cross-module synthesis as uncertain. Never invent an execution order to join independent workflows. Do not assume a missing excerpt is absent from the project. Include at most {MAX_FINDINGS} findings, each observation under 1000 characters and with 1-{MAX_EVIDENCE_IDS} supplied evidence IDs, and at most {MAX_UNCERTAINTIES} uncertainties. The whole findings array must serialize under summary_budget_bytes, so write fewer and denser observations rather than many that have to be trimmed; non-ASCII text costs about three bytes per character. Do not produce a document outline. Use the requested language.";
 const OVERVIEW_TEMPLATE: &str = "Read source evidence before planning through verified child findings. Synthesize ALL verified child findings into a balanced project overview. These findings are the document's top level, so choose them as a spine rather than as the strongest observations that happened to survive: order them the way a reader should meet them, keep them at one level of abstraction so none is a detail of another, and make them distinct, since two that overlap will be told twice and a gap between them is a part of the project nobody explains. Anything more specific belongs under one of them rather than beside it. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[]}. Preserve the main product workflows, public entry points, processing, persisted/returned results, consumers and error/cancel paths across ALL children. Dependencies and test harness details together need at most two findings; do not let them displace product behavior. Use at most {MAX_FINDINGS} findings, each under 1000 characters and with 1-{MAX_EVIDENCE_IDS} source_anchors from its child findings, and at most {MAX_UNCERTAINTIES} uncertainties. The whole findings array must serialize under summary_budget_bytes, so write fewer and denser observations rather than many that have to be trimmed; non-ASCII text costs about three bytes per character. Previously-read originals are retained and validated by the caller; do not treat their omission from this synthesis request as an unknown project behavior. Carry only observations already in children and distinguish their runtime/context kinds. Do not add new facts or invent cross-module execution order; retain genuinely unresolved connections. Use the requested language.";
 static READ: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| crate::planning::with_limits(READ_TEMPLATE));
+    std::sync::LazyLock::new(|| crate::findings::with_limits(READ_TEMPLATE));
 static REDUCE: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| crate::planning::with_limits(REDUCE_TEMPLATE));
+    std::sync::LazyLock::new(|| crate::findings::with_limits(REDUCE_TEMPLATE));
 static OVERVIEW: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| crate::planning::with_limits(OVERVIEW_TEMPLATE));
+    std::sync::LazyLock::new(|| crate::findings::with_limits(OVERVIEW_TEMPLATE));
 
 // Ceilings, not the operating limits. Both effective limits are derived from
 // the configured context window so that a request always fits the gate in
@@ -79,7 +81,7 @@ pub(crate) struct Span {
 struct LightDiscovery {
     brief: SourceBrief,
     #[serde(default)]
-    details: Vec<crate::planning::Finding>,
+    details: Vec<crate::findings::Finding>,
     #[serde(default)]
     evidence: Vec<Span>,
 }
@@ -99,15 +101,15 @@ pub(crate) struct TreeNode {
     pub files: Vec<String>,
     pub children: Vec<String>,
     /// The node's own summary.
-    pub findings: Vec<crate::planning::Finding>,
+    pub findings: Vec<crate::findings::Finding>,
     /// Valid observations a failed validation kept beside the summary.
-    pub details: Vec<crate::planning::Finding>,
+    pub details: Vec<crate::findings::Finding>,
     pub spans: Vec<Span>,
 }
 
 impl TreeNode {
     /// Everything the node observed, its summary first.
-    pub fn observations(&self) -> impl Iterator<Item = &crate::planning::Finding> {
+    pub fn observations(&self) -> impl Iterator<Item = &crate::findings::Finding> {
         self.findings.iter().chain(&self.details)
     }
 }
@@ -228,7 +230,7 @@ pub(crate) async fn tree(ctx: &RunContext) -> Result<std::sync::Arc<TreeIndex>> 
 }
 
 /// Salvage independently validated observations; never relabel unsupported runtime claims.
-fn validated_findings(brief: &SourceBrief, evidence: &[Evidence]) -> Vec<crate::planning::Finding> {
+fn validated_findings(brief: &SourceBrief, evidence: &[Evidence]) -> Vec<crate::findings::Finding> {
     brief
         .findings
         .iter()
@@ -247,14 +249,14 @@ fn validated_findings(brief: &SourceBrief, evidence: &[Evidence]) -> Vec<crate::
 fn salvage(mut brief: SourceBrief, evidence: &[Evidence], maximum: usize) -> SourceBrief {
     brief.findings = validated_findings(&brief, evidence)
         .into_iter()
-        .take(crate::planning::ACCEPTED_FINDINGS)
+        .take(crate::findings::ACCEPTED_FINDINGS)
         .collect();
     brief.uncertainties = brief
         .uncertainties
         .into_iter()
         .chain(brief.followup_queries)
         .filter(|s| !s.trim().is_empty() && s.len() <= 1500)
-        .take(crate::planning::MAX_UNCERTAINTIES.saturating_sub(1))
+        .take(crate::findings::MAX_UNCERTAINTIES.saturating_sub(1))
         .collect();
     brief.uncertainties.push("일부 소스 관찰은 근거 검증을 통과하지 못해 제외되었습니다. 해당 분석 묶음의 검증 오류와 원문을 재검토해야 합니다.".into());
     brief.followup_queries = vec![];
@@ -498,14 +500,14 @@ async fn node(
         })
         .cloned()
         .collect();
-    let anchors = crate::planning::anchors(&cited_originals, shown_evidence);
+    let anchors = crate::findings::anchors(&cited_originals, shown_evidence);
     let summary_cap = summary_limit(ctx);
     let summary_accept = accepted_summary(input_limit(ctx));
     let mut input = json!({"phase":if children.is_empty(){"understanding_batch"}else{"understanding_reduce"},
         "summary_budget_bytes":summary_cap,
-        "language":ctx.snapshot.task.language,"final_pass":true,"evidence":crate::planning::classified(&evidence),
+        "language":ctx.snapshot.task.language,"final_pass":true,"evidence":crate::findings::classified(&evidence),
         "summaries":summaries,"source_anchors":anchors,
-        "finding_kind_policy":crate::planning::FINDING_KIND_POLICY,
+        "finding_kind_policy":crate::findings::FINDING_KIND_POLICY,
         "classification_policy":"runtime_allowed on each evidence passage and each previously_read source anchor says whether it can support a runtime finding. XML/configuration declarations are context: describe what is declared, not whether it is loaded or executed. Runtime observations must cite supplied implementation. If a batch has no implementation, return context observations only. On repair, preserve valid observations and rewrite only invalid ones; never merely relabel an unsupported execution claim.","instruction":if children.is_empty(){READ.as_str()}else{REDUCE.as_str()}});
     if children.is_empty()
         && let Some(object) = input.as_object_mut()
@@ -717,7 +719,12 @@ async fn node(
                 // is judged against it.
                 let fragment = error
                     .contains(llm::RESPONSE_TRUNCATED)
-                    .then(|| repair.response.as_deref().map(|r| editorial::excerpt(r, 2_000)))
+                    .then(|| {
+                        repair
+                            .response
+                            .as_deref()
+                            .map(|r| editorial::excerpt(r, 2_000))
+                    })
                     .flatten();
                 ctx.event(
                     "source_validation",
@@ -926,6 +933,43 @@ fn estimate(
         "note":"Reading only, before planning and writing; assumes about 2.5 bytes per token and one minute per request."})
 }
 
+/// Every chunk this run indexed, with the size the reading has to budget for.
+///
+/// Returns the chunks to read and how many `exclusions` held back. Paged through
+/// `db::chunk_page` rather than read whole, and cancellable between pages: a
+/// large source has a lot of chunks and the run may be stopped while listing it.
+async fn list_source_chunks(
+    ctx: &RunContext,
+    exclusions: &HashMap<String, &'static str>,
+) -> Result<(Vec<(u64, crate::graph::ChunkSpan, u64)>, usize)> {
+    let mut chunks = Vec::new();
+    let mut skipped = 0usize;
+    let mut after = 0u64;
+    loop {
+        ctx.check()?;
+        let page = db::chunk_page(&ctx.pool, &ctx.id, after).await?;
+        if page.is_empty() {
+            return Ok((chunks, skipped));
+        }
+        for row in page {
+            after = row.id;
+            if exclusions.contains_key(&row.path) {
+                skipped += 1;
+                continue;
+            }
+            chunks.push((
+                row.id,
+                crate::graph::ChunkSpan {
+                    path: row.path,
+                    start: row.start,
+                    end: row.end,
+                },
+                row.bytes,
+            ));
+        }
+    }
+}
+
 pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     // The node keys below stay at version 7 on purpose: a leaf's request did not
     // change, so its checkpoint is still valid and is reused. Only a reduction's
@@ -945,60 +989,11 @@ pub async fn analyze(ctx: &RunContext, system: &str) -> Result<Discovery> {
     // the concurrency it was configured with instead of one request at a time.
     let concurrency = ctx.snapshot.settings.llm.concurrency.max(1);
     let exclusions = reading_exclusions(ctx).await?;
-    let mut after = 0u64;
-    let mut source_chunks = Vec::<(u64, crate::graph::ChunkSpan, u64)>::new();
-    let mut skipped_chunks = 0usize;
-    loop {
-        ctx.check()?;
-        let rows = sqlx::query("SELECT c.id,c.path,c.start_line,c.end_line,COALESCE(LENGTH(COALESCE(b.content,c.content)),0) bytes FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.run_id=? AND c.id>? ORDER BY c.id LIMIT 256")
-            .bind(&ctx.id).bind(after).fetch_all(&ctx.pool).await?;
-        if rows.is_empty() {
-            break;
-        }
-        for row in rows {
-            let id: u64 = row.try_get("id")?;
-            after = id;
-            let path: String = row.try_get("path")?;
-            if exclusions.contains_key(&path) {
-                skipped_chunks += 1;
-                continue;
-            }
-            source_chunks.push((
-                id,
-                crate::graph::ChunkSpan {
-                    path,
-                    start: row.try_get("start_line")?,
-                    end: row.try_get("end_line")?,
-                },
-                row.try_get::<i64, _>("bytes")?.max(0) as u64,
-            ));
-        }
-    }
+    let (mut source_chunks, mut skipped_chunks) = list_source_chunks(ctx, &exclusions).await?;
     // A source made only of lock or generated files is still a source; reading
     // it is better than reading nothing.
     let exclusions = if source_chunks.is_empty() && skipped_chunks > 0 {
-        skipped_chunks = 0;
-        after = 0;
-        loop {
-            let rows = sqlx::query("SELECT c.id,c.path,c.start_line,c.end_line,COALESCE(LENGTH(COALESCE(b.content,c.content)),0) bytes FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash WHERE c.run_id=? AND c.id>? ORDER BY c.id LIMIT 256")
-                .bind(&ctx.id).bind(after).fetch_all(&ctx.pool).await?;
-            if rows.is_empty() {
-                break;
-            }
-            for row in rows {
-                let id: u64 = row.try_get("id")?;
-                after = id;
-                source_chunks.push((
-                    id,
-                    crate::graph::ChunkSpan {
-                        path: row.try_get("path")?,
-                        start: row.try_get("start_line")?,
-                        end: row.try_get("end_line")?,
-                    },
-                    row.try_get::<i64, _>("bytes")?.max(0) as u64,
-                ));
-            }
-        }
+        (source_chunks, skipped_chunks) = list_source_chunks(ctx, &HashMap::new()).await?;
         HashMap::new()
     } else {
         exclusions
@@ -1222,11 +1217,11 @@ mod tests {
             ..Default::default()
         };
         let cap = summary_maximum(request_limit(&c, 0));
-        let per_finding = cap / crate::planning::MAX_FINDINGS;
+        let per_finding = cap / crate::findings::MAX_FINDINGS;
         assert!(
             per_finding >= 400,
             "{cap} bytes over {} findings leaves {per_finding} each, too little to say anything",
-            crate::planning::MAX_FINDINGS
+            crate::findings::MAX_FINDINGS
         );
         // The budget travels with the request rather than only in the checker.
         assert!(READ.contains("summary_budget_bytes"));
@@ -1239,7 +1234,7 @@ mod tests {
         // carry the constants rather than copies of their values. This checks
         // the rendering rather than the wording: a placeholder that is misspelt
         // or never substituted would otherwise reach the model verbatim.
-        let cap = crate::planning::MAX_EVIDENCE_IDS;
+        let cap = crate::findings::MAX_EVIDENCE_IDS;
         assert!(
             READ.contains(&format!("at most {cap} evidence IDs each")),
             "{}",
@@ -1435,7 +1430,7 @@ mod tests {
 
     #[test]
     fn a_brief_is_measured_by_the_citations_the_request_will_carry() -> Result<()> {
-        let evidence: Vec<Evidence> = (0..crate::planning::MAX_EVIDENCE_IDS)
+        let evidence: Vec<Evidence> = (0..crate::findings::MAX_EVIDENCE_IDS)
             .map(|i| Evidence {
                 id: source::hash(&[i as u8]),
                 path: format!("m{i}.rs"),
@@ -1445,11 +1440,11 @@ mod tests {
             })
             .collect();
         let brief = SourceBrief {
-            findings: (0..crate::planning::MAX_FINDINGS)
-                .map(|_| crate::planning::Finding {
+            findings: (0..crate::findings::MAX_FINDINGS)
+                .map(|_| crate::findings::Finding {
                     topic: "관측".into(),
                     observation: "가".repeat(20),
-                    kind: crate::planning::FindingKind::Context,
+                    kind: crate::findings::FindingKind::Context,
                     evidence_ids: evidence.iter().map(|e| e.id.clone()).collect(),
                 })
                 .collect(),
@@ -1523,10 +1518,10 @@ mod tests {
             followup_queries: vec![],
         };
         while serde_json::to_vec(&brief).is_ok_and(|v| v.len() <= maximum) {
-            brief.findings.push(crate::planning::Finding {
+            brief.findings.push(crate::findings::Finding {
                 topic: "관측".into(),
                 observation: "가".repeat(900),
-                kind: crate::planning::FindingKind::Context,
+                kind: crate::findings::FindingKind::Context,
                 evidence_ids: evidence.iter().take(6).map(|e| e.id.clone()).collect(),
             });
         }
@@ -1584,13 +1579,13 @@ mod tests {
         // citation ceiling would require twelve findings of six distinct
         // passages each, with no passage supporting two observations, so the
         // batch has to stop well short of it.
-        let ceiling = crate::planning::MAX_FINDINGS * crate::planning::MAX_EVIDENCE_IDS;
+        let ceiling = crate::findings::MAX_FINDINGS * crate::findings::MAX_EVIDENCE_IDS;
         assert!(MAX_BATCH_PASSAGES < ceiling);
-        let findings_needed = MAX_BATCH_PASSAGES.div_ceil(crate::planning::MAX_EVIDENCE_IDS);
+        let findings_needed = MAX_BATCH_PASSAGES.div_ceil(crate::findings::MAX_EVIDENCE_IDS);
         assert!(
-            findings_needed <= crate::planning::MAX_FINDINGS / 2,
+            findings_needed <= crate::findings::MAX_FINDINGS / 2,
             "a full batch already needs {findings_needed} of {} findings just to name its passages",
-            crate::planning::MAX_FINDINGS
+            crate::findings::MAX_FINDINGS
         );
     }
 

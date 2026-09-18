@@ -1,6 +1,6 @@
 //! Write arbitrarily long sections in bounded responses, retaining partial text.
 //! All parts share the original evidence and pass document validation together.
-use crate::{db, editorial, llm, runner::RunContext, source};
+use crate::{context::RunContext, db, editorial, llm, source};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

@@ -1,4 +1,9 @@
-use crate::{db, model::Evidence, parser, runner::RunContext};
+//! Source snapshot, index and bounded evidence retrieval.
+//!
+//! `index` copies and chunks the selected roots; `retrieve` searches that index
+//! and returns passages that fit a byte budget. Evidence IDs hash path, line
+//! range and content, so the same source yields the same citations on a rerun.
+use crate::{context::RunContext, db, model::Evidence, parser};
 use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde_json::json;

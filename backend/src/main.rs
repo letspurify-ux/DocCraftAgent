@@ -1,14 +1,33 @@
 #![forbid(unsafe_code)]
+//! DocCraft Agent — turns local source code into purpose-built Markdown.
+//!
+//! A run moves through the modules in this order, each stage checkpointed so an
+//! interrupted run resumes where it stopped:
+//!
+//! ```text
+//! source      snapshot and index the selected roots
+//! understanding  read every chunk, synthesize it hierarchically
+//! purpose     narrow that reading to what the requested document needs
+//! planning    turn it into an outline, then review the outline
+//! runner      write each section, review the document, repair what it flags
+//! publish     validate diagrams and save atomically
+//! ```
+//!
+//! `runner` owns the lifecycle and drives that sequence; `api` exposes it over
+//! HTTP; `llm`, `budget`, `db` and `graph` are the shared services beneath.
 mod api;
 mod budget;
 mod code_graph;
 mod composition;
 mod config;
+mod context;
 mod db;
 mod editorial;
+mod findings;
 mod graph;
 mod llm;
 mod maintenance;
+mod markdown;
 mod model;
 mod parser;
 mod planning;
@@ -68,7 +87,7 @@ async fn main() -> Result<()> {
             None
         }
     };
-    let state = Arc::new(runner::AppState::new(vault, settings, pool));
+    let state = Arc::new(context::AppState::new(vault, settings, pool));
     runner::recover(state.clone()).await?;
     maintenance::start(state.clone());
     let app = api::router(state.clone());

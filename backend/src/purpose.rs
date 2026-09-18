@@ -1,10 +1,13 @@
 //! One purpose-focused source summary over reusable general reading.
 //! Preserve detailed observations and originals without inventing a question list.
 use crate::{
-    db, editorial, llm,
+    context::RunContext,
+    db, editorial,
+    findings::{Discovery, Finding, SourceBrief, pack_evidence, validate_brief},
+    llm,
     model::{Evidence, Outline, TaskConfig},
-    planning::{Discovery, Finding, SourceBrief, evidence_budget, pack_evidence, validate_brief},
-    runner::{RunContext, fatal, is_budget},
+    planning::evidence_budget,
+    runner::{fatal, is_budget},
     source,
     understanding::Node,
 };
@@ -15,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 const READ_TEMPLATE: &str = "Read source evidence before planning the document. Summarize the code according to purpose, grouping related responsibilities and actual workflows. Return ONLY JSON {findings:[{topic:string,observation:string,kind:'runtime'|'context',evidence_ids:[string]}],uncertainties:[string],followup_queries:[string]}. Use 1-{MAX_FINDINGS} findings with short topics, observations under 1000 characters and 1-{MAX_EVIDENCE_IDS} supplied evidence IDs. Preserve important entry points, processing, conditions, state changes, outputs, consumers and error/cancellation paths. Adapt the emphasis to the user's requested audience and scope. Do not generate a list of reader questions or a table of contents. verified_overview and supporting_findings contain prior observations checked against their original passages. Carry relevant observations using previously_read anchors; use original passages supplied in this request for new claims or cross-module connections. Runtime findings require implementation evidence; XML/configuration/docs/tests establish context, not execution. Do not infer call order from filenames/imports or treat separate alternatives as consecutive steps. Do not infer absent implementation from an omitted excerpt. Record genuinely unresolved links in uncertainties (at most {MAX_UNCERTAINTIES}). Request at most 3 focused followup_queries using observed paths/symbols ONLY when an important part of the requested flow needs more source evidence. Avoid extra investigation of minor helper details. On the final pass return followup_queries:[] and keep remaining gaps in uncertainties. When correcting an earlier finding reuse its exact topic. Include all three arrays, even when empty. Use the requested language.";
 pub(crate) static READ: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| crate::planning::with_limits(READ_TEMPLATE));
+    std::sync::LazyLock::new(|| crate::findings::with_limits(READ_TEMPLATE));
 
 pub(crate) fn intent_key(task: &TaskConfig) -> String {
     source::hash(
@@ -225,10 +228,10 @@ async fn read_sources(
         let available = merge_evidence(&[evidence.clone(), prior.evidence.clone()]);
         let mut input = json!({"phase":"purpose_reading","purpose":ctx.snapshot.task.direction,"language":ctx.snapshot.task.language,
             "verified_overview":prior.brief,"supporting_findings":context(prior, true),
-            "source_anchors":crate::planning::anchors(&prior.evidence, &evidence),
-            "evidence":crate::planning::classified(&evidence),
+            "source_anchors":crate::findings::anchors(&prior.evidence, &evidence),
+            "evidence":crate::findings::classified(&evidence),
             "open_questions":prior.brief.uncertainties,"final_pass":final_pass,"attempt":attempt+1,"previous_error":error,
-            "finding_kind_policy":crate::planning::FINDING_KIND_POLICY,"instruction":READ.as_str()});
+            "finding_kind_policy":crate::findings::FINDING_KIND_POLICY,"instruction":READ.as_str()});
         repair.apply(&mut input);
         let result = llm::call(ctx, system, input.clone()).await.and_then(|s| {
             let mut brief: SourceBrief = repair.decode(&s)?;

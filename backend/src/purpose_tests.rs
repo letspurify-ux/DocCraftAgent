@@ -1,5 +1,5 @@
 use super::*;
-use crate::planning::FindingKind;
+use crate::findings::FindingKind;
 
 fn empty_brief() -> SourceBrief {
     SourceBrief {
@@ -225,7 +225,7 @@ async fn summary_pipeline_skips_questions_recovers_and_reuses_general_reading() 
         let e = &detail.evidence[0];
         sqlx::query("INSERT INTO chunks(run_id,file_id,path,start_line,end_line,symbols,content) VALUES(?,1,?,1,1,'refund_result',?)")
             .bind(&run.ctx.id).bind(&e.path).bind(&e.content).execute(&pool).await?;
-        let plan = crate::planning::outline(&run.ctx,"Test documentation engine").await?;
+        let plan = crate::runner::plan_document(&run.ctx,"Test documentation engine").await?;
         assert_eq!(plan.sections.len(),2);
         let saved: Discovery = serde_json::from_value(db::load_checkpoint(&pool,&run.ctx.id,"source_understanding").await?.unwrap_or(json!({})))?;
         assert!(!saved.validation_unresolved);
@@ -241,14 +241,14 @@ async fn summary_pipeline_skips_questions_recovers_and_reuses_general_reading() 
         assert_eq!(first_requests[0]["final_pass"],false);
         assert_eq!(first_requests[1]["final_pass"],true);
         assert!(first_requests[1]["evidence"].as_array().is_some_and(|list|list.iter().any(|e|e["content"].as_str().is_some_and(|s|s.contains("refund_result")))));
-        crate::planning::outline(&run.ctx,"Test documentation engine").await?;
+        crate::runner::plan_document(&run.ctx,"Test documentation engine").await?;
         assert_eq!(requests.lock().await.len(),first_requests.len());
         // Delete only the assembled result to exercise summary checkpoint resume.
         sqlx::query("DELETE FROM checkpoints WHERE run_id=? AND step IN ('outline','source_understanding')").bind(&run.ctx.id).execute(&pool).await?;
-        crate::planning::outline(&run.ctx,"Test documentation engine").await?;
+        crate::runner::plan_document(&run.ctx,"Test documentation engine").await?;
         assert_eq!(requests.lock().await.len(),first_requests.len());
         run.ctx.snapshot.task.direction = "Changed direction".into();
-        crate::planning::outline(&run.ctx,"Test documentation engine").await?;
+        crate::runner::plan_document(&run.ctx,"Test documentation engine").await?;
         let all = requests.lock().await.clone();
         assert!(all[first_requests.len()..].iter().any(|r|r["phase"]=="purpose_reading" && r["purpose"]=="Changed direction"));
         assert!(all.iter().all(|r|r["phase"]!="understanding_batch" && r["phase"]!="understanding_reduce"));
@@ -256,10 +256,10 @@ async fn summary_pipeline_skips_questions_recovers_and_reuses_general_reading() 
         assert_eq!(db::load_checkpoint(&pool,&run.ctx.id,"understanding:node:leaf").await?,Some(leaf));
         let before = requests.lock().await.len();
         run.ctx.snapshot.task.direction = "Concise direction".into();
-        crate::planning::outline(&run.ctx,"Test documentation engine").await?;
+        crate::runner::plan_document(&run.ctx,"Test documentation engine").await?;
         assert_eq!(requests.lock().await.len()-before,3); // One summary, one plan, one review.
         run.ctx.snapshot.task.direction = "Failure direction".into();
-        let recovered = crate::planning::outline(&run.ctx,"Test documentation engine").await?;
+        let recovered = crate::runner::plan_document(&run.ctx,"Test documentation engine").await?;
         assert_eq!(recovered.sections.len(),2);
         let saved: Discovery = serde_json::from_value(db::load_checkpoint(&pool,&run.ctx.id,"source_understanding").await?.unwrap_or(json!({})))?;
         assert!(saved.validation_unresolved);

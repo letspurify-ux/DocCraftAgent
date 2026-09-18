@@ -1,9 +1,9 @@
-use crate::{
-    config, db, llm,
-    model::*,
-    runner::{self, AppState},
-    source,
-};
+//! HTTP surface: settings, tasks, runs and artifacts.
+//!
+//! Handlers validate input and delegate; they hold no pipeline logic. Run
+//! progress leaves through the `/runs/{id}/events` SSE stream, which replays
+//! persisted events from a cursor so a reconnecting client misses nothing.
+use crate::{config, context::AppState, db, llm, model::*, runner, source};
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
@@ -872,7 +872,7 @@ mod origin_tests {
         let state = &run.ctx.state;
         state.controls.lock().await.insert(
             run.ctx.id.clone(),
-            runner::Control {
+            crate::context::Control {
                 token: run.ctx.cancel.clone(),
                 target: run.ctx.snapshot.task.target.clone(),
                 gate: run.ctx.gate.clone(),
@@ -896,7 +896,7 @@ mod origin_tests {
         let state = &run.ctx.state;
         state.controls.lock().await.insert(
             run.ctx.id.clone(),
-            runner::Control {
+            crate::context::Control {
                 token: run.ctx.cancel.clone(),
                 target: run.ctx.snapshot.task.target.clone(),
                 gate: run.ctx.gate.clone(),
@@ -964,7 +964,7 @@ mod origin_tests {
         let state = &run.ctx.state;
         state.controls.lock().await.insert(
             run.ctx.id.clone(),
-            runner::Control {
+            crate::context::Control {
                 token: run.ctx.cancel.clone(),
                 target: run.ctx.snapshot.task.target.clone(),
                 gate: run.ctx.gate.clone(),
@@ -1187,13 +1187,13 @@ mod origin_tests {
             None,
         ));
         let token = tokio_util::sync::CancellationToken::new();
-        let gate = Arc::new(runner::CommitGate {
+        let gate = Arc::new(crate::context::CommitGate {
             lock: tokio::sync::Mutex::new(()),
             published: std::sync::atomic::AtomicBool::new(false),
         });
         state.controls.lock().await.insert(
             "run".into(),
-            runner::Control {
+            crate::context::Control {
                 token: token.clone(),
                 target: "target.md".into(),
                 gate: gate.clone(),
@@ -1231,13 +1231,13 @@ mod origin_tests {
             None,
         ));
         let token = tokio_util::sync::CancellationToken::new();
-        let gate = Arc::new(runner::CommitGate {
+        let gate = Arc::new(crate::context::CommitGate {
             lock: tokio::sync::Mutex::new(()),
             published: std::sync::atomic::AtomicBool::new(false),
         });
         state.controls.lock().await.insert(
             "run".into(),
-            runner::Control {
+            crate::context::Control {
                 token: token.clone(),
                 target: "target.md".into(),
                 gate: gate.clone(),

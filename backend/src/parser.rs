@@ -1,3 +1,8 @@
+//! Tree-sitter parsing into chunks and symbols.
+//!
+//! Results describe syntax only. A call site here is a navigation candidate,
+//! never proof that the call executes. Unknown languages fall back to UTF-8
+//! text chunks rather than being skipped.
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;

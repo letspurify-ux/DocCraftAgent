@@ -232,11 +232,7 @@ export function Composition({ run }: { run: Run }) {
             표시합니다.
           </small>
           {source.graph && (
-            <SourceGraph
-              key={run.id}
-              runId={run.id}
-              graph={source.graph}
-            />
+            <SourceGraph key={run.id} runId={run.id} graph={source.graph} />
           )}
           {source.coverage?.additional_reading_unresolved && (
             <p className="banner">

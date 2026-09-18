@@ -1,4 +1,10 @@
-use crate::{budget, model::LlmConfig, runner::RunContext, source::hash};
+//! One model call, made survivable.
+//!
+//! Every request is keyed by prompt, model, parameters and full input, so an
+//! identical call is served from `llm_cache` instead of being paid for twice.
+//! Around that sit the retries, the JSON repair for responses that arrive
+//! malformed, and `TruncatedOutput` for answers cut off mid-generation.
+use crate::{budget, context::RunContext, model::LlmConfig, source::hash};
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde_json::{Value, json};

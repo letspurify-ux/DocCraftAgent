@@ -1,3 +1,7 @@
+//! Encrypted settings vault on disk.
+//!
+//! Secrets are written through `atomic_private`, redacted on the way out to the
+//! API, and preserved when a client saves settings without resending them.
 use crate::model::Settings;
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,

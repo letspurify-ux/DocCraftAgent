@@ -1,3 +1,8 @@
+//! Serialized shapes shared across the process: settings, tasks, run snapshots
+//! and the document types (`Outline`, `SectionPlan`, `Section`, `Issue`).
+//!
+//! These cross module and checkpoint boundaries, so changing a field changes a
+//! stored format. The reading stages keep their own vocabulary in `findings`.
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 

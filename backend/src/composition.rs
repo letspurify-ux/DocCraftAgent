@@ -1,11 +1,5 @@
 //! Reviewable source understanding and versioned outline editing.
-use crate::{
-    api::ApiError,
-    db,
-    model::*,
-    planning,
-    runner::{self, AppState},
-};
+use crate::{api::ApiError, context::AppState, db, model::*, planning, runner};
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json,
@@ -207,7 +201,7 @@ async fn revise_inner(s: Arc<AppState>, id: String, edit: Revision) -> Result<Va
     if let Some(plan) = candidate.as_mut() {
         plan.requirements = current.requirements.clone();
         plan.revision = next;
-        let discovery: planning::Discovery = serde_json::from_value(
+        let discovery: crate::findings::Discovery = serde_json::from_value(
             db::load_checkpoint(&pool, &id, "source_understanding")
                 .await?
                 .context("원본 근거가 없는 과거 실행은 피드백으로 목차를 다시 생성하세요")?,

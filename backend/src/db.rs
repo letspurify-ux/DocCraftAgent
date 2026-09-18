@@ -1,3 +1,9 @@
+//! MariaDB pool, migrations, and the checkpoint/event store the pipeline
+//! resumes from.
+//!
+//! A checkpoint is one JSON value under a (run, step) key. Steps are named by
+//! the stage that writes them, and a stage that finds its own step already
+//! written returns it instead of repeating the work.
 use crate::model::{DbConfig, EventView, RunView};
 use anyhow::{Result, bail};
 use serde_json::Value;
@@ -162,4 +168,41 @@ pub async fn checkpoint_repair(
         .bind(run).bind(section).bind(serde_json::to_string(data)?)
         .bind(run).bind(repair).execute(pool).await?;
     Ok(())
+}
+
+/// One indexed chunk of a run, described without its text.
+pub struct ChunkRow {
+    pub id: u64,
+    pub path: String,
+    pub start: u32,
+    pub end: u32,
+    pub bytes: u64,
+}
+
+/// One page of a run's chunks, in id order, starting after `after` (0 to begin).
+///
+/// Paged because a large source has more chunks than one result set should
+/// carry, and sized without their text because the caller is planning how to
+/// read them, not reading them yet.
+pub async fn chunk_page(pool: &MySqlPool, run: &str, after: u64) -> Result<Vec<ChunkRow>> {
+    let rows = sqlx::query(
+        "SELECT c.id,c.path,c.start_line,c.end_line,COALESCE(LENGTH(COALESCE(b.content,c.content)),0) bytes \
+         FROM chunks c LEFT JOIN chunk_blobs b ON b.hash=c.blob_hash \
+         WHERE c.run_id=? AND c.id>? ORDER BY c.id LIMIT 256",
+    )
+    .bind(run)
+    .bind(after)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ChunkRow {
+                id: row.try_get("id")?,
+                path: row.try_get("path")?,
+                start: row.try_get("start_line")?,
+                end: row.try_get("end_line")?,
+                bytes: row.try_get::<i64, _>("bytes")?.max(0) as u64,
+            })
+        })
+        .collect()
 }

@@ -1,6 +1,11 @@
+//! Atomic publication of the finished document.
+//!
+//! Mermaid is validated before anything is written. If the target changed
+//! underneath the run, the result is saved beside it as a conflict copy rather
+//! than overwriting someone else's edit.
 use crate::{
     config::atomic_private,
-    runner::{AppState, RunContext},
+    context::{AppState, RunContext},
     source::{hash, target_path},
 };
 use anyhow::{Context, Result, bail};

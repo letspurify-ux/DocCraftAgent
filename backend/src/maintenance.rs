@@ -1,4 +1,8 @@
-use crate::{db, model::RunSnapshot, runner::AppState};
+//! Background upkeep: reconnect a dropped database, resume runs that were
+//! interrupted by it, and periodically clear expired cache rows.
+//!
+//! Cleanup only runs while no run is active, so it never competes with one.
+use crate::{context::AppState, db, model::RunSnapshot};
 use anyhow::Result;
 use sqlx::Row;
 use std::{sync::Arc, time::Duration};

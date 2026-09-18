@@ -1,4 +1,6 @@
-use crate::{config::Vault, db, llm, model::*, runner::*};
+//! Shared fixtures for tests that need a real database: a pooled connection
+//! and `TestRun`, which builds a run row and tears it down afterwards.
+use crate::{config::Vault, context::*, db, llm, model::*};
 use anyhow::{Context, Result};
 use sqlx::MySqlPool;
 use std::{

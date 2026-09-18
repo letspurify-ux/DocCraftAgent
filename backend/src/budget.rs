@@ -1,3 +1,8 @@
+//! Token accounting for a request before it is sent.
+//!
+//! Byte-to-token density is calibrated from observed responses and kept
+//! pessimistic, so `packing_limit` answers how much input actually fits rather
+//! than how much would fit if the estimate were right.
 use crate::model::LlmConfig;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
